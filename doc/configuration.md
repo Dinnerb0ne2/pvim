@@ -1,47 +1,38 @@
 # 配置文件说明
 
-项目根目录默认配置文件是 `pvi.config.json`。  
-所有功能开关、快捷键、脚本与插件配置都在这里集中管理。
+主配置文件：`pvim.config.json`
 
-## 配置结构
+## 核心结构
 
 ```json
 {
   "python": { "required": "3.14.3" },
-  "editor": { "line_numbers": true, "tab_size": 4 },
-  "theme": { "enabled": true, "config_file": "pvi.theme.default.json" },
+  "theme": { "enabled": true, "config_file": "pvim.theme.default.json" },
+  "performance": {
+    "experimental_jit": true,
+    "lazy_load": true,
+    "profile_top_n": 25
+  },
   "features": {
-    "syntax_highlighting": { "enabled": true, "language_map_file": "syntax\\languages.json", "default_file": "syntax\\plaintext.json" },
-    "auto_pairs": { "enabled": true, "config_file": "autopairs.json" },
-    "sidebar": { "enabled": true, "width": 30, "max_files": 3000 },
-    "vscode_shortcuts": { "enabled": true, "bindings": {} },
-    "key_hints": { "enabled": true, "trigger": "F1" },
-    "fuzzy_finder": { "enabled": true },
     "scripting": { "enabled": true, "step_limit": 100000 },
-    "plugins": { "enabled": true, "directory": "plugins", "auto_load": true },
-    "git_status": { "enabled": true, "refresh_seconds": 2.0 },
-    "refactor_tools": { "enabled": true },
-    "find_replace": { "enabled": true },
-    "code_style_normalizer": { "enabled": true }
+    "plugins": { "enabled": true, "directory": "plugins", "auto_load": true }
   }
 }
 ```
 
-## 关键项建议
+## 性能相关建议
 
-1. `features.scripting.step_limit`  
-   强烈建议保持 `100000` 或更低，避免脚本死循环卡住界面。
-2. `features.plugins.directory`  
-   插件安装目录，默认是项目根目录下的 `plugins`。
-3. `features.vscode_shortcuts.bindings`  
-   所有快捷键都可重映射，例如将 `fuzzy_finder` 改为 `F5`。
+1. `performance.experimental_jit = true`  
+   会设置 `PYTHON_JIT=1`（Python 3.14 实验路径）。
+2. `performance.lazy_load = true`  
+   延迟插件和语法解析器加载，降低启动成本。
+3. `features.scripting.step_limit`  
+   脚本步数上限，防止 `while true` 卡死。
+4. `performance.profile_top_n`  
+   控制 `:profile script` 的输出热点数量。
 
-## 热重载配置
-
-在编辑器里执行：
+## 运行时重载
 
 ```vim
 :reload-config
 ```
-
-会重新读取配置并生效（包括主题、功能开关、插件设置）。

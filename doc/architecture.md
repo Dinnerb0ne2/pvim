@@ -1,53 +1,34 @@
-# 架构说明
-
-## 目录结构（v0.1）
+# 架构说明（v0.2）
 
 ```text
-pvi.py
-pvi_app/
+src/
   core/
     config.py
     console.py
     theme.py
+    async_runtime.py
+    process_pipe.py
+    buffer.py
   features/
     syntax.py
-    file_index.py
-    fuzzy.py
-    git_status.py
-    refactor.py
-    formatter.py
+    ast_query.py
+    ...
   scripting/
     lexer.py
     parser.py
     ast_nodes.py
     interpreter.py
-    errors.py
   plugins/
     manager.py
   ui/
     editor.py
-  main.py
+    floating_list.py
 ```
 
-## 分层职责
+## 核心链路
 
-- `core`：配置、终端输入输出、主题样式。
-- `features`：编辑能力与工具能力（语法高亮、模糊搜索、Git、重构、格式化等）。
-- `scripting`：自定义脚本语言实现（词法、语法、AST、解释执行、安全限制）。
-- `plugins`：插件发现、安装、加载、运行、宿主 API 网关。
-- `ui`：编辑器主循环、渲染、交互命令与快捷键处理。
-
-## 脚本运行链路
-
-1. `plugins/manager.py` 读取插件脚本
-2. `scripting/lexer.py` 词法分析
-3. `scripting/parser.py` 语法分析生成 AST（节点带行号）
-4. `scripting/interpreter.py` 执行 AST（带步数限制）
-5. 脚本通过 `api(pvim, action, ...)` 与编辑器交互
-
-## 性能策略
-
-- 语法配置按需加载（按扩展名）
-- 文件索引缓存
-- Git 状态按间隔刷新
-- 差量渲染（仅更新变化行）
+1. UI 主循环非阻塞轮询按键 + 渲染
+2. 后台 asyncio 事件循环调度异步任务与进程 IO
+3. Buffer 保存真实文本 + 虚拟文本叠加层
+4. 脚本通过 Facade API 驱动编辑器能力
+5. AST 查询优先 tree-sitter，缺失时回退 Python AST（`.py`）

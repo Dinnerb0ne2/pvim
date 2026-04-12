@@ -1,48 +1,26 @@
 # 插件系统
 
-PVI 插件基于 PVIScript 实现，不依赖第三方库。
+PVIM 插件基于脚本文件（`.pvi` / `.pvs`）运行。
 
-## 插件目录
+## 目录与发现
 
-默认目录：`plugins/`（可在 `pvi.config.json` 修改）。
-
-支持两种插件形态：
-
-1. 单文件插件：`plugins/name.pvi` 或 `plugins/name.pvs`
-2. 目录插件：包含 `plugin.json` + 主脚本
-
-目录插件清单示例：
-
-```json
-{
-  "name": "my-plugin",
-  "main": "main.pvi"
-}
-```
-
-## 生命周期约定
-
-- `fn on_load() { ... }`：插件加载后触发
-- `fn on_key(key) { ... }`：按键事件触发（可选）
+- 默认目录：`plugins/`
+- 支持单文件插件与目录插件（`plugin.json` + `main`）
 
 ## 命令
 
-- `:plugin list`：查看插件列表与加载状态
-- `:plugin load`：加载全部已发现插件
-- `:plugin load <name>`：加载指定插件
-- `:plugin install <path>`：安装本地插件文件/目录
-- `:plugin run <name> <function> [args...]`：调用插件函数
+- `:plugin list`（浮动列表展示）
+- `:plugin load [name]`
+- `:plugin install <path>`
+- `:plugin run <plugin> <function> [args...]`
 
-## 默认插件
+## 生命周期
 
-项目内置示例插件：
+- `on_load()`：插件加载后执行
+- `on_key(key)`：按键事件回调（可选）
 
-- `plugins/welcome.pvi`
+## 执行模型
 
-它会在加载时提示，并示例了 `on_key` 与普通函数调用。
-
-## 隔离策略
-
-- 每个插件一个独立解释器环境（变量不互通）
-- 通过 `api(pvim, ...)` 访问宿主能力，不直接暴露 Python 内部对象
-- 插件异常被捕获并弹窗，不会导致主编辑器退出
+- 每个插件独立解释器与变量环境
+- 插件脚本 AST 在加载时预编译并缓存
+- 通过 Facade API 与编辑器交互，不直接暴露底层复杂对象

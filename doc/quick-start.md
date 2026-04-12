@@ -1,34 +1,32 @@
 # 快速开始
 
-## 1. 环境要求
+## 环境要求
 
 - Windows 终端
 - Python 3.14.3
-- 不需要安装任何第三方库
 
-## 2. 启动
+## 启动命令
 
 ```bash
-python pvi.py
-python pvi.py your_file.py
-python pvi.py your_file.py --config pvi.config.json
+python pvim.py
+python pvim.py your_file.py
+python pvim.py your_file.py --config pvim.config.json
 ```
 
-## 3. 首次体验建议
+## 第一轮建议操作
 
-1. 启动后按 `F1` 查看快捷键提示面板。
-2. 按 `Ctrl+P` 打开模糊搜索器快速切换文件。
-3. 按 `Ctrl+/` 试一键注释。
-4. 用 `:plugin list` 查看默认插件加载状态。
+1. `F1` 打开快捷键提示面板
+2. `Ctrl+P` 模糊搜索文件
+3. `:plugin list` 打开插件浮动列表
+4. `:proc start "<command>"` 启动外部进程管道
+5. `:ast` 查询光标所在函数/类边界
 
-## 4. 常用命令
+## 常用命令
 
-- `:w` 保存
-- `:q` 退出
-- `:find <text>` 查找
-- `:replace <old> <new>` 替换下一个
-- `:replaceall <old> <new>` 全量替换
-- `:rename <old> <new>` 重命名符号
-- `:format` 代码风格归一化
-- `:plugin list` / `:plugin load`
-- `:script run <path>`
+- `:w` / `:q` / `:wq`
+- `:find` / `:replace` / `:replaceall`
+- `:format`
+- `:virtual add <line> <text>`
+- `:proc start|read|write|stop|status ...`
+- `:script run <file>`
+- `:profile script <file>`
