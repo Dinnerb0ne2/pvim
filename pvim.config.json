@@ -4,7 +4,10 @@
   },
   "editor": {
     "line_numbers": true,
-    "tab_size": 4
+    "tab_size": 4,
+    "soft_wrap": true,
+    "default_line_ending": "lf",
+    "preserve_line_ending": true
   },
   "theme": {
     "enabled": true,
@@ -55,6 +58,20 @@
     "fuzzy_finder": {
       "enabled": false
     },
+    "live_grep": {
+      "enabled": true,
+      "max_results": 200
+    },
+    "text_objects": {
+      "enabled": true
+    },
+    "undo_tree": {
+      "enabled": true,
+      "max_actions": 400
+    },
+    "macros": {
+      "enabled": true
+    },
     "scripting": {
       "enabled": false,
       "step_limit": 1000000
@@ -67,6 +84,14 @@
       "enabled": false,
       "directory": "plugins",
       "auto_load": true
+    },
+    "swap": {
+      "enabled": true,
+      "interval_seconds": 4.0
+    },
+    "session": {
+      "enabled": true,
+      "file": ".pvim.session.json"
     },
     "plugin_keyhooks": {
       "enabled": false

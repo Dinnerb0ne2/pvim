@@ -12,6 +12,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "editor": {
         "line_numbers": True,
         "tab_size": 4,
+        "soft_wrap": True,
+        "default_line_ending": "lf",
+        "preserve_line_ending": True,
     },
     "theme": {
         "enabled": True,
@@ -62,6 +65,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "fuzzy_finder": {
             "enabled": False,
         },
+        "live_grep": {
+            "enabled": True,
+            "max_results": 200,
+        },
+        "text_objects": {
+            "enabled": True,
+        },
+        "undo_tree": {
+            "enabled": True,
+            "max_actions": 400,
+        },
+        "macros": {
+            "enabled": True,
+        },
         "scripting": {
             "enabled": False,
             "step_limit": 1000000,
@@ -69,6 +86,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "piece_table": {
             "enabled": True,
             "large_file_line_threshold": 50000,
+        },
+        "swap": {
+            "enabled": True,
+            "interval_seconds": 4.0,
+        },
+        "session": {
+            "enabled": True,
+            "file": ".pvim.session.json",
         },
         "plugins": {
             "enabled": False,
@@ -193,6 +218,21 @@ class AppConfig:
     def tab_size(self) -> int:
         return _as_int(self._lookup("editor", "tab_size", default=4), default=4, minimum=1)
 
+    def soft_wrap_enabled(self) -> bool:
+        return _as_bool(self._lookup("editor", "soft_wrap", default=True), default=True)
+
+    def preserve_line_ending(self) -> bool:
+        return _as_bool(self._lookup("editor", "preserve_line_ending", default=True), default=True)
+
+    def default_line_ending(self) -> str:
+        value = self._lookup("editor", "default_line_ending", default="lf")
+        if not isinstance(value, str):
+            return "\n"
+        lowered = value.strip().lower()
+        if lowered in {"crlf", "windows"}:
+            return "\r\n"
+        return "\n"
+
     def theme_enabled(self) -> bool:
         return _as_bool(self._lookup("theme", "enabled", default=True), default=True)
 
@@ -287,6 +327,52 @@ class AppConfig:
             default=50000,
             minimum=1000,
         )
+
+    def live_grep_enabled(self) -> bool:
+        return self.feature_enabled("live_grep")
+
+    def live_grep_max_results(self) -> int:
+        return _as_int(
+            self._lookup("features", "live_grep", "max_results", default=200),
+            default=200,
+            minimum=20,
+        )
+
+    def text_objects_enabled(self) -> bool:
+        return self.feature_enabled("text_objects")
+
+    def undo_tree_enabled(self) -> bool:
+        return self.feature_enabled("undo_tree")
+
+    def undo_tree_max_actions(self) -> int:
+        return _as_int(
+            self._lookup("features", "undo_tree", "max_actions", default=400),
+            default=400,
+            minimum=20,
+        )
+
+    def macros_enabled(self) -> bool:
+        return self.feature_enabled("macros")
+
+    def swap_enabled(self) -> bool:
+        return self.feature_enabled("swap")
+
+    def swap_interval_seconds(self) -> float:
+        return _as_float(
+            self._lookup("features", "swap", "interval_seconds", default=4.0),
+            default=4.0,
+            minimum=0.5,
+        )
+
+    def session_enabled(self) -> bool:
+        return self.feature_enabled("session")
+
+    def session_file(self) -> Path:
+        value = self._lookup("features", "session", "file", default=".pvim.session.json")
+        if not isinstance(value, str):
+            value = ".pvim.session.json"
+        resolved = self.resolve_path(value)
+        return resolved if resolved is not None else (self.path.parent / ".pvim.session.json").resolve()
 
     def plugins_directory(self) -> Path:
         value = self._lookup("features", "plugins", "directory", default="plugins")

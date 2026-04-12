@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import time
 
+from ...core.display import pad_to_display, slice_by_display
 from .component import LayoutContext
 from .feature_registry import FeatureRegistry
 
@@ -71,17 +72,17 @@ class LayoutManager:
     def render_tabline(self, context: LayoutContext, tabs: list[str], current_index: int, *, separator: str = " │ ") -> str:
         if not tabs:
             line = " [No Buffers] "
-            return line[: context.width].ljust(context.width)
+            return pad_to_display(slice_by_display(line, 0, context.width), context.width)
         parts: list[str] = []
         for index, item in enumerate(tabs):
             label = f"[{item}]" if index == current_index else item
             parts.append(label)
         text = separator.join(parts)
-        return text[: context.width].ljust(context.width)
+        return pad_to_display(slice_by_display(text, 0, context.width), context.width)
 
     def render_winbar(self, context: LayoutContext, breadcrumb: str) -> str:
         text = breadcrumb or context.file_name or "[No Name]"
-        return text[: context.width].ljust(context.width)
+        return pad_to_display(slice_by_display(text, 0, context.width), context.width)
 
     def render_statusline(self, context: LayoutContext) -> str:
         left = " | ".join(self._registry.status_segments("left", context))
@@ -97,7 +98,7 @@ class LayoutManager:
             full = f" {left}   {center}   {right} "
         else:
             full = f" {left}   {right} "
-        return full[: context.width].ljust(context.width)
+        return pad_to_display(slice_by_display(full, 0, context.width), context.width)
 
     def changed_region(self, name: str, content: str) -> bool:
         previous = self._last_regions.get(name)

@@ -36,3 +36,8 @@ doc/
 ```
 
 详细文档见 [doc/README.md](./doc/README.md)。
+
+## License
+
+本项目以 **GNU GPL v3.0 (or later)** 开源发布。  
+你可以在遵守 GPL 条款的前提下自由使用、修改和再分发本项目。

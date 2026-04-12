@@ -2,58 +2,66 @@ from __future__ import annotations
 
 import asyncio
 import cProfile
+from collections import deque
 import io
 import json
 import os
 from pathlib import Path
 import pstats
-import shlex
+import re
 import sys
 import time
 
-from .. import APP_NAME, APP_VERSION
-from ..core.async_runtime import AsyncRuntime
-from ..core.buffer import Buffer
-from ..core.config import AppConfig
-from ..core.console import CSI, ConsoleController, KeyReader
-from ..core.process_pipe import AsyncProcessManager
-from ..core.terminal_capabilities import detect_terminal_capabilities
-from ..core.theme import RESET, Theme, load_theme
-from ..features.file_index import FileIndex
-from ..features.formatter import normalize_code_style, organize_python_imports
-from ..features.fuzzy import fuzzy_filter
-from ..features.git_status import GitStatusProvider
-from ..features.ast_query import AstQueryService
-from ..features.modules import FileTreeFeature, GitControlFeature, TabCompletionFeature
-from ..features.modules.git_control import GitSnapshot
-from ..features.refactor import find_next, rename_symbol, replace_all, replace_next, word_at_cursor
-from ..features.syntax import PLAIN_PROFILE, SyntaxManager
-from ..plugins import PluginManager
-from ..scripting import ScriptError
-from .floating_list import FloatingList
-from .layout import FeatureDescriptor, FeatureRegistry, LayoutContext, LayoutManager, NotificationCenter
-
-MODE_NORMAL = "NORMAL"
-MODE_INSERT = "INSERT"
-MODE_COMMAND = "COMMAND"
-MODE_VISUAL = "VISUAL"
-MODE_FUZZY = "FUZZY"
-MODE_FLOAT_LIST = "FLOAT_LIST"
-MODE_EXPLORER = "EXPLORER"
-MODE_COMPLETION = "COMPLETION"
-MODE_KEY_HINTS = "KEY_HINTS"
-MODE_ALERT = "ALERT"
+from ... import APP_NAME, APP_VERSION
+from ...core.async_runtime import AsyncRuntime
+from ...core.buffer import Buffer
+from ...core.config import AppConfig
+from ...core.console import CSI, ConsoleController, KeyReader
+from ...core.display import display_width, index_from_display_col, pad_to_display, slice_by_display
+from ...core.history import ActionRecord, ActionSnapshot, HistoryStack
+from ...core.persistence import EditorPersistence, SwapPayload
+from ...core.process_pipe import AsyncProcessManager
+from ...core.terminal_capabilities import detect_terminal_capabilities
+from ...core.theme import RESET, Theme, load_theme
+from ...features.ast_query import AstQueryService
+from ...features.file_index import FileIndex
+from ...features.formatter import normalize_code_style, organize_python_imports
+from ...features.fuzzy import fuzzy_filter
+from ...features.git_status import GitStatusProvider
+from ...features.live_grep import GrepMatch, LiveGrep
+from ...features.modules import FileTreeFeature, GitControlFeature, TabCompletionFeature
+from ...features.modules.git_control import GitSnapshot
+from ...features.refactor import find_next, rename_symbol, replace_all, replace_next, word_at_cursor
+from ...features.syntax import PLAIN_PROFILE, SyntaxManager
+from ...plugins import PluginManager
+from ...scripting import ScriptError
+from ..floating_list import FloatingList
+from ..layout import FeatureDescriptor, FeatureRegistry, LayoutContext, LayoutManager, NotificationCenter
+from .commands import CommandsMixin
+from .insert_mode import InsertModeMixin
+from .modes import (
+    MODE_ALERT,
+    MODE_COMMAND,
+    MODE_COMPLETION,
+    MODE_EXPLORER,
+    MODE_FLOAT_LIST,
+    MODE_FUZZY,
+    MODE_INSERT,
+    MODE_KEY_HINTS,
+    MODE_LIVE_GREP,
+    MODE_NORMAL,
+    MODE_VISUAL,
+)
+from .normal_mode import NormalModeMixin
+from .text_objects import is_word_char, quote_range, word_range
+from .ui_mode import UIModeMixin
 
 
 def clamp(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
 
 
-def _is_word_char(char: str) -> bool:
-    return char.isalnum() or char == "_"
-
-
-class PvimEditor:
+class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
     def __init__(self, file_path: Path | None, config: AppConfig) -> None:
         self.config = config
 
@@ -67,6 +75,8 @@ class PvimEditor:
 
         self.mode = MODE_NORMAL
         self.pending_operator = ""
+        self.pending_scope = ""
+        self._pending_motion = ""
         self.command_text = ""
         self.visual_anchor: int | None = None
         self.extra_cursor_lines: list[int] = []
@@ -81,6 +91,36 @@ class PvimEditor:
         self._completion_insert_col = 0
         self._completion_insert_row = 0
         self._completion_replace_end = 0
+        self._live_grep = LiveGrep()
+        self._live_grep_matches: list[GrepMatch] = []
+        self._live_grep_requested_version = 0
+        self._live_grep_running_version = 0
+        self._live_grep_task_active = False
+        self._live_grep_query = ""
+        self._live_grep_mode = False
+
+        self._history = HistoryStack(max_actions=400)
+        self._history_enabled = True
+        self._history_suspended = False
+        self._skip_history_once = False
+        self._current_line_ending = "\n"
+
+        self._input_queue: deque[str] = deque()
+        self._macro_registers: dict[str, list[str]] = {}
+        self._macro_recording_register: str | None = None
+        self._macro_recording_keys: list[str] = []
+        self._macro_waiting_action: str = ""
+        self._macro_replaying = False
+
+        self._persistence = EditorPersistence()
+        self._swap_enabled = True
+        self._swap_interval = 4.0
+        self._last_swap_write = 0.0
+        self._swap_prompt_path: Path | None = None
+        self._swap_prompt_payload: SwapPayload | None = None
+        self._session_enabled = True
+        self._session_path = Path.cwd() / ".pvim.session.json"
+        self._soft_wrap_enabled = True
 
         self.key_hints_enabled = True
         self.key_hints_trigger = "F1"
@@ -149,6 +189,8 @@ class PvimEditor:
 
         if file_path is not None:
             self.open_file(file_path, force=True, startup=True)
+        elif self._session_enabled:
+            self._restore_session()
 
     @property
     def lines(self) -> list[str]:
@@ -241,11 +283,18 @@ class PvimEditor:
     def _apply_runtime_config(self) -> None:
         self.show_line_numbers = self.config.show_line_numbers()
         self.tab_size = self.config.tab_size()
+        self._soft_wrap_enabled = self.config.soft_wrap_enabled()
         self.show_sidebar = self.config.sidebar_enabled()
         self.sidebar_width = self.config.sidebar_width()
         self.key_hints_enabled = self.config.key_hints_enabled()
         self.key_hints_trigger = self.config.key_hints_trigger()
         self._lazy_load_enabled = self.config.lazy_load_enabled()
+        self._swap_enabled = self.config.swap_enabled()
+        self._swap_interval = self.config.swap_interval_seconds()
+        self._session_enabled = self.config.session_enabled()
+        self._session_path = self.config.session_file()
+        self._history_enabled = self.config.undo_tree_enabled()
+        self._history.set_limit(self.config.undo_tree_max_actions())
         self._feature_registry.set_enabled("tabline", self.config.feature_enabled("tabline"))
         self._feature_registry.set_enabled("winbar", self.config.feature_enabled("winbar"))
         self._feature_registry.set_enabled("file_tree", self.config.feature_enabled("file_tree"))
@@ -501,6 +550,8 @@ class PvimEditor:
     def _close_alert(self) -> None:
         self.mode = self._resume_mode_after_alert if self._resume_mode_after_alert != MODE_ALERT else MODE_NORMAL
         self.alert_lines = []
+        self._swap_prompt_path = None
+        self._swap_prompt_payload = None
 
     def _open_key_hints(self) -> None:
         if not self.key_hints_enabled:
@@ -531,12 +582,16 @@ class PvimEditor:
             "  Ctrl+U clear multi-cursor",
             "  Ctrl+Left / Ctrl+Right move by word",
             "  Tab / Shift+Tab indent / outdent",
+            "  u undo / Ctrl+Y redo",
+            "  q a ... q record macro / @a replay",
+            "  ciw da\" vap cif text objects",
             "",
             "Tools",
             "  Ctrl+F quick find",
             "  Ctrl+G quick replace",
             "  Ctrl+N tab completion",
             "  Ctrl+P fuzzy finder",
+            "  :grep <text> project search",
             "  Ctrl+R rename symbol",
             "  F3 file tree",
             "  F4 toggle sidebar",
@@ -564,6 +619,8 @@ class PvimEditor:
             "  :profile script <path>",
             "  :piece",
             "  :termcaps",
+            "  :session save|load",
+            "  :swap write|clear",
             "  :tree open|refresh|close|toggle",
             "  :feature <name> <on|off>",
         ]
@@ -575,6 +632,246 @@ class PvimEditor:
         if self.config.feature_enabled("notifications") and message:
             ttl = 3.0 if error else 2.0
             self._notifications.push(message, ttl_seconds=ttl)
+
+    def _capture_snapshot(self) -> ActionSnapshot:
+        return ActionSnapshot(
+            lines=tuple(self.lines),
+            cursor_x=self.cx,
+            cursor_y=self.cy,
+            line_ending=self._current_line_ending,
+        )
+
+    def _push_history_if_changed(self, before: ActionSnapshot, *, label: str) -> None:
+        if self._skip_history_once:
+            self._skip_history_once = False
+            return
+        if self._history_suspended or not self._history_enabled:
+            return
+        after = self._capture_snapshot()
+        if before.lines == after.lines:
+            return
+        self._history.push(ActionRecord(label=label, before=before, after=after))
+
+    def _apply_snapshot(self, snapshot: ActionSnapshot) -> None:
+        self._history_suspended = True
+        try:
+            self.lines = list(snapshot.lines) if snapshot.lines else [""]
+            self.cy = clamp(snapshot.cursor_y, 0, len(self.lines) - 1)
+            self.cx = clamp(snapshot.cursor_x, 0, len(self._line()))
+            self.row_offset = max(0, self.row_offset)
+            self.col_offset = max(0, self.col_offset)
+            self._current_line_ending = snapshot.line_ending if snapshot.line_ending in {"\n", "\r\n"} else "\n"
+            self.buffer.mark_all_dirty()
+            self.modified = True
+        finally:
+            self._history_suspended = False
+
+    def _undo(self) -> None:
+        record = self._history.undo()
+        if record is None:
+            self._set_message("Nothing to undo.")
+            return
+        self._skip_history_once = True
+        self._apply_snapshot(record.before)
+        self.pending_operator = ""
+        self.pending_scope = ""
+        self._set_message(f"Undo: {record.label}")
+
+    def _redo(self) -> None:
+        record = self._history.redo()
+        if record is None:
+            self._set_message("Nothing to redo.")
+            return
+        self._skip_history_once = True
+        self._apply_snapshot(record.after)
+        self.pending_operator = ""
+        self.pending_scope = ""
+        self._set_message(f"Redo: {record.label}")
+
+    def _start_macro_recording(self, register: str) -> None:
+        self._macro_recording_register = register
+        self._macro_recording_keys = []
+        self._set_message(f"Recording macro @{register}")
+
+    def _stop_macro_recording(self) -> None:
+        register = self._macro_recording_register
+        if register is None:
+            return
+        self._macro_registers[register] = list(self._macro_recording_keys)
+        self._macro_recording_register = None
+        self._macro_recording_keys = []
+        self._set_message(f"Recorded macro @{register}")
+
+    def _replay_macro(self, register: str) -> None:
+        if not self.config.macros_enabled():
+            self._set_message("Macros are disabled in config.", error=True)
+            return
+        keys = self._macro_registers.get(register, [])
+        if not keys:
+            self._set_message(f"Macro @{register} is empty.", error=True)
+            return
+        for key in reversed(keys):
+            self._input_queue.appendleft(key)
+        self._set_message(f"Replay macro @{register} ({len(keys)} keys)")
+
+    def _record_key_for_macro(self, key: str) -> None:
+        if self._macro_recording_register is None or self._macro_replaying:
+            return
+        if key == "q":
+            return
+        if self._macro_waiting_action:
+            return
+        self._macro_recording_keys.append(key)
+
+    def _normalize_loaded_text(self, text: str) -> tuple[str, str]:
+        if "\r\n" in text:
+            line_ending = "\r\n"
+        elif "\r" in text:
+            line_ending = "\r\n"
+        else:
+            line_ending = "\n"
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        return normalized, line_ending
+
+    def _write_swap_if_needed(self, *, force: bool = False) -> None:
+        if not self._swap_enabled or not self.modified or self.file_path is None:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_swap_write < self._swap_interval:
+            return
+        try:
+            self._persistence.write_swap(
+                file_path=self.file_path,
+                lines=self.lines,
+                cursor_x=self.cx,
+                cursor_y=self.cy,
+                line_ending=self._current_line_ending,
+            )
+        except OSError as exc:
+            self._set_message(f"Swap write failed: {exc}", error=True)
+            return
+        self._last_swap_write = now
+
+    def _open_swap_prompt(self, path: Path, payload: SwapPayload) -> None:
+        self._swap_prompt_path = path
+        self._swap_prompt_payload = payload
+        self.alert_lines = [
+            f"Swap file found for {path}",
+            "Press y to recover unsaved content.",
+            "Press n to ignore and remove swap file.",
+        ]
+        self._resume_mode_after_alert = self.mode if self.mode != MODE_ALERT else MODE_NORMAL
+        self.mode = MODE_ALERT
+
+    def _maybe_prompt_swap_recovery(self, path: Path) -> None:
+        payload = self._persistence.read_swap(path)
+        if payload is None:
+            return
+        self._open_swap_prompt(path, payload)
+
+    def _apply_swap_payload(self) -> None:
+        path = self._swap_prompt_path
+        payload = self._swap_prompt_payload
+        if path is None or payload is None:
+            return
+        self.lines = payload.lines if payload.lines else [""]
+        self.cy = clamp(payload.cursor_y, 0, len(self.lines) - 1)
+        self.cx = clamp(payload.cursor_x, 0, len(self._line()))
+        self._current_line_ending = payload.line_ending if payload.line_ending in {"\n", "\r\n"} else "\n"
+        self.modified = True
+        self.buffer.mark_all_dirty()
+        self._set_message("Swap recovered.")
+
+    def _clear_swap_prompt(self) -> None:
+        self._swap_prompt_path = None
+        self._swap_prompt_payload = None
+        self._close_alert()
+
+    def _restore_session(self) -> None:
+        data = self._persistence.load_session(self._session_path)
+        if not data:
+            return
+        file_name = data.get("current_file")
+        if isinstance(file_name, str) and file_name:
+            opened = self.open_file(file_name, force=True, startup=True)
+            if opened:
+                cursor_x = int(data.get("cursor_x", 0))
+                cursor_y = int(data.get("cursor_y", 0))
+                self.cy = clamp(cursor_y, 0, len(self.lines) - 1)
+                self.cx = clamp(cursor_x, 0, len(self._line()))
+        tabs = data.get("tabs")
+        if isinstance(tabs, list):
+            parsed_tabs = [str(item) for item in tabs if str(item).strip()]
+            if parsed_tabs:
+                self._tab_items = parsed_tabs
+        current_index = data.get("tab_index")
+        if isinstance(current_index, int):
+            self._current_tab_index = clamp(current_index, 0, max(0, len(self._tab_items) - 1))
+
+    def _save_session(self) -> None:
+        if not self._session_enabled:
+            return
+        payload = {
+            "current_file": str(self.file_path) if self.file_path else "",
+            "cursor_x": self.cx,
+            "cursor_y": self.cy,
+            "tabs": list(self._tab_items),
+            "tab_index": self._current_tab_index,
+        }
+        try:
+            self._persistence.save_session(self._session_path, payload)
+        except OSError:
+            return
+
+    def _start_live_grep_task(self, version: int, query: str) -> None:
+        self._live_grep_task_active = True
+        self._live_grep_running_version = version
+
+        async def _search() -> tuple[int, str, list[GrepMatch]]:
+            matches = await self._live_grep.search(
+                Path.cwd(),
+                query,
+                limit=self.config.live_grep_max_results(),
+            )
+            return version, query, matches
+
+        self._async_runtime.submit("feature:live-grep", _search())
+
+    def _open_live_grep(self, query: str) -> None:
+        if not self.config.live_grep_enabled():
+            self._set_message("Live grep is disabled in config.", error=True)
+            return
+        clean = query.strip()
+        if not clean:
+            self._set_message("Usage: :grep <query>", error=True)
+            return
+        self._live_grep_query = clean
+        self._live_grep_requested_version += 1
+        if not self._live_grep_task_active:
+            self._start_live_grep_task(self._live_grep_requested_version, clean)
+        self._floating_list = FloatingList(
+            title=f'Live Grep "{clean}"',
+            footer="<Enter> open  <Esc> close",
+            items=["searching..."],
+        )
+        self._floating_source = "live_grep"
+        self.mode = MODE_FLOAT_LIST
+
+    def _accept_live_grep_selection(self) -> None:
+        popup = self._floating_list
+        if popup is None:
+            return
+        index = popup.selected
+        if index < 0 or index >= len(self._live_grep_matches):
+            return
+        match = self._live_grep_matches[index]
+        if self.open_file(match.file_path, force=False):
+            self.cy = clamp(match.line - 1, 0, len(self.lines) - 1)
+            self.cx = clamp(match.column - 1, 0, len(self._line()))
+            self.mode = MODE_NORMAL
+            self._floating_list = None
+            self._floating_source = ""
+            self._set_message(f"Grep jump: {match.file_path}:{match.line}:{match.column}")
 
     def _drain_async_events(self, *, max_items: int = 64) -> None:
         for event in self._async_runtime.poll_events(max_items=max_items):
@@ -642,6 +939,34 @@ class PvimEditor:
                             self._git_control_feature.apply(snapshot)
                         if self._git_control_requested_version > version:
                             self._start_git_control_task(self._git_control_requested_version)
+                    continue
+
+                if label == "feature:live-grep":
+                    self._live_grep_task_active = False
+                    if error:
+                        self._set_message(f"Live grep failed: {error}", error=True)
+                        continue
+                    version = -1
+                    query = self._live_grep_query
+                    matches: list[GrepMatch] = []
+                    if isinstance(result, tuple) and len(result) == 3:
+                        version = int(result[0])
+                        query = str(result[1])
+                        payload = result[2]
+                        if isinstance(payload, list):
+                            matches = [item for item in payload if isinstance(item, GrepMatch)]
+                    if version != self._live_grep_requested_version:
+                        if self._live_grep_requested_version > version:
+                            self._start_live_grep_task(self._live_grep_requested_version, self._live_grep_query)
+                        continue
+                    self._live_grep_query = query
+                    self._live_grep_matches = matches
+                    if self._floating_source == "live_grep" and self._floating_list is not None:
+                        labels = [match.label(Path.cwd()) for match in matches]
+                        if not labels:
+                            labels = ["(no matches)"]
+                        self._floating_list.set_items(labels)
+                    self._set_message(f"Live grep: {len(matches)} matches")
                     continue
 
                 if error:
@@ -810,10 +1135,25 @@ class PvimEditor:
         elif self.cy >= self.row_offset + text_rows:
             self.row_offset = self.cy - text_rows + 1
 
-        if self.cx < self.col_offset:
-            self.col_offset = self.cx
-        elif self.cx >= self.col_offset + text_cols:
-            self.col_offset = self.cx - text_cols + 1
+        if self._soft_wrap_enabled:
+            self.col_offset = 0
+            while self.row_offset < self.cy and self._cursor_softwrap_row(text_cols) > text_rows:
+                self.row_offset += 1
+            while self.row_offset > 0:
+                previous = self.row_offset - 1
+                probe = self.row_offset
+                self.row_offset = previous
+                if self._cursor_softwrap_row(text_cols) <= text_rows:
+                    continue
+                self.row_offset = probe
+                break
+        else:
+            line = self._line()
+            cursor_display = display_width(line[: self.cx])
+            if cursor_display < self.col_offset:
+                self.col_offset = cursor_display
+            elif cursor_display >= self.col_offset + text_cols:
+                self.col_offset = cursor_display - text_cols + 1
 
         self.row_offset = max(0, self.row_offset)
         self.col_offset = max(0, self.col_offset)
@@ -854,7 +1194,7 @@ class PvimEditor:
         index = self.cx
         while index > 0 and line[index - 1].isspace():
             index -= 1
-        while index > 0 and _is_word_char(line[index - 1]):
+        while index > 0 and is_word_char(line[index - 1]):
             index -= 1
         if index == self.cx and index > 0:
             index -= 1
@@ -866,7 +1206,7 @@ class PvimEditor:
         length = len(line)
         while index < length and line[index].isspace():
             index += 1
-        while index < length and _is_word_char(line[index]):
+        while index < length and is_word_char(line[index]):
             index += 1
 
         if index >= length and self.cy < len(self.lines) - 1:
@@ -1028,6 +1368,202 @@ class PvimEditor:
         if self.mode != MODE_VISUAL or self.visual_anchor is None:
             return None
         return min(self.visual_anchor, self.cy), max(self.visual_anchor, self.cy)
+
+    def _paragraph_range(self, scope: str) -> tuple[int, int] | None:
+        if not self.lines:
+            return None
+        anchor = self.cy
+        if not self.lines[anchor].strip():
+            probe = anchor
+            while probe < len(self.lines) and not self.lines[probe].strip():
+                probe += 1
+            if probe >= len(self.lines):
+                probe = anchor
+                while probe >= 0 and not self.lines[probe].strip():
+                    probe -= 1
+            if probe < 0 or probe >= len(self.lines):
+                return None
+            anchor = probe
+
+        start = anchor
+        end = anchor
+        while start > 0 and self.lines[start - 1].strip():
+            start -= 1
+        while end < len(self.lines) - 1 and self.lines[end + 1].strip():
+            end += 1
+        if scope == "a":
+            if start > 0 and not self.lines[start - 1].strip():
+                start -= 1
+            if end < len(self.lines) - 1 and not self.lines[end + 1].strip():
+                end += 1
+        return start, end
+
+    def _ast_text_object_range(self, kind: str, scope: str) -> tuple[int, int, int, int] | None:
+        if self.file_path is None:
+            return None
+        source = "\n".join(self.lines)
+        match = self._ast_query().query_at(
+            file_path=self.file_path,
+            source=source,
+            row=self.cy + 1,
+            col=self.cx + 1,
+            kinds={kind},
+        )
+        if match is None:
+            return None
+        start_line = clamp(match.start_line - 1, 0, len(self.lines) - 1)
+        end_line = clamp(match.end_line - 1, 0, len(self.lines) - 1)
+        start_col = max(0, match.start_col - 1)
+        end_col = max(0, match.end_col - 1)
+        if scope == "i" and end_line - start_line >= 1:
+            start_line += 1
+            start_col = 0
+            end_col = len(self.lines[end_line])
+        return start_line, start_col, end_line, end_col
+
+    def _delete_char_range(self, start_line: int, start_col: int, end_line: int, end_col: int) -> None:
+        if (start_line, start_col) > (end_line, end_col):
+            start_line, end_line = end_line, start_line
+            start_col, end_col = end_col, start_col
+
+        start_line = clamp(start_line, 0, len(self.lines) - 1)
+        end_line = clamp(end_line, 0, len(self.lines) - 1)
+        start_col = clamp(start_col, 0, len(self.lines[start_line]))
+        end_col = clamp(end_col, 0, len(self.lines[end_line]))
+
+        if start_line == end_line:
+            line = self.lines[start_line]
+            self.lines[start_line] = line[:start_col] + line[end_col:]
+        else:
+            head = self.lines[start_line][:start_col]
+            tail = self.lines[end_line][end_col:]
+            self.lines[start_line : end_line + 1] = [head + tail]
+        if not self.lines:
+            self.lines = [""]
+        self.cy = clamp(start_line, 0, len(self.lines) - 1)
+        self.cx = clamp(start_col, 0, len(self._line()))
+        self.buffer.mark_all_dirty()
+        self._mark_modified()
+
+    def _delete_line_range(self, start_line: int, end_line: int) -> None:
+        if start_line > end_line:
+            start_line, end_line = end_line, start_line
+        start_line = clamp(start_line, 0, len(self.lines) - 1)
+        end_line = clamp(end_line, 0, len(self.lines) - 1)
+        del self.lines[start_line : end_line + 1]
+        if not self.lines:
+            self.lines = [""]
+        self.cy = clamp(start_line, 0, len(self.lines) - 1)
+        self.cx = clamp(self.cx, 0, len(self._line()))
+        self.buffer.mark_all_dirty()
+        self._mark_modified()
+
+    def _apply_text_object(self, operator: str, scope: str, key: str) -> bool:
+        if not self.config.text_objects_enabled():
+            self._set_message("Text objects are disabled in config.", error=True)
+            return True
+
+        if key == "w":
+            word = word_range(self._line(), self.cx, scope)
+            if word is None:
+                self._set_message("No word text object.", error=True)
+                return True
+            if operator == "v":
+                self.mode = MODE_VISUAL
+                self.visual_anchor = self.cy
+                return True
+            self._delete_char_range(self.cy, word[0], self.cy, word[1])
+            if operator == "c":
+                self.mode = MODE_INSERT
+                self._set_message("-- INSERT --")
+            return True
+
+        if key == '"':
+            quote = quote_range(self._line(), self.cx, '"', scope)
+            if quote is None:
+                self._set_message('No quote text object for ".', error=True)
+                return True
+            if operator == "v":
+                self.mode = MODE_VISUAL
+                self.visual_anchor = self.cy
+                return True
+            self._delete_char_range(self.cy, quote[0], self.cy, quote[1])
+            if operator == "c":
+                self.mode = MODE_INSERT
+                self._set_message("-- INSERT --")
+            return True
+
+        if key == "p":
+            paragraph = self._paragraph_range(scope)
+            if paragraph is None:
+                self._set_message("No paragraph text object.", error=True)
+                return True
+            if operator == "v":
+                self.mode = MODE_VISUAL
+                self.visual_anchor = paragraph[0]
+                self.cy = paragraph[1]
+                self.cx = 0
+                return True
+            self._delete_line_range(paragraph[0], paragraph[1])
+            if operator == "c":
+                self.mode = MODE_INSERT
+                self._set_message("-- INSERT --")
+            return True
+
+        if key in {"f", "c"}:
+            kind = "function" if key == "f" else "class"
+            match = self._ast_text_object_range(kind, scope)
+            if match is None:
+                self._set_message(f"No AST {kind} text object.", error=True)
+                return True
+            if operator == "v":
+                self.mode = MODE_VISUAL
+                self.visual_anchor = match[0]
+                self.cy = match[2]
+                self.cx = 0
+                return True
+            if scope == "a":
+                self._delete_line_range(match[0], match[2])
+            else:
+                self._delete_char_range(match[0], match[1], match[2], match[3])
+            if operator == "c":
+                self.mode = MODE_INSERT
+                self._set_message("-- INSERT --")
+            return True
+
+        return False
+
+    def _goto_definition(self) -> None:
+        symbol = word_at_cursor(self._line(), self.cx)
+        if not symbol:
+            self._set_message("No symbol under cursor.", error=True)
+            return
+
+        pattern = re.compile(rf"^\s*(def|class)\s+{re.escape(symbol)}\b")
+        for index, line in enumerate(self.lines):
+            if pattern.search(line):
+                self.cy = index
+                self.cx = max(0, line.find(symbol))
+                self._set_message(f"Definition: {symbol} (current file)")
+                return
+
+        self.file_index.refresh()
+        for relative in self.file_index.list_files()[:2000]:
+            path = Path.cwd() / relative
+            if self.file_path is not None and path.resolve() == self.file_path.resolve():
+                continue
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except (OSError, UnicodeDecodeError):
+                continue
+            for index, line in enumerate(lines):
+                if pattern.search(line):
+                    if self.open_file(path, force=False):
+                        self.cy = clamp(index, 0, len(self.lines) - 1)
+                        self.cx = max(0, self._line().find(symbol))
+                        self._set_message(f"Definition: {symbol} ({relative})")
+                    return
+        self._set_message(f"Definition not found: {symbol}", error=True)
 
     def _indent_lines(self, start: int, end: int) -> None:
         prefix = " " * self.tab_size
@@ -1194,10 +1730,10 @@ class PvimEditor:
     def _completion_prefix_range(self) -> tuple[int, int, str]:
         line = self._line()
         start = self.cx
-        while start > 0 and _is_word_char(line[start - 1]):
+        while start > 0 and is_word_char(line[start - 1]):
             start -= 1
         end = self.cx
-        while end < len(line) and _is_word_char(line[end]):
+        while end < len(line) and is_word_char(line[end]):
             end += 1
         return start, end, line[start:self.cx]
 
@@ -1568,13 +2104,20 @@ class PvimEditor:
         text = ""
         if path.exists():
             try:
-                text = path.read_text(encoding="utf-8")
+                raw = path.read_bytes().decode("utf-8")
+                normalized, detected_line_ending = self._normalize_loaded_text(raw)
+                text = normalized
+                if self.config.preserve_line_ending():
+                    self._current_line_ending = detected_line_ending
+                else:
+                    self._current_line_ending = self.config.default_line_ending()
             except (OSError, UnicodeDecodeError) as exc:
                 self._set_message(f"Open failed: {exc}", error=True)
                 return False
             self._set_message(f"Opened {path}")
         else:
             self._set_message(f"New file: {path}")
+            self._current_line_ending = self.config.default_line_ending()
 
         self.file_path = path
         self.lines = text.split("\n")
@@ -1591,8 +2134,11 @@ class PvimEditor:
         self.col_offset = 0
         self.modified = False
         self.pending_operator = ""
+        self.pending_scope = ""
+        self._pending_motion = ""
         self.visual_anchor = None
         self._clear_multi_cursor()
+        self._history.clear()
         self._syntax_profile = self._syntax_manager().profile_for_file(self.file_path)
         if self.file_path is not None:
             tab_label = self.file_path.name
@@ -1600,6 +2146,7 @@ class PvimEditor:
                 self._tab_items.append(tab_label)
             self._current_tab_index = self._tab_items.index(tab_label)
         self._schedule_git_control_refresh(force=True)
+        self._maybe_prompt_swap_recovery(path)
         return True
 
     def save_file(self, target: Path | str | None = None) -> bool:
@@ -1612,7 +2159,10 @@ class PvimEditor:
 
         try:
             self.file_path.parent.mkdir(parents=True, exist_ok=True)
-            self.file_path.write_text(self.buffer.text(), encoding="utf-8")
+            current = self.buffer.text()
+            target_newline = self._current_line_ending if self.config.preserve_line_ending() else self.config.default_line_ending()
+            data = current.replace("\n", target_newline)
+            self.file_path.write_text(data, encoding="utf-8", newline="")
         except OSError as exc:
             self._set_message(f"Write failed: {exc}", error=True)
             return False
@@ -1624,13 +2174,19 @@ class PvimEditor:
                 self._tab_items.append(tab_label)
             self._current_tab_index = self._tab_items.index(tab_label)
         self._schedule_git_control_refresh(force=True)
+        if self.file_path is not None:
+            self._persistence.remove_swap(self.file_path)
         self._set_message(f"Wrote {self.file_path}")
         return True
 
     def request_quit(self, *, force: bool) -> bool:
         if self.modified and not force:
+            self._write_swap_if_needed(force=True)
             self._set_message("No write since last change. Use :q! to discard.", error=True)
             return False
+        self._save_session()
+        if self.file_path is not None and not self.modified:
+            self._persistence.remove_swap(self.file_path)
         self.running = False
         return True
 
@@ -1666,8 +2222,8 @@ class PvimEditor:
             return f"{base_style}{' ' * text_cols}{RESET}"
 
         top_left, top_right, bottom_left, bottom_right, vertical, horizontal = self._box_chars()
-        longest_item = max((len(item) for item in popup.items), default=20)
-        content_width = max(len(title) + 2, len(footer) + 2, longest_item + 2)
+        longest_item = max((display_width(item) for item in popup.items), default=20)
+        content_width = max(display_width(title) + 2, display_width(footer) + 2, longest_item + 2)
         popup_width = clamp(content_width + 2, 24, max(24, text_cols - 2))
         popup_height = clamp(min(text_rows - 2, len(popup.items) + 4), 6, max(6, text_rows - 1))
         top = max(0, (text_rows - popup_height) // 2)
@@ -1682,8 +2238,9 @@ class PvimEditor:
         content_width = popup_width - 2
         if row == 0:
             heading = f" {title} "
-            heading = heading[:content_width]
-            top_line = top_left + heading.center(content_width, horizontal) + top_right
+            heading = slice_by_display(heading, 0, content_width)
+            heading = pad_to_display(heading, content_width)
+            top_line = top_left + heading + top_right
             return f"{border_style}{(' ' * left) + top_line + (' ' * right_pad)}{RESET}"
 
         if row == popup_height - 1:
@@ -1691,12 +2248,13 @@ class PvimEditor:
             return f"{border_style}{(' ' * left) + bottom_line + (' ' * right_pad)}{RESET}"
 
         if row == popup_height - 2 and footer:
-            footer_line = vertical + footer[:content_width].ljust(content_width) + vertical
+            footer_text = pad_to_display(slice_by_display(footer, 0, content_width), content_width)
+            footer_line = vertical + footer_text + vertical
             return f"{border_style}{(' ' * left) + footer_line + (' ' * right_pad)}{RESET}"
 
         index = popup.scroll + row - 1
         if 0 <= index < len(popup.items):
-            text = popup.items[index][:content_width].ljust(content_width)
+            text = pad_to_display(slice_by_display(popup.items[index], 0, content_width), content_width)
             middle_line = vertical + text + vertical
             style = selected_style if index == popup.selected else base_style
             return f"{style}{(' ' * left) + middle_line + (' ' * right_pad)}{RESET}"
@@ -1715,12 +2273,12 @@ class PvimEditor:
 
         if screen_row == 0:
             head = "Keyboard Hints (Up/Down scroll, Esc close)"
-            return f"{selected_style}{head[:text_cols].ljust(text_cols)}{RESET}"
+            return f"{selected_style}{pad_to_display(slice_by_display(head, 0, text_cols), text_cols)}{RESET}"
 
         content_row = self.key_hint_scroll + screen_row - 1
         if 0 <= content_row < len(self.key_hint_lines):
             text = self.key_hint_lines[content_row]
-            return f"{base_style}{text[:text_cols].ljust(text_cols)}{RESET}"
+            return f"{base_style}{pad_to_display(slice_by_display(text, 0, text_cols), text_cols)}{RESET}"
 
         return f"{base_style}{' ' * text_cols}{RESET}"
 
@@ -1730,13 +2288,41 @@ class PvimEditor:
 
         if screen_row == 0:
             head = "Script Error (Esc/Enter close)"
-            return f"{error_style}{head[:text_cols].ljust(text_cols)}{RESET}"
+            return f"{error_style}{pad_to_display(slice_by_display(head, 0, text_cols), text_cols)}{RESET}"
 
         content_row = screen_row - 1
         if 0 <= content_row < len(self.alert_lines):
             text = self.alert_lines[content_row]
-            return f"{base_style}{text[:text_cols].ljust(text_cols)}{RESET}"
+            return f"{base_style}{pad_to_display(slice_by_display(text, 0, text_cols), text_cols)}{RESET}"
         return f"{base_style}{' ' * text_cols}{RESET}"
+
+    def _line_segment_count(self, line_index: int, text_cols: int) -> int:
+        if not (0 <= line_index < len(self.lines)):
+            return 1
+        width = max(1, display_width(self.lines[line_index]))
+        return max(1, (width + text_cols - 1) // text_cols)
+
+    def _visual_slot(self, screen_row: int, text_cols: int) -> tuple[int, int] | None:
+        if not self._soft_wrap_enabled:
+            return self.row_offset + screen_row, self.col_offset
+        visual_row = 0
+        line_index = self.row_offset
+        while line_index < len(self.lines):
+            segments = self._line_segment_count(line_index, text_cols)
+            for segment in range(segments):
+                if visual_row == screen_row:
+                    return line_index, segment * text_cols
+                visual_row += 1
+            line_index += 1
+        return None
+
+    def _cursor_softwrap_row(self, text_cols: int) -> int:
+        row = 1
+        for line_index in range(self.row_offset, self.cy):
+            row += self._line_segment_count(line_index, text_cols)
+        cursor_display = display_width(self.lines[self.cy][: self.cx])
+        row += cursor_display // max(1, text_cols)
+        return row
 
     def _render_editor_row(
         self,
@@ -1756,17 +2342,18 @@ class PvimEditor:
         if self._should_render_dashboard():
             return self._render_dashboard_row(screen_row, text_rows, gutter, text_cols)
 
-        line_index = self.row_offset + screen_row
-        if line_index < len(self.lines):
+        slot = self._visual_slot(screen_row, text_cols)
+        if slot is not None:
+            line_index, start_display = slot
             raw = self.lines[line_index]
-            visible_code = raw[self.col_offset : self.col_offset + text_cols]
+            visible_code = slice_by_display(raw, start_display, text_cols)
             ghost_chunks = self.buffer.get_virtual_text(line_index)
             ghost_visible = ""
             if ghost_chunks:
                 ghost_raw = "  <<" + " | ".join(ghost_chunks) + ">>"
-                room = max(0, text_cols - len(visible_code))
-                ghost_visible = ghost_raw[:room]
-            padding = " " * max(0, text_cols - len(visible_code) - len(ghost_visible))
+                room = max(0, text_cols - display_width(visible_code))
+                ghost_visible = slice_by_display(ghost_raw, 0, room)
+            padding = " " * max(0, text_cols - display_width(visible_code) - display_width(ghost_visible))
 
             is_current = line_index == self.cy and self.mode not in {
                 MODE_COMMAND,
@@ -1801,7 +2388,10 @@ class PvimEditor:
                     marker = self._git_control_feature.line_markers.get(line_index + 1, " ")
                     marker = marker if marker.strip() else " "
                 number_width = max(1, gutter - 2)
-                number = f"{line_index + 1:>{number_width}}{marker} "
+                if self._soft_wrap_enabled and start_display > 0:
+                    number = f"{'':>{number_width}}>{marker}"
+                else:
+                    number = f"{line_index + 1:>{number_width}}{marker} "
                 number_style = (
                     self.theme.ui_style("line_number_current")
                     if is_current
@@ -1843,8 +2433,10 @@ class PvimEditor:
         line = " " * text_cols
         style = base_style
         if start <= screen_row < start + len(hints):
-            message = hints[screen_row - start][:text_cols]
-            line = message.center(text_cols)
+            message = slice_by_display(hints[screen_row - start], 0, text_cols)
+            message_width = display_width(message)
+            left_pad = max(0, (text_cols - message_width) // 2)
+            line = pad_to_display((" " * left_pad) + message, text_cols)
             if screen_row - start in {0, 1}:
                 style = accent_style
         if gutter > 0:
@@ -1892,7 +2484,7 @@ class PvimEditor:
 
         if screen_row == 0:
             title = f" Files ({len(files)}) "
-            return f"{header_style}{title[:width].ljust(width)}{RESET}"
+            return f"{header_style}{pad_to_display(slice_by_display(title, 0, width), width)}{RESET}"
 
         file_index = start_index + screen_row - 1
         if file_index < len(files):
@@ -1900,7 +2492,7 @@ class PvimEditor:
             marker = self.git.status_for_relative(relative) if self.config.feature_enabled("git_status") else " "
             marker = marker if marker.strip() else " "
             body = f"{marker} {relative}"
-            text = body[:width].ljust(width)
+            text = pad_to_display(slice_by_display(body, 0, width), width)
             is_current = self._current_relative_path() == relative
             style = current_style if is_current else base_style
             return f"{style}{text}{RESET}"
@@ -1920,7 +2512,7 @@ class PvimEditor:
             mode=self.mode,
             file_name=file_name,
             row=self.cy + 1,
-            col=self.cx + 1,
+            col=display_width(self._line()[: self.cx]) + 1,
             branch=git_label,
         )
         text = self._layout_manager.render_statusline(context)
@@ -1929,21 +2521,23 @@ class PvimEditor:
     def _render_bottom_row(self, width: int) -> tuple[str, int]:
         if self.mode == MODE_COMMAND:
             text = ":" + self.command_text
-            if len(text) <= width:
-                visible = text.ljust(width)
-                cursor_col = len(text) + 1
+            text_width = display_width(text)
+            if text_width <= width:
+                visible = pad_to_display(text, width)
+                cursor_col = text_width + 1
             else:
-                visible = text[-width:]
+                visible = pad_to_display(slice_by_display(text, text_width - width, width), width)
                 cursor_col = width
             return f"{self.theme.ui_style('command_line')}{visible}{RESET}", clamp(cursor_col, 1, width)
 
         if self.mode == MODE_FUZZY:
             text = f"fuzzy> {self.fuzzy_query}"
-            if len(text) <= width:
-                visible = text.ljust(width)
-                cursor_col = len(text) + 1
+            text_width = display_width(text)
+            if text_width <= width:
+                visible = pad_to_display(text, width)
+                cursor_col = text_width + 1
             else:
-                visible = text[-width:]
+                visible = pad_to_display(slice_by_display(text, text_width - width, width), width)
                 cursor_col = width
             return f"{self.theme.ui_style('command_line')}{visible}{RESET}", clamp(cursor_col, 1, width)
 
@@ -1967,7 +2561,7 @@ class PvimEditor:
             text = "Error popup: Esc/Enter close"
             return f"{self.theme.ui_style('command_line')}{text[:width].ljust(width)}{RESET}", 1
 
-        line = self.message[:width].ljust(width)
+        line = pad_to_display(slice_by_display(self.message, 0, width), width)
         style = self.theme.ui_style("message_error") if self.message_error else self.theme.ui_style("message_info")
         return f"{style}{line}{RESET}", 1
 
@@ -1995,7 +2589,7 @@ class PvimEditor:
             mode=self.mode,
             file_name=file_name,
             row=self.cy + 1,
-            col=self.cx + 1,
+            col=display_width(self._line()[: self.cx]) + 1,
             branch=self._git_control_feature.branch
             if self._git_control_feature.enabled
             else (self.git.branch_label(self.file_path) if self.config.feature_enabled("git_status") else "-"),
@@ -2040,8 +2634,16 @@ class PvimEditor:
             cursor_row = height
             cursor_col = 1
         else:
-            cursor_row = plan.editor_top + clamp(self.cy - self.row_offset + 1, 1, text_rows)
-            cursor_col = clamp(sidebar_width + gutter + (self.cx - self.col_offset) + 1, 1, width)
+            line = self._line()
+            cursor_display = display_width(line[: self.cx])
+            if self._soft_wrap_enabled:
+                visual_row = self._cursor_softwrap_row(text_cols)
+                cursor_row = plan.editor_top + clamp(visual_row, 1, text_rows)
+                segment_start = (cursor_display // max(1, text_cols)) * max(1, text_cols)
+                cursor_col = clamp(sidebar_width + gutter + (cursor_display - segment_start) + 1, 1, width)
+            else:
+                cursor_row = plan.editor_top + clamp(self.cy - self.row_offset + 1, 1, text_rows)
+                cursor_col = clamp(sidebar_width + gutter + (cursor_display - self.col_offset) + 1, 1, width)
 
         return frame, cursor_row, cursor_col
 
@@ -2073,17 +2675,19 @@ class PvimEditor:
         visible = items[-2:]
         title = " Notifications "
         top_left, top_right, bottom_left, bottom_right, vertical, horizontal = self._box_chars()
-        content_width = max(len(title), *(len(item) for item in visible))
+        content_width = max(display_width(title), *(display_width(item) for item in visible))
         box_width = clamp(content_width + 2, 20, max(20, width))
         if box_width >= width:
             box_width = width
         left = max(0, width - box_width)
 
-        top = top_left + title.center(max(0, box_width - 2), horizontal) + top_right
+        header = pad_to_display(slice_by_display(title, 0, max(0, box_width - 2)), max(0, box_width - 2))
+        top = top_left + header + top_right
         bottom = bottom_left + (horizontal * max(0, box_width - 2)) + bottom_right
         rows = [top]
         for item in visible:
-            rows.append(vertical + item[: max(0, box_width - 2)].ljust(max(0, box_width - 2)) + vertical)
+            content = pad_to_display(slice_by_display(item, 0, max(0, box_width - 2)), max(0, box_width - 2))
+            rows.append(vertical + content + vertical)
         rows.append(bottom)
 
         start = max(0, len(frame) - len(rows) - 1)
@@ -2107,6 +2711,7 @@ class PvimEditor:
             self.row_offset,
             self.col_offset,
             self.mode,
+            self._soft_wrap_enabled,
             self._active_sidebar_width(width),
             self._gutter_width(),
             frozenset(self._feature_registry.enabled_components()),
@@ -2158,331 +2763,6 @@ class PvimEditor:
         self._last_frame = frame
         self._last_view_state = view_state
         self._last_cursor_line = self.cy
-
-    def execute_command(self, command: str) -> None:
-        command = command.strip()
-        if not command:
-            return
-
-        try:
-            parts = shlex.split(command)
-        except ValueError as exc:
-            self._set_message(f"Command parse failed: {exc}", error=True)
-            return
-
-        if not parts:
-            return
-        cmd = parts[0]
-        args = parts[1:]
-
-        if cmd in {"w", "write"}:
-            if args:
-                self.save_file(args[0])
-            else:
-                self.save_file()
-            return
-
-        if cmd in {"q", "quit"}:
-            self.request_quit(force=False)
-            return
-
-        if cmd in {"q!", "quit!"}:
-            self.request_quit(force=True)
-            return
-
-        if cmd in {"wq", "x"}:
-            if self.save_file():
-                self.request_quit(force=True)
-            return
-
-        if cmd in {"e", "edit"} and args:
-            self.open_file(args[0], force=False)
-            return
-
-        if cmd in {"e!", "edit!"} and args:
-            self.open_file(args[0], force=True)
-            return
-
-        if cmd == "set" and args:
-            option = args[0]
-            if option in {"number", "nu"}:
-                self.show_line_numbers = True
-                self._set_message("Line numbers: on")
-                return
-            if option in {"nonumber", "nonu"}:
-                self.show_line_numbers = False
-                self._set_message("Line numbers: off")
-                return
-            if option in {"sidebar", "side"}:
-                self.show_sidebar = True
-                self._set_message("Sidebar: on")
-                return
-            if option in {"nosidebar", "noside"}:
-                self.show_sidebar = False
-                self._set_message("Sidebar: off")
-                return
-            self._set_message(f"Unknown set option: {option}", error=True)
-            return
-
-        if cmd in {"help", "h"}:
-            self._set_message(
-                "Commands: :w :q :e :find :replace :rename :format :fuzzy :tree :feature :keys :script :plugin :proc :virtual :ast :profile :piece :termcaps"
-            )
-            return
-
-        if cmd in {"keys", "keyhint", "keymap"}:
-            self._open_key_hints()
-            return
-
-        if cmd in {"find", "search"}:
-            query = " ".join(args)
-            self._find(query)
-            return
-
-        if cmd == "replace":
-            if len(args) < 2:
-                self._set_message("Usage: :replace <old> <new>", error=True)
-                return
-            self._replace_next(args[0], args[1])
-            return
-
-        if cmd in {"replaceall", "replace_all"}:
-            if len(args) < 2:
-                self._set_message("Usage: :replaceall <old> <new>", error=True)
-                return
-            self._replace_all(args[0], args[1])
-            return
-
-        if cmd == "rename":
-            if len(args) < 2:
-                self._set_message("Usage: :rename <old> <new>", error=True)
-                return
-            self._rename_symbol(args[0], args[1])
-            return
-
-        if cmd == "refactor":
-            if not args:
-                self._set_message("Usage: :refactor rename/imports ...", error=True)
-                return
-            action = args[0]
-            if action == "rename" and len(args) >= 3:
-                self._rename_symbol(args[1], args[2])
-                return
-            if action in {"imports", "organize-imports"}:
-                self._refactor_imports()
-                return
-            self._set_message(f"Unknown refactor action: {action}", error=True)
-            return
-
-        if cmd == "format":
-            self._format_code()
-            return
-
-        if cmd == "fuzzy":
-            self._open_fuzzy(" ".join(args))
-            return
-
-        if cmd in {"files-refresh", "refresh-files"}:
-            self.file_index.refresh(force=True)
-            self._set_message("File index refreshed.")
-            return
-
-        if cmd == "script":
-            if not args:
-                self._set_message("Usage: :script run <path>", error=True)
-                return
-            action = args[0]
-            if action == "run" and len(args) >= 2:
-                self._run_script_file(args[1])
-                return
-            self._set_message("Usage: :script run <path>", error=True)
-            return
-
-        if cmd == "profile":
-            if len(args) >= 2 and args[0] == "script":
-                self._profile_script_file(args[1])
-                return
-            self._set_message("Usage: :profile script <path>", error=True)
-            return
-
-        if cmd == "plugin":
-            self._handle_plugin_command(args)
-            return
-
-        if cmd == "proc":
-            if not args:
-                self._set_message("Usage: :proc start|read|write|stop|status ...", error=True)
-                return
-            action = args[0]
-            if action == "start" and len(args) >= 2:
-                command_text = " ".join(args[1:])
-                process_id = self._process_manager.start(command_text)
-                self._set_message(f"Process started: {process_id}")
-                return
-            if action == "read" and len(args) >= 2:
-                process_id = int(args[1])
-                max_lines = int(args[2]) if len(args) >= 3 else 20
-                lines = self._process_manager.read(process_id, max_lines=max_lines)
-                if lines:
-                    self._show_alert("\n".join(lines))
-                else:
-                    self._set_message("No process output.")
-                return
-            if action == "write" and len(args) >= 3:
-                process_id = int(args[1])
-                text = " ".join(args[2:])
-                ok = self._process_manager.write(process_id, text)
-                self._set_message("Process write sent." if ok else "Process write failed.")
-                return
-            if action == "stop" and len(args) >= 2:
-                process_id = int(args[1])
-                ok = self._process_manager.stop(process_id)
-                self._set_message("Process stop sent." if ok else "Process stop failed.")
-                return
-            if action == "status" and len(args) >= 2:
-                process_id = int(args[1])
-                self._set_message(f"Process {process_id}: {self._process_manager.status(process_id)}")
-                return
-            self._set_message("Usage: :proc start|read|write|stop|status ...", error=True)
-            return
-
-        if cmd == "virtual":
-            if not args:
-                self._set_message("Usage: :virtual add|set|clear|get ...", error=True)
-                return
-            action = args[0]
-            if action in {"add", "set"} and len(args) >= 3:
-                row = int(args[1]) - 1
-                if row < 0 or row >= len(self.lines):
-                    self._set_message("Invalid row for virtual text.", error=True)
-                    return
-                text = " ".join(args[2:])
-                if action == "add":
-                    self.buffer.add_virtual_text(row, text)
-                else:
-                    self.buffer.set_virtual_text(row, [text] if text else [])
-                self._set_message("Virtual text updated.")
-                return
-            if action == "clear":
-                if len(args) >= 2:
-                    self.buffer.clear_virtual_text(int(args[1]) - 1)
-                else:
-                    self.buffer.clear_virtual_text()
-                self._set_message("Virtual text cleared.")
-                return
-            if action == "get" and len(args) >= 2:
-                row = int(args[1]) - 1
-                text = " | ".join(self.buffer.get_virtual_text(row))
-                self._set_message(text or "(no virtual text)")
-                return
-            self._set_message("Usage: :virtual add|set|clear|get ...", error=True)
-            return
-
-        if cmd == "ast":
-            row = int(args[0]) if len(args) >= 1 else self.cy + 1
-            col = int(args[1]) if len(args) >= 2 else self.cx + 1
-            kinds = args[2] if len(args) >= 3 else "function,class"
-            result = self._plugin_api_dispatch(1, "ast.node_at", [row, col, kinds])
-            if not isinstance(result, str) or not result:
-                self._set_message("AST node not found.", error=True)
-                return
-            self._set_message(f"AST {result}")
-            return
-
-        if cmd == "piece":
-            stats = self.buffer.piece_table_stats()
-            self._set_message(
-                f"PieceTable enabled={stats['enabled']} lines={stats['line_count']} len={stats['length']} dirty={stats['dirty']}"
-            )
-            return
-
-        if cmd == "termcaps":
-            caps = self._terminal_capabilities
-            self._set_message(
-                f"Terminal truecolor={caps.true_color} colors={caps.color_level} unicode={caps.unicode_ui}"
-            )
-            return
-
-        if cmd in {"sidebar"}:
-            if not args:
-                self._set_message("Usage: :sidebar on|off|toggle", error=True)
-                return
-            option = args[0]
-            if option == "on":
-                self.show_sidebar = True
-                self._set_message("Sidebar: on")
-                return
-            if option == "off":
-                self.show_sidebar = False
-                self._set_message("Sidebar: off")
-                return
-            if option == "toggle":
-                self._toggle_sidebar()
-                return
-            self._set_message("Usage: :sidebar on|off|toggle", error=True)
-            return
-
-        if cmd in {"tree", "explorer"}:
-            action = args[0] if args else "open"
-            if action in {"open", "show"}:
-                self._open_explorer(refresh=False)
-                return
-            if action in {"refresh", "reload"}:
-                self._open_explorer(refresh=True)
-                return
-            if action in {"close", "hide"}:
-                self._close_explorer()
-                return
-            if action == "toggle":
-                if self.mode == MODE_EXPLORER:
-                    self._close_explorer()
-                else:
-                    self._open_explorer(refresh=False)
-                return
-            self._set_message("Usage: :tree open|refresh|close|toggle", error=True)
-            return
-
-        if cmd == "feature":
-            if len(args) < 2:
-                self._set_message("Usage: :feature <name> <on|off>", error=True)
-                return
-            name = args[0]
-            state = args[1].lower()
-            enabled = state == "on"
-            if state not in {"on", "off"}:
-                self._set_message("Usage: :feature <name> <on|off>", error=True)
-                return
-            if not self._feature_registry.set_enabled(name, enabled):
-                self._set_message(f"Unknown feature: {name}", error=True)
-                return
-            if name == "file_tree":
-                self._file_tree_feature.enabled = enabled
-                if enabled:
-                    self._schedule_file_tree_refresh()
-                else:
-                    self._close_explorer()
-            elif name == "tab_completion":
-                self._completion_feature.enabled = enabled
-                if not enabled:
-                    self._close_tab_completion()
-            elif name == "git_control":
-                self._git_control_feature.enabled = enabled
-                if enabled:
-                    self._schedule_git_control_refresh(force=True)
-                else:
-                    self._git_control_feature.apply(GitSnapshot(branch="-", file_state="clean", line_markers={}))
-            elif name == "notifications" and not enabled:
-                self._notifications = NotificationCenter()
-            self._set_message(f"Feature {name}: {'on' if enabled else 'off'}")
-            return
-
-        if cmd in {"reload-config", "config-reload"}:
-            self.config = AppConfig.load(self.config.path)
-            self._apply_runtime_config()
-            self._set_message("Configuration reloaded.")
-            return
-
-        self._set_message(f"Unknown command: {command}", error=True)
 
     def _shortcut(self, action: str, default: str) -> str:
         return self.config.shortcut(action, default)
@@ -2573,419 +2853,9 @@ class PvimEditor:
 
         return False
 
-    def _insert_printable(self, key: str) -> None:
-        if not self._auto_pairs:
-            self._insert_text_multi(key)
-            return
-
-        line = self._line()
-        if key in self._auto_pairs:
-            closing = self._auto_pairs[key]
-            if key == closing:
-                if self.cx < len(line) and line[self.cx] == key:
-                    self.cx += 1
-                    return
-                self._insert_text_multi(key + closing)
-                self.cx -= 1
-                return
-
-            self._insert_text_multi(key + closing)
-            self.cx -= 1
-            return
-
-        if key in self._auto_pair_closers and self.cx < len(line) and line[self.cx] == key:
-            self.cx += 1
-            return
-
-        self._insert_text_multi(key)
-
-    def _handle_command_key(self, key: str) -> None:
-        if key == "ESC":
-            self.mode = MODE_NORMAL
-            self.command_text = ""
-            self._set_message("Command cancelled.")
-            return
-
-        if key == "BACKSPACE":
-            self.command_text = self.command_text[:-1]
-            return
-
-        if key == "ENTER":
-            command = self.command_text
-            self.command_text = ""
-            self.mode = MODE_NORMAL
-            self.execute_command(command)
-            return
-
-        if len(key) == 1 and key.isprintable():
-            self.command_text += key
-
-    def _handle_fuzzy_key(self, key: str) -> None:
-        if key == "ESC":
-            self.mode = MODE_NORMAL
-            self.fuzzy_query = ""
-            self.fuzzy_matches = []
-            self.fuzzy_index = 0
-            self._floating_list = None
-            self._floating_source = ""
-            self._set_message("Fuzzy cancelled.")
-            return
-
-        if key == "ENTER":
-            self._accept_fuzzy_selection()
-            return
-
-        if key == "BACKSPACE":
-            self.fuzzy_query = self.fuzzy_query[:-1]
-            self._update_fuzzy_matches()
-            return
-
-        if key in {"UP", "CTRL_LEFT"}:
-            if self._floating_list is not None:
-                self._floating_list.move_up()
-                self.fuzzy_index = self._floating_list.selected
-            else:
-                self.fuzzy_index = max(0, self.fuzzy_index - 1)
-            return
-
-        if key in {"DOWN", "CTRL_RIGHT"}:
-            if self._floating_list is not None:
-                _, height = self._terminal_size()
-                self._floating_list.move_down(max(1, height - 3))
-                self.fuzzy_index = self._floating_list.selected
-            else:
-                self.fuzzy_index = min(max(0, len(self.fuzzy_matches) - 1), self.fuzzy_index + 1)
-            return
-
-        if len(key) == 1 and key.isprintable():
-            self.fuzzy_query += key
-            self._update_fuzzy_matches()
-
-    def _handle_key_hints_key(self, key: str) -> None:
-        if key in {"ESC", "ENTER", self.key_hints_trigger}:
-            self.mode = MODE_NORMAL
-            return
-        if key == "UP":
-            self.key_hint_scroll = max(0, self.key_hint_scroll - 1)
-            return
-        if key == "DOWN":
-            max_scroll = max(0, len(self.key_hint_lines) - 1)
-            self.key_hint_scroll = min(max_scroll, self.key_hint_scroll + 1)
-
-    def _handle_alert_key(self, key: str) -> None:
-        if key in {"ESC", "ENTER"}:
-            self._close_alert()
-
-    def _handle_floating_list_key(self, key: str) -> None:
-        popup = self._floating_list
-        if popup is None:
-            self.mode = MODE_NORMAL
-            return
-
-        if key == "ESC":
-            self._floating_list = None
-            self._floating_source = ""
-            self.mode = MODE_NORMAL
-            return
-
-        if key in {"UP", "CTRL_LEFT"}:
-            popup.move_up()
-            return
-
-        if key in {"DOWN", "CTRL_RIGHT"}:
-            _, height = self._terminal_size()
-            popup.move_down(max(1, height - 3))
-            return
-
-        if key == "ENTER":
-            selected = popup.selected_item()
-            if selected is not None:
-                self._set_message(selected)
-            self._floating_list = None
-            self._floating_source = ""
-            self.mode = self._floating_accept_mode
-
-    def _handle_explorer_key(self, key: str) -> None:
-        if key == "ESC":
-            self._close_explorer()
-            return
-        visible_rows = max(1, self._terminal_size()[1] - 8)
-        if key in {"UP", "CTRL_LEFT"}:
-            self._file_tree_feature.move_up()
-            self._sync_file_tree_popup()
-            return
-        if key in {"DOWN", "CTRL_RIGHT"}:
-            self._file_tree_feature.move_down(visible_rows)
-            self._sync_file_tree_popup()
-            return
-        if key == "ENTER":
-            selected = self._file_tree_feature.selected_path()
-            if not selected:
-                return
-            if self.open_file(Path.cwd() / selected, force=False):
-                self._close_explorer()
-
-    def _handle_completion_key(self, key: str) -> None:
-        visible_rows = max(1, self._terminal_size()[1] - 8)
-        if key == "ESC":
-            self._close_tab_completion()
-            return
-        if key in {"UP", "CTRL_LEFT"}:
-            self._completion_feature.move_up()
-            self._sync_completion_popup()
-            return
-        if key in {"DOWN", "CTRL_RIGHT"}:
-            self._completion_feature.move_down(visible_rows)
-            self._sync_completion_popup()
-            return
-        if key in {"TAB", "ENTER"}:
-            self._accept_tab_completion()
-            return
-        if key == "BACKSPACE":
-            self._close_tab_completion()
-            self._backspace()
-            return
-        if len(key) == 1 and key.isprintable():
-            self._close_tab_completion()
-            self._insert_printable(key)
-            return
-        if key == "LEFT":
-            self._close_tab_completion()
-            self._move_left()
-            return
-        if key == "RIGHT":
-            self._close_tab_completion()
-            self._move_right()
-            return
-
-    def _handle_visual_key(self, key: str) -> None:
-        if key in {"ESC"}:
-            self.mode = MODE_NORMAL
-            self.visual_anchor = None
-            self._set_message("-- NORMAL --")
-            return
-
-        if key in {"k", "UP"}:
-            self._move_up()
-            return
-        if key in {"j", "DOWN"}:
-            self._move_down()
-            return
-        if key in {"h", "LEFT"}:
-            self._move_left()
-            return
-        if key in {"l", "RIGHT"}:
-            self._move_right()
-            return
-
-        if key in {"TAB", ">"}:
-            selected = self._selected_line_range()
-            if selected is not None:
-                self._indent_lines(selected[0], selected[1])
-            return
-
-        if key in {"SHIFT_TAB", "<"}:
-            selected = self._selected_line_range()
-            if selected is not None:
-                self._outdent_lines(selected[0], selected[1])
-            return
-
-        if key == "i":
-            selected = self._selected_line_range()
-            if selected is None:
-                return
-            start, end = selected
-            self.extra_cursor_lines = [line for line in range(start, end + 1) if line != self.cy]
-            self.mode = MODE_INSERT
-            self.visual_anchor = None
-            self._set_message(f"-- INSERT -- multi-cursor {1 + len(self.extra_cursor_lines)}")
-            return
-
-        if key == ":":
-            self._enter_command()
-
-    def _handle_insert_key(self, key: str) -> None:
-        if key == "ESC":
-            self.mode = MODE_NORMAL
-            self.visual_anchor = None
-            self._set_message("-- NORMAL --")
-            return
-
-        if key == "BACKSPACE":
-            self._backspace()
-            return
-
-        if key == "ENTER":
-            self._insert_newline()
-            return
-
-        if key == "TAB":
-            if self._open_tab_completion():
-                return
-            self._insert_text_multi(" " * self.tab_size)
-            return
-
-        if key == "DEL":
-            self._delete_char()
-            return
-
-        if key == "LEFT":
-            self._move_left()
-            return
-
-        if key == "RIGHT":
-            self._move_right()
-            return
-
-        if key == "UP":
-            self._move_up()
-            return
-
-        if key == "DOWN":
-            self._move_down()
-            return
-
-        if key == "HOME":
-            self.cx = 0
-            return
-
-        if key == "END":
-            self.cx = len(self._line())
-            return
-
-        if key == "PGUP":
-            self._page_up()
-            return
-
-        if key == "PGDN":
-            self._page_down()
-            return
-
-        if len(key) == 1 and key.isprintable():
-            self._insert_printable(key)
-
-    def _handle_normal_key(self, key: str) -> None:
-        if key in {"h", "LEFT"}:
-            self._move_left()
-            self.pending_operator = ""
-            return
-
-        if key in {"l", "RIGHT"}:
-            self._move_right()
-            self.pending_operator = ""
-            return
-
-        if key in {"k", "UP"}:
-            self._move_up()
-            self.pending_operator = ""
-            return
-
-        if key in {"j", "DOWN"}:
-            self._move_down()
-            self.pending_operator = ""
-            return
-
-        if key in {"HOME", "0"}:
-            self.cx = 0
-            self.pending_operator = ""
-            return
-
-        if key in {"END", "$"}:
-            self.cx = len(self._line())
-            self.pending_operator = ""
-            return
-
-        if key == "PGUP":
-            self._page_up()
-            self.pending_operator = ""
-            return
-
-        if key == "PGDN":
-            self._page_down()
-            self.pending_operator = ""
-            return
-
-        if key in {"i"}:
-            self.mode = MODE_INSERT
-            self.pending_operator = ""
-            self._set_message("-- INSERT --")
-            return
-
-        if key in {"a"}:
-            self.cx = min(self.cx + 1, len(self._line()))
-            self.mode = MODE_INSERT
-            self.pending_operator = ""
-            self._set_message("-- INSERT --")
-            return
-
-        if key in {"A"}:
-            self.cx = len(self._line())
-            self.mode = MODE_INSERT
-            self.pending_operator = ""
-            self._set_message("-- INSERT --")
-            return
-
-        if key in {"o"}:
-            self._open_line_below()
-            self.pending_operator = ""
-            return
-
-        if key in {"x", "DEL"}:
-            self._delete_char()
-            self.pending_operator = ""
-            return
-
-        if key == "d":
-            if self.pending_operator == "d":
-                self._delete_line()
-                self.pending_operator = ""
-            else:
-                self.pending_operator = "d"
-                self._set_message("d")
-            return
-
-        if key == ":":
-            self._enter_command()
-            return
-
-        if key == "/":
-            self._enter_command("find ")
-            return
-
-        if key == "V":
-            self.mode = MODE_VISUAL
-            self.visual_anchor = self.cy
-            self.pending_operator = ""
-            self._set_message("-- VISUAL LINE --")
-            return
-
-        if key == ">":
-            self._indent_lines(self.cy, self.cy)
-            self.pending_operator = ""
-            return
-
-        if key == "<":
-            self._outdent_lines(self.cy, self.cy)
-            self.pending_operator = ""
-            return
-
-        if key == "F2":
-            self.show_line_numbers = not self.show_line_numbers
-            state = "on" if self.show_line_numbers else "off"
-            self._set_message(f"Line numbers: {state}")
-            self.pending_operator = ""
-            return
-
-        if key == "F4":
-            self._toggle_sidebar()
-            self.pending_operator = ""
-            return
-
-        if key == "ESC":
-            self.pending_operator = ""
-            self._clear_multi_cursor()
-
     def _read_key(self) -> str:
+        if self._input_queue:
+            return self._input_queue.popleft()
         return KeyReader.read_key()
 
     def _dispatch_plugin_key(self, key: str) -> None:
@@ -3006,81 +2876,93 @@ class PvimEditor:
         self._set_message(latest)
 
     def handle_key(self, key: str) -> None:
-        if self.mode == MODE_ALERT:
-            self._handle_alert_key(key)
-            return
+        before = self._capture_snapshot()
+        self._record_key_for_macro(key)
+        try:
+            if self.mode == MODE_ALERT:
+                self._handle_alert_key(key)
+                return
 
-        if self.mode == MODE_KEY_HINTS:
-            self._handle_key_hints_key(key)
-            return
+            if self.mode == MODE_KEY_HINTS:
+                self._handle_key_hints_key(key)
+                return
 
-        if self.mode == MODE_FLOAT_LIST:
-            self._handle_floating_list_key(key)
-            return
+            if self.mode == MODE_FLOAT_LIST:
+                self._handle_floating_list_key(key)
+                return
 
-        if self.mode == MODE_EXPLORER:
-            self._handle_explorer_key(key)
-            return
+            if self.mode == MODE_EXPLORER:
+                self._handle_explorer_key(key)
+                return
 
-        if self.mode == MODE_COMPLETION:
-            self._handle_completion_key(key)
-            return
+            if self.mode == MODE_COMPLETION:
+                self._handle_completion_key(key)
+                return
 
-        if key == "CTRL_S":
-            self.save_file()
-            return
+            if key == "CTRL_S":
+                self.save_file()
+                return
 
-        if key in {"CTRL_Q", "CTRL_C"}:
-            self.request_quit(force=False)
-            return
+            if key in {"CTRL_Q", "CTRL_C"}:
+                self.request_quit(force=False)
+                return
 
-        if self._handle_shortcuts(key):
-            return
+            if self._handle_shortcuts(key):
+                return
 
-        if self.mode == MODE_COMMAND:
-            self._handle_command_key(key)
+            if self.mode == MODE_COMMAND:
+                self._handle_command_key(key)
+                self._dispatch_plugin_key(key)
+                return
+
+            if self.mode == MODE_FUZZY:
+                self._handle_fuzzy_key(key)
+                self._dispatch_plugin_key(key)
+                return
+
+            if self.mode == MODE_VISUAL:
+                self._handle_visual_key(key)
+                self._dispatch_plugin_key(key)
+                return
+
+            if self.mode == MODE_INSERT:
+                self._handle_insert_key(key)
+                self._dispatch_plugin_key(key)
+                return
+
+            self._handle_normal_key(key)
             self._dispatch_plugin_key(key)
-            return
-
-        if self.mode == MODE_FUZZY:
-            self._handle_fuzzy_key(key)
-            self._dispatch_plugin_key(key)
-            return
-
-        if self.mode == MODE_VISUAL:
-            self._handle_visual_key(key)
-            self._dispatch_plugin_key(key)
-            return
-
-        if self.mode == MODE_INSERT:
-            self._handle_insert_key(key)
-            self._dispatch_plugin_key(key)
-            return
-
-        self._handle_normal_key(key)
-        self._dispatch_plugin_key(key)
+        finally:
+            self._push_history_if_changed(before, label=f"key:{key}")
 
     def run(self) -> None:
         self._console.enter()
         try:
             while self.running:
-                if KeyReader.has_key():
+                if self._input_queue or KeyReader.has_key():
+                    from_queue = bool(self._input_queue)
                     key = self._read_key()
+                    self._macro_replaying = from_queue
                     self.handle_key(key)
+                    self._macro_replaying = False
                     self.render()
                     self._drain_async_events(max_items=8)
                     self._schedule_git_control_refresh()
                     if self.mode == MODE_EXPLORER and not self._file_tree_feature.entries:
                         self._schedule_file_tree_refresh()
+                    self._write_swap_if_needed()
                     self._last_tick = time.monotonic()
                     continue
                 self._drain_async_events()
                 self._schedule_git_control_refresh()
                 if self.mode == MODE_EXPLORER and not self._file_tree_feature.entries:
                     self._schedule_file_tree_refresh()
+                self._write_swap_if_needed()
                 self.render()
                 time.sleep(0.01)
         finally:
+            self._save_session()
+            self._write_swap_if_needed(force=True)
             self._async_runtime.close()
             self._console.exit()
 

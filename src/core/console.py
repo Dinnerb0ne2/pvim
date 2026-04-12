@@ -49,6 +49,7 @@ CONTROL_KEYS = {
     "\x07": "CTRL_G",
     "\x04": "CTRL_D",
     "\x12": "CTRL_R",
+    "\x19": "CTRL_Y",
     "\x15": "CTRL_U",
     "\x0e": "CTRL_N",
     "\x10": "CTRL_P",
