@@ -1,0 +1,74 @@
+{
+  "python": {
+    "required": "3.14.3"
+  },
+  "editor": {
+    "line_numbers": true,
+    "tab_size": 4
+  },
+  "theme": {
+    "enabled": true,
+    "config_file": "pvim.theme.default.json"
+  },
+  "features": {
+    "syntax_highlighting": {
+      "enabled": true,
+      "language_map_file": "syntax\\languages.json",
+      "default_file": "syntax\\plaintext.json"
+    },
+    "auto_pairs": {
+      "enabled": true,
+      "config_file": "autopairs.json"
+    },
+    "sidebar": {
+      "enabled": true,
+      "width": 30,
+      "max_files": 3000
+    },
+    "vscode_shortcuts": {
+      "enabled": true,
+      "bindings": {
+        "toggle_comment": "CTRL_SLASH",
+        "add_cursor_down": "CTRL_D",
+        "clear_multi_cursor": "CTRL_U",
+        "word_left": "CTRL_LEFT",
+        "word_right": "CTRL_RIGHT",
+        "quick_find": "CTRL_F",
+        "quick_replace": "CTRL_G",
+        "fuzzy_finder": "CTRL_P",
+        "toggle_sidebar": "F4",
+        "format_code": "F8",
+        "refactor_rename": "CTRL_R"
+      }
+    },
+    "key_hints": {
+      "enabled": true,
+      "trigger": "F1"
+    },
+    "fuzzy_finder": {
+      "enabled": true
+    },
+    "scripting": {
+      "enabled": true,
+      "step_limit": 100000
+    },
+    "plugins": {
+      "enabled": true,
+      "directory": "plugins",
+      "auto_load": true
+    },
+    "git_status": {
+      "enabled": true,
+      "refresh_seconds": 2.0
+    },
+    "refactor_tools": {
+      "enabled": true
+    },
+    "find_replace": {
+      "enabled": true
+    },
+    "code_style_normalizer": {
+      "enabled": true
+    }
+  }
+}

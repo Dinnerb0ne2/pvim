@@ -1,0 +1,15 @@
+fn on_load() {
+  api(pvim, "message", "welcome plugin loaded");
+}
+
+fn on_key(key) {
+  if key == "F6" {
+    api(pvim, "message", f"plugin key hook: {key}");
+    return "handled";
+  }
+  return "";
+}
+
+fn greet(name) {
+  return f"Hello, {name}!";
+}

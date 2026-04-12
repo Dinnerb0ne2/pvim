@@ -1,0 +1,7 @@
+{
+  "name": "json",
+  "line_comment": "",
+  "keywords": ["true", "false", "null"],
+  "builtins": [],
+  "string_delimiters": ["\""]
+}

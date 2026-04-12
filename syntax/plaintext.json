@@ -1,0 +1,7 @@
+{
+  "name": "plaintext",
+  "line_comment": "#",
+  "keywords": [],
+  "builtins": [],
+  "string_delimiters": ["\"", "'"]
+}

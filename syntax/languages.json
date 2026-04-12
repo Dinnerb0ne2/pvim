@@ -1,0 +1,8 @@
+{
+  ".py": "syntax\\python.json",
+  ".json": "syntax\\json.json",
+  ".txt": "syntax\\plaintext.json",
+  ".md": "syntax\\plaintext.json",
+  ".yml": "syntax\\plaintext.json",
+  ".yaml": "syntax\\plaintext.json"
+}
