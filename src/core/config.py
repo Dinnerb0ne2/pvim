@@ -16,6 +16,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "soft_wrap": True,
         "default_line_ending": "lf",
         "preserve_line_ending": True,
+        "encodings": ["utf-8", "utf-8-sig", "gb18030", "gbk", "big5", "shift_jis", "latin-1"],
     },
     "theme": {
         "enabled": True,
@@ -37,7 +38,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "config_file": "autopairs.json",
         },
         "sidebar": {
-            "enabled": False,
+            "enabled": True,
             "width": 30,
             "max_files": 3000,
         },
@@ -60,11 +61,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
             },
         },
         "key_hints": {
-            "enabled": False,
+            "enabled": True,
             "trigger": "F1",
         },
         "fuzzy_finder": {
-            "enabled": False,
+            "enabled": True,
         },
         "live_grep": {
             "enabled": True,
@@ -97,6 +98,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "enabled": True,
             "interval_seconds": 4.0,
         },
+        "auto_save": {
+            "enabled": True,
+            "interval_seconds": 8.0,
+        },
         "session": {
             "enabled": True,
             "file": ".pvim.session.json",
@@ -110,13 +115,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "enabled": False,
         },
         "tabline": {
-            "enabled": False,
+            "enabled": True,
         },
         "winbar": {
-            "enabled": False,
+            "enabled": True,
         },
         "file_tree": {
-            "enabled": False,
+            "enabled": True,
         },
         "tab_completion": {
             "enabled": True,
@@ -125,7 +130,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "enabled": True,
         },
         "notifications": {
-            "enabled": False,
+            "enabled": True,
         },
         "git_status": {
             "enabled": True,
@@ -238,6 +243,19 @@ class AppConfig:
         if lowered in {"crlf", "windows"}:
             return "\r\n"
         return "\n"
+
+    def preferred_encodings(self) -> list[str]:
+        value = self._lookup("editor", "encodings", default=["utf-8"])
+        if not isinstance(value, list):
+            return ["utf-8"]
+        parsed: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            clean = item.strip().lower()
+            if clean and clean not in parsed:
+                parsed.append(clean)
+        return parsed or ["utf-8"]
 
     def theme_enabled(self) -> bool:
         return _as_bool(self._lookup("theme", "enabled", default=True), default=True)
@@ -393,6 +411,16 @@ class AppConfig:
             self._lookup("features", "swap", "interval_seconds", default=4.0),
             default=4.0,
             minimum=0.5,
+        )
+
+    def auto_save_enabled(self) -> bool:
+        return self.feature_enabled("auto_save")
+
+    def auto_save_interval_seconds(self) -> float:
+        return _as_float(
+            self._lookup("features", "auto_save", "interval_seconds", default=8.0),
+            default=8.0,
+            minimum=1.0,
         )
 
     def session_enabled(self) -> bool:

@@ -61,6 +61,35 @@ class CommandsMixin:
             self.open_file(args[0], force=True)
             return
 
+        if cmd in {"split", "sp"}:
+            self._open_split("horizontal")
+            return
+
+        if cmd in {"vsplit", "vsp"}:
+            self._open_split("vertical")
+            return
+
+        if cmd in {"only"}:
+            self._close_split()
+            return
+
+        if cmd == "wincmd" and args:
+            action = args[0].lower()
+            if action == "w":
+                self._toggle_split_focus()
+                return
+            if action == "h":
+                self._resize_split(-0.05)
+                return
+            if action == "l":
+                self._resize_split(0.05)
+                return
+            if action in {"q", "c"}:
+                self._close_split()
+                return
+            self._set_message("Usage: :wincmd w|h|l|q", error=True)
+            return
+
         if cmd == "set" and args:
             option = args[0]
             if option in {"number", "nu"}:
@@ -72,19 +101,30 @@ class CommandsMixin:
                 self._set_message("Line numbers: off")
                 return
             if option in {"sidebar", "side"}:
+                self._sidebar_manual_override = True
                 self.show_sidebar = True
                 self._set_message("Sidebar: on")
                 return
             if option in {"nosidebar", "noside"}:
+                self._sidebar_manual_override = True
                 self.show_sidebar = False
                 self._set_message("Sidebar: off")
+                return
+            if option == "encoding":
+                if len(args) < 2:
+                    self._set_message("Usage: :set encoding <name>", error=True)
+                    return
+                self._set_encoding(args[1])
+                return
+            if option.startswith("encoding="):
+                self._set_encoding(option.split("=", 1)[1])
                 return
             self._set_message(f"Unknown set option: {option}", error=True)
             return
 
         if cmd in {"help", "h"}:
             self._set_message(
-                "Commands: :w :q :e :find :replace :rename :format :fuzzy :grep :tree :feature :workspace :session :swap :keys :script :plugin :proc :virtual :ast :profile :piece :termcaps :lsp :diag"
+                "Commands: :w :q :e :split/:vsplit/:only :wincmd :find/:findre :replace/:replacere :replaceall/:replaceallre :encoding :project :term :rename :format :fuzzy :grep :tree :feature :workspace :session :swap :keys :script :plugin :proc :virtual :ast :profile :piece :termcaps :lsp :diag"
             )
             return
 
@@ -109,6 +149,30 @@ class CommandsMixin:
                 self._set_message("Usage: :replaceall <old> <new>", error=True)
                 return
             self._replace_all(args[0], args[1])
+            return
+
+        if cmd in {"findre", "searchre"}:
+            if not args:
+                self._set_message("Usage: :findre <pattern> [flags]", error=True)
+                return
+            flags = args[1] if len(args) >= 2 else ""
+            self._find_regex(args[0], flags)
+            return
+
+        if cmd in {"replacere", "replace_re"}:
+            if len(args) < 2:
+                self._set_message("Usage: :replacere <pattern> <replacement> [flags]", error=True)
+                return
+            flags = args[2] if len(args) >= 3 else ""
+            self._replace_regex_next(args[0], args[1], flags)
+            return
+
+        if cmd in {"replaceallre", "replace_all_re"}:
+            if len(args) < 2:
+                self._set_message("Usage: :replaceallre <pattern> <replacement> [flags]", error=True)
+                return
+            flags = args[2] if len(args) >= 3 else ""
+            self._replace_regex_all(args[0], args[1], flags)
             return
 
         if cmd == "rename":
@@ -144,8 +208,22 @@ class CommandsMixin:
             self._open_live_grep(" ".join(args))
             return
 
-        if cmd in {"workspace", "project"}:
+        if cmd == "workspace":
             self._set_message(f"Workspace: {self._workspace_root}")
+            return
+
+        if cmd in {"project", "project!"}:
+            force = cmd.endswith("!")
+            if not args:
+                self._set_message(f"Workspace: {self._workspace_root}")
+                return
+            if args[0] in {"open", "o"}:
+                if len(args) < 2:
+                    self._set_message("Usage: :project open <directory>", error=True)
+                    return
+                self.open_project(args[1], force=force)
+                return
+            self.open_project(args[0], force=force)
             return
 
         if cmd in {"diag", "diagnostic", "diagnostics"}:
@@ -247,6 +325,11 @@ class CommandsMixin:
             self._set_message("Usage: :proc start|read|write|stop|status ...", error=True)
             return
 
+        if cmd in {"term", "terminal"}:
+            command_text = " ".join(args).strip()
+            self._open_terminal(command_text or None)
+            return
+
         if cmd == "virtual":
             if not args:
                 self._set_message("Usage: :virtual add|set|clear|get ...", error=True)
@@ -342,10 +425,12 @@ class CommandsMixin:
                 return
             option = args[0]
             if option == "on":
+                self._sidebar_manual_override = True
                 self.show_sidebar = True
                 self._set_message("Sidebar: on")
                 return
             if option == "off":
+                self._sidebar_manual_override = True
                 self.show_sidebar = False
                 self._set_message("Sidebar: off")
                 return
@@ -353,6 +438,13 @@ class CommandsMixin:
                 self._toggle_sidebar()
                 return
             self._set_message("Usage: :sidebar on|off|toggle", error=True)
+            return
+
+        if cmd == "encoding":
+            if not args:
+                self._set_message(f"Encoding: {self._current_encoding}")
+                return
+            self._set_encoding(args[0])
             return
 
         if cmd in {"tree", "explorer"}:

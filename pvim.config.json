@@ -7,7 +7,8 @@
     "tab_size": 4,
     "soft_wrap": true,
     "default_line_ending": "lf",
-    "preserve_line_ending": true
+    "preserve_line_ending": true,
+    "encodings": ["utf-8", "utf-8-sig", "gb18030", "gbk", "big5", "shift_jis", "latin-1"]
   },
   "theme": {
     "enabled": true,
@@ -29,7 +30,7 @@
       "config_file": "autopairs.json"
     },
     "sidebar": {
-      "enabled": false,
+      "enabled": true,
       "width": 30,
       "max_files": 3000
     },
@@ -52,11 +53,11 @@
       }
     },
     "key_hints": {
-      "enabled": false,
+      "enabled": true,
       "trigger": "F1"
     },
     "fuzzy_finder": {
-      "enabled": false
+      "enabled": true
     },
     "live_grep": {
       "enabled": true,
@@ -94,6 +95,10 @@
       "enabled": true,
       "interval_seconds": 4.0
     },
+    "auto_save": {
+      "enabled": true,
+      "interval_seconds": 8.0
+    },
     "session": {
       "enabled": true,
       "file": ".pvim.session.json"
@@ -102,13 +107,13 @@
       "enabled": false
     },
     "tabline": {
-      "enabled": false
+      "enabled": true
     },
     "winbar": {
-      "enabled": false
+      "enabled": true
     },
     "file_tree": {
-      "enabled": false
+      "enabled": true
     },
     "tab_completion": {
       "enabled": true
@@ -117,7 +122,7 @@
       "enabled": true
     },
     "notifications": {
-      "enabled": false
+      "enabled": true
     },
     "git_status": {
       "enabled": true,

@@ -5,6 +5,7 @@
 - [快速开始](./getting-started/quick-start.md)
 - [配置说明](./getting-started/configuration.md)
 - [快捷键](./getting-started/keybindings.md)
+- [详细使用手册](./getting-started/user-manual.md)
 
 ## Architecture
 

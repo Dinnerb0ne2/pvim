@@ -11,6 +11,11 @@ PVIM 是一个基于 **Python 3.14.3**、纯标准库实现的终端编辑器。
 - 文件树、Tab 补全、Git 控制可插拔模块
 - 可选 LSP 客户端（配置命令后支持定义跳转/悬浮/补全）
 - 工作区根目录自动检测（.git / pyproject.toml / package.json）
+- 正则搜索替换（findre/replacere/replaceallre）
+- 分屏窗口管理（split/vsplit/wincmd）
+- 内置终端面板（:term）
+- 多编码读取与按编码保存（状态栏显示编码）
+- Swap 恢复 + 会话恢复 + 自动保存
 - 子进程刷新版本号丢弃机制（只接收最新结果）
 - 虚拟文本叠加层与浮动窗口
 - PieceTable 底层结构（大文件编辑基础）
@@ -23,6 +28,7 @@ PVIM 是一个基于 **Python 3.14.3**、纯标准库实现的终端编辑器。
 ```bash
 python pvim.py
 python pvim.py your_file.py
+python pvim.py .
 python pvim.py your_file.py --config pvim.config.json
 ```
 
@@ -47,7 +53,7 @@ src/
 doc/
 ```
 
-详细文档见 [doc/README.md](./doc/README.md)。
+详细文档见 [doc/README.md](./doc/README.md)，推荐先读 [详细使用手册](./doc/getting-started/user-manual.md)。
 
 ## License
 

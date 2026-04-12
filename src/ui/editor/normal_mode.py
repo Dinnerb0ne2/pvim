@@ -35,8 +35,29 @@ class NormalModeMixin:
             self._pending_motion = ""
             if key == "d":
                 self._goto_definition()
+            elif key == "g":
+                self.cy = 0
+                self.cx = min(self.cx, len(self._line()))
             else:
                 self._set_message(f"Unknown g motion: g{key}", error=True)
+            return
+
+        if self._pending_motion == "CTRL_W":
+            self._pending_motion = ""
+            if key in {"v", "V"}:
+                self._open_split("vertical")
+            elif key in {"s", "S"}:
+                self._open_split("horizontal")
+            elif key in {"w", "W"}:
+                self._toggle_split_focus()
+            elif key in {"h", "H"}:
+                self._resize_split(-0.05)
+            elif key in {"l", "L"}:
+                self._resize_split(0.05)
+            elif key in {"q", "Q", "c", "C"}:
+                self._close_split()
+            else:
+                self._set_message(f"Unknown window command: <C-w>{key}", error=True)
             return
 
         if key in {"h", "LEFT"}:
@@ -80,6 +101,14 @@ class NormalModeMixin:
             self._pending_motion = ""
             return
 
+        if key == "G":
+            self.cy = max(0, len(self.lines) - 1)
+            self.cx = min(self.cx, len(self._line()))
+            self.pending_operator = ""
+            self.pending_scope = ""
+            self._pending_motion = ""
+            return
+
         if key == "PGUP":
             self._page_up()
             self.pending_operator = ""
@@ -107,6 +136,16 @@ class NormalModeMixin:
             self._set_message("-- INSERT --")
             return
 
+        if key == "I":
+            line = self._line()
+            self.cx = len(line) - len(line.lstrip(" \t"))
+            self.mode = MODE_INSERT
+            self.pending_operator = ""
+            self.pending_scope = ""
+            self._pending_motion = ""
+            self._set_message("-- INSERT --")
+            return
+
         if key in {"a"}:
             self.cx = min(self.cx + 1, len(self._line()))
             self.mode = MODE_INSERT
@@ -127,6 +166,13 @@ class NormalModeMixin:
 
         if key in {"o"}:
             self._open_line_below()
+            self.pending_operator = ""
+            self.pending_scope = ""
+            self._pending_motion = ""
+            return
+
+        if key == "O":
+            self._open_line_above()
             self.pending_operator = ""
             self.pending_scope = ""
             self._pending_motion = ""
@@ -196,6 +242,13 @@ class NormalModeMixin:
             self._set_message("g")
             return
 
+        if key == "CTRL_W":
+            self._pending_motion = "CTRL_W"
+            self.pending_operator = ""
+            self.pending_scope = ""
+            self._set_message("<C-w>")
+            return
+
         if key == "K":
             self._show_hover()
             self.pending_operator = ""
@@ -208,7 +261,7 @@ class NormalModeMixin:
             return
 
         if key == "/":
-            self._enter_command("find ")
+            self._enter_command("find ", prompt="/")
             return
 
         if key == "V":

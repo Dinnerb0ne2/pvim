@@ -31,3 +31,18 @@
 - `gd`：转到定义（当前工程内）
 - `Ctrl+P`：fuzzy 文件搜索
 - `:grep <query>`：全局实时搜索
+- `:findre <pattern> [flags]`：正则搜索
+- `:replaceallre <pattern> <replacement> [flags]`：正则全量替换
+
+## 项目与终端
+
+- `:project <dir>`：打开目录工作区
+- `:term [command]`：打开内置终端面板
+
+## 分屏
+
+- `Ctrl+W v`：垂直分屏
+- `Ctrl+W s`：水平分屏
+- `Ctrl+W w`：切换焦点窗口
+- `Ctrl+W h` / `Ctrl+W l`：调整分屏比例
+- `Ctrl+W q`：关闭分屏

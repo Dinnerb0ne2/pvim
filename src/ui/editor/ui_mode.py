@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .modes import MODE_INSERT, MODE_NORMAL
+from .modes import MODE_INSERT, MODE_NORMAL, MODE_TERMINAL
 
 
 class UIModeMixin:
@@ -8,6 +8,7 @@ class UIModeMixin:
         if key == "ESC":
             self.mode = MODE_NORMAL
             self.command_text = ""
+            self._command_prompt = ":"
             self._set_message("Command cancelled.")
             return
 
@@ -19,6 +20,7 @@ class UIModeMixin:
             command = self.command_text
             self.command_text = ""
             self.mode = MODE_NORMAL
+            self._command_prompt = ":"
             self.execute_command(command)
             return
 
@@ -91,6 +93,39 @@ class UIModeMixin:
                 return
         if key in {"ESC", "ENTER"}:
             self._close_alert()
+
+    def _handle_terminal_key(self, key: str) -> None:
+        if key == "ESC":
+            self._close_terminal(kill=False)
+            return
+        if key == "CTRL_C":
+            self._send_terminal_input("\u0003")
+            return
+        if key == "CTRL_D":
+            self._send_terminal_input("\u0004")
+            return
+        if key == "PGUP":
+            self._terminal_scroll = min(self._terminal_scroll + 1, max(0, len(self._terminal_output) - 1))
+            return
+        if key == "PGDN":
+            self._terminal_scroll = max(0, self._terminal_scroll - 1)
+            return
+        if key == "BACKSPACE":
+            self._terminal_input = self._terminal_input[:-1]
+            return
+        if key == "ENTER":
+            self._send_terminal_input(self._terminal_input)
+            self._terminal_input = ""
+            self._terminal_scroll = 0
+            return
+        if key == "TAB":
+            self._terminal_input += "\t"
+            return
+        if len(key) == 1 and key.isprintable():
+            self._terminal_input += key
+            return
+        if key == "CTRL_Q":
+            self._close_terminal(kill=True)
 
     def _handle_floating_list_key(self, key: str) -> None:
         popup = self._floating_list

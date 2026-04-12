@@ -2,7 +2,7 @@
 
 ## 环境要求
 
-- Windows 终端
+- 现代终端（Windows Terminal / iTerm2 / Linux tty 等）
 - Python 3.14.3
 
 ## 启动
@@ -10,6 +10,7 @@
 ```bash
 python pvim.py
 python pvim.py your_file.py
+python pvim.py .
 python pvim.py your_file.py --config pvim.config.json
 ```
 
@@ -23,8 +24,13 @@ python pvim.py your_file.py --config pvim.config.json
 ## 常用命令
 
 - `:find <text>` / `:replace <old> <new>` / `:replaceall <old> <new>`
+- `:findre <pattern> [flags]` / `:replacere <pattern> <replacement> [flags]`
 - `:fuzzy [query]`
 - `:grep <query>`（全局搜索）
+- `:project <dir>`（打开项目目录）
+- `:term [command]`（内置终端）
+- `:split` / `:vsplit` / `:only`（分屏管理）
+- `:encoding [name]`（查看/切换编码）
 - `:tree open|refresh|close|toggle`
 - `:session save|load`
 - `:swap write|clear`

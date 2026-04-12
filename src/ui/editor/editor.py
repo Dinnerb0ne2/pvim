@@ -51,6 +51,7 @@ from .modes import (
     MODE_KEY_HINTS,
     MODE_LIVE_GREP,
     MODE_NORMAL,
+    MODE_TERMINAL,
     MODE_VISUAL,
 )
 from .normal_mode import NormalModeMixin
@@ -80,6 +81,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self.pending_scope = ""
         self._pending_motion = ""
         self.command_text = ""
+        self._command_prompt = ":"
         self.visual_anchor: int | None = None
         self.extra_cursor_lines: list[int] = []
 
@@ -110,6 +112,8 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._history_suspended = False
         self._skip_history_once = False
         self._current_line_ending = "\n"
+        self._current_encoding = "utf-8"
+        self._encoding_candidates: list[str] = ["utf-8"]
 
         self._input_queue: deque[str] = deque()
         self._macro_registers: dict[str, list[str]] = {}
@@ -122,6 +126,9 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._swap_enabled = True
         self._swap_interval = 4.0
         self._last_swap_write = 0.0
+        self._auto_save_enabled = True
+        self._auto_save_interval = 8.0
+        self._last_auto_save = 0.0
         self._swap_prompt_path: Path | None = None
         self._swap_prompt_payload: SwapPayload | None = None
         self._session_enabled = True
@@ -165,6 +172,8 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self.show_line_numbers = True
         self.tab_size = 4
         self.show_sidebar = False
+        self._sidebar_manual_override = False
+        self._project_mode = False
         self.sidebar_width = 30
         self._lazy_load_enabled = True
         self._terminal_capabilities = detect_terminal_capabilities()
@@ -179,6 +188,16 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._file_tree_feature = FileTreeFeature(enabled=False)
         self._completion_feature = TabCompletionFeature(enabled=False)
         self._git_control_feature = GitControlFeature(enabled=False)
+        self._terminal_process_id: int | None = None
+        self._terminal_output: list[str] = []
+        self._terminal_input = ""
+        self._terminal_scroll = 0
+        self._split_enabled = False
+        self._split_orientation = "vertical"
+        self._split_ratio = 0.5
+        self._split_focus = "main"
+        self._split_main_view = (0, 0, 0, 0)
+        self._split_secondary_view = (0, 0, 0, 0)
         self.plugins = PluginManager(
             plugins_root=Path.cwd() / "plugins",
             enabled=False,
@@ -194,7 +213,11 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._apply_runtime_config()
 
         if file_path is not None:
-            self.open_file(file_path, force=True, startup=True)
+            target = file_path.expanduser()
+            if target.exists() and target.is_dir():
+                self.open_project(target, force=True, startup=True)
+            else:
+                self.open_file(target, force=True, startup=True)
         elif self._session_enabled:
             self._restore_session()
 
@@ -284,19 +307,25 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         return f"{self.mode} {self.file_path.name if self.file_path else '[No Name]'}{dirty}"
 
     def _status_right_segment(self, context: LayoutContext) -> str:
-        return f"utf-8 Ln {context.row}, Col {context.col}"
+        return f"{self._current_encoding} Ln {context.row}, Col {context.col}"
 
     def _apply_runtime_config(self) -> None:
         self.show_line_numbers = self.config.show_line_numbers()
         self.tab_size = self.config.tab_size()
         self._soft_wrap_enabled = self.config.soft_wrap_enabled()
         self.show_sidebar = self.config.sidebar_enabled()
+        self._sidebar_manual_override = False
         self.sidebar_width = self.config.sidebar_width()
         self.key_hints_enabled = self.config.key_hints_enabled()
         self.key_hints_trigger = self.config.key_hints_trigger()
         self._lazy_load_enabled = self.config.lazy_load_enabled()
         self._swap_enabled = self.config.swap_enabled()
         self._swap_interval = self.config.swap_interval_seconds()
+        self._auto_save_enabled = self.config.auto_save_enabled()
+        self._auto_save_interval = self.config.auto_save_interval_seconds()
+        self._encoding_candidates = self.config.preferred_encodings()
+        if self._current_encoding not in self._encoding_candidates:
+            self._current_encoding = self._encoding_candidates[0]
         self._session_enabled = self.config.session_enabled()
         self._session_path = self.config.session_file()
         self._history_enabled = self.config.undo_tree_enabled()
@@ -609,11 +638,13 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             "  Ctrl+N tab completion",
             "  Ctrl+P fuzzy finder",
             "  :grep <text> project search",
+            "  :findre / :replacere / :replaceallre regex search-replace",
             "  Ctrl+R rename symbol",
             "  K hover docs (when LSP enabled)",
             "  F3 file tree",
             "  F4 toggle sidebar",
             "  F8 normalize code style",
+            "  Ctrl+W v/s split, Ctrl+W w switch pane, Ctrl+W q close",
             "",
             "Plugin commands",
             "  :plugin list",
@@ -638,6 +669,10 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             "  :piece",
             "  :termcaps",
             "  :workspace",
+            "  :project <dir> open folder workspace",
+            "  :split / :vsplit / :only / :wincmd w|h|l|q",
+            "  :term [cmd] built-in terminal panel",
+            "  :encoding [name]",
             "  :session save|load",
             "  :swap write|clear",
             "  :tree open|refresh|close|toggle",
@@ -684,6 +719,9 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._current_line_ending = snapshot.line_ending if snapshot.line_ending in {"\n", "\r\n"} else "\n"
             self.buffer.mark_all_dirty()
             self.modified = True
+            current_view = self._capture_view_state()
+            self._split_main_view = current_view
+            self._split_secondary_view = current_view
         finally:
             self._history_suspended = False
 
@@ -754,6 +792,33 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         normalized = text.replace("\r\n", "\n").replace("\r", "\n")
         return normalized, line_ending
 
+    def _decode_file_bytes(self, payload: bytes) -> tuple[str, str]:
+        last_error: UnicodeDecodeError | None = None
+        for encoding in self._encoding_candidates:
+            try:
+                return payload.decode(encoding), encoding
+            except UnicodeDecodeError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        return payload.decode("utf-8"), "utf-8"
+
+    def _set_encoding(self, encoding: str) -> bool:
+        clean = encoding.strip().lower()
+        if not clean:
+            self._set_message("Usage: :encoding <name>", error=True)
+            return False
+        try:
+            "".encode(clean)
+        except LookupError:
+            self._set_message(f"Unknown encoding: {encoding}", error=True)
+            return False
+        self._current_encoding = clean
+        if clean not in self._encoding_candidates:
+            self._encoding_candidates.insert(0, clean)
+        self._set_message(f"Encoding set: {clean}")
+        return True
+
     def _write_swap_if_needed(self, *, force: bool = False) -> None:
         if not self._swap_enabled or not self.modified or self.file_path is None:
             return
@@ -772,6 +837,15 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._set_message(f"Swap write failed: {exc}", error=True)
             return
         self._last_swap_write = now
+
+    def _auto_save_if_needed(self) -> None:
+        if not self._auto_save_enabled or not self.modified or self.file_path is None:
+            return
+        now = time.monotonic()
+        if now - self._last_auto_save < self._auto_save_interval:
+            return
+        if self.save_file(quiet=True):
+            self._last_auto_save = now
 
     def _open_swap_prompt(self, path: Path, payload: SwapPayload) -> None:
         self._swap_prompt_path = path
@@ -812,6 +886,11 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         data = self._persistence.load_session(self._session_path)
         if not data:
             return
+        project_root = data.get("workspace_root")
+        if isinstance(project_root, str) and project_root:
+            project_path = Path(project_root)
+            if project_path.exists() and project_path.is_dir():
+                self.open_project(project_path, force=True, startup=True)
         file_name = data.get("current_file")
         if isinstance(file_name, str) and file_name:
             opened = self.open_file(file_name, force=True, startup=True)
@@ -838,6 +917,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             "cursor_y": self.cy,
             "tabs": list(self._tab_items),
             "tab_index": self._current_tab_index,
+            "workspace_root": str(self._workspace_root),
         }
         try:
             self._persistence.save_session(self._session_path, payload)
@@ -1000,13 +1080,23 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                 process_id = int(event.get("process_id", 0))
                 line = str(event.get("line", ""))
                 if line:
-                    self._set_message(f"[proc:{process_id}] {line}")
+                    if process_id == self._terminal_process_id:
+                        self._terminal_output.append(line)
+                        if len(self._terminal_output) > 2000:
+                            self._terminal_output = self._terminal_output[-2000:]
+                    else:
+                        self._set_message(f"[proc:{process_id}] {line}")
                 continue
 
             if event_type == "process_exit":
                 process_id = int(event.get("process_id", 0))
                 code = event.get("return_code", None)
-                self._set_message(f"Process {process_id} exited ({code}).")
+                if process_id == self._terminal_process_id:
+                    self._terminal_output.append(f"[exit] code={code}")
+                    self._set_message(f"Terminal exited ({code}).")
+                    self._terminal_process_id = None
+                else:
+                    self._set_message(f"Process {process_id} exited ({code}).")
 
     def _ast_query(self) -> AstQueryService:
         if self._ast_query_service is None:
@@ -1266,10 +1356,82 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self.cy = clamp(self.cy, 0, len(self.lines) - 1)
         self.cx = clamp(self.cx, 0, len(self._line()))
 
+    def _capture_view_state(self) -> tuple[int, int, int, int]:
+        return (self.cx, self.cy, self.row_offset, self.col_offset)
+
+    def _apply_view_state(self, state: tuple[int, int, int, int]) -> None:
+        cx, cy, row_offset, col_offset = state
+        self.cy = clamp(cy, 0, len(self.lines) - 1)
+        self.cx = clamp(cx, 0, len(self._line()))
+        self.row_offset = max(0, row_offset)
+        self.col_offset = max(0, col_offset)
+
+    def _capture_split_active_view(self) -> None:
+        if not self._split_enabled:
+            return
+        current = self._capture_view_state()
+        if self._split_focus == "main":
+            self._split_main_view = current
+        else:
+            self._split_secondary_view = current
+
+    def _open_split(self, orientation: str) -> None:
+        if orientation not in {"vertical", "horizontal"}:
+            self._set_message(f"Unknown split orientation: {orientation}", error=True)
+            return
+        self._capture_split_active_view()
+        current = self._capture_view_state()
+        self._split_enabled = True
+        self._split_orientation = orientation
+        self._split_focus = "main"
+        self._split_main_view = current
+        self._split_secondary_view = current
+        self._set_message(f"Split opened ({orientation}).")
+
+    def _close_split(self) -> None:
+        if not self._split_enabled:
+            self._set_message("Split is not active.")
+            return
+        self._capture_split_active_view()
+        self._split_enabled = False
+        self._split_focus = "main"
+        self._set_message("Split closed.")
+
+    def _toggle_split_focus(self) -> None:
+        if not self._split_enabled:
+            self._set_message("Split is not active.", error=True)
+            return
+        self._capture_split_active_view()
+        if self._split_focus == "main":
+            self._split_focus = "secondary"
+            self._apply_view_state(self._split_secondary_view)
+        else:
+            self._split_focus = "main"
+            self._apply_view_state(self._split_main_view)
+        self._set_message(f"Split focus: {self._split_focus}")
+
+    def _resize_split(self, delta: float) -> None:
+        if not self._split_enabled:
+            self._set_message("Split is not active.", error=True)
+            return
+        self._split_ratio = max(0.25, min(0.75, self._split_ratio + delta))
+        self._set_message(f"Split ratio: {self._split_ratio:.2f}")
+
+    def _split_vertical_sizes(self, editor_width: int) -> tuple[int, int] | None:
+        usable = max(1, editor_width - 1)
+        min_pane = 12
+        if usable < min_pane * 2:
+            return None
+        left = clamp(int(usable * self._split_ratio), min_pane, usable - min_pane)
+        right = usable - left
+        return left, right
+
     def _active_sidebar_width(self, width: int) -> int:
         if not self.show_sidebar or not self.config.sidebar_enabled():
             return 0
-        if self.mode in {MODE_FUZZY, MODE_FLOAT_LIST, MODE_EXPLORER, MODE_COMPLETION, MODE_KEY_HINTS, MODE_ALERT}:
+        if self.file_path is not None and not self._project_mode and not self._sidebar_manual_override:
+            return 0
+        if self.mode in {MODE_FUZZY, MODE_FLOAT_LIST, MODE_EXPLORER, MODE_COMPLETION, MODE_KEY_HINTS, MODE_ALERT, MODE_TERMINAL}:
             return 0
         preferred = self.sidebar_width
         if width - preferred < 20:
@@ -1284,6 +1446,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             MODE_COMPLETION,
             MODE_KEY_HINTS,
             MODE_ALERT,
+            MODE_TERMINAL,
         }:
             return 0
         return max(3, len(str(max(1, len(self.lines))))) + 1
@@ -1406,11 +1569,16 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         line = self._line()
         left = line[: self.cx]
         right = line[self.cx :]
+        indent = left[: len(left) - len(left.lstrip(" \t"))]
+        trigger = left.rstrip()
+        if trigger.endswith(("{", "[", "(")) or trigger.endswith(":"):
+            indent = indent + (" " * self.tab_size)
+        right_trimmed = right.lstrip(" \t") if right.startswith((" ", "\t")) else right
         self._set_line(left)
-        self.lines.insert(self.cy + 1, right)
+        self.lines.insert(self.cy + 1, indent + right_trimmed)
         self.buffer.mark_all_dirty()
         self.cy += 1
-        self.cx = 0
+        self.cx = len(indent)
         self._mark_modified()
 
     def _handle_pair_backspace(self) -> bool:
@@ -1512,10 +1680,25 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
 
     def _open_line_below(self) -> None:
         self._clear_multi_cursor()
+        source = self._line()
+        indent = source[: len(source) - len(source.lstrip(" \t"))]
+        if source.rstrip().endswith(("{", "[", "(")) or source.rstrip().endswith(":"):
+            indent = indent + (" " * self.tab_size)
         self.cy += 1
-        self.lines.insert(self.cy, "")
+        self.lines.insert(self.cy, indent)
         self.buffer.mark_all_dirty()
-        self.cx = 0
+        self.cx = len(indent)
+        self.mode = MODE_INSERT
+        self._mark_modified()
+        self._set_message("-- INSERT --")
+
+    def _open_line_above(self) -> None:
+        self._clear_multi_cursor()
+        source = self._line()
+        indent = source[: len(source) - len(source.lstrip(" \t"))]
+        self.lines.insert(self.cy, indent)
+        self.buffer.mark_all_dirty()
+        self.cx = len(indent)
         self.mode = MODE_INSERT
         self._mark_modified()
         self._set_message("-- INSERT --")
@@ -2064,9 +2247,57 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         if not self.config.sidebar_enabled():
             self._set_message("Sidebar feature is disabled in config.", error=True)
             return
+        self._sidebar_manual_override = True
         self.show_sidebar = not self.show_sidebar
         state = "on" if self.show_sidebar else "off"
         self._set_message(f"Sidebar: {state}")
+
+    def _terminal_default_command(self) -> str:
+        if os.name == "nt":
+            return "cmd"
+        shell = os.environ.get("SHELL", "").strip()
+        return shell or "/bin/sh"
+
+    def _open_terminal(self, command: str | None = None) -> bool:
+        if self._terminal_process_id is not None and self._process_manager.status(self._terminal_process_id) == "running":
+            self.mode = MODE_TERMINAL
+            self._set_message("Terminal resumed.")
+            return True
+        command_text = command.strip() if isinstance(command, str) and command.strip() else self._terminal_default_command()
+        try:
+            process_id = self._process_manager.start(command_text, cwd=str(self._workspace_root))
+        except Exception as exc:
+            self._set_message(f"Terminal start failed: {exc}", error=True)
+            return False
+        self._terminal_process_id = process_id
+        self._terminal_output = [f"[term:{process_id}] {command_text}"]
+        self._terminal_input = ""
+        self._terminal_scroll = 0
+        self.mode = MODE_TERMINAL
+        self._set_message(f"Terminal started: {process_id}")
+        return True
+
+    def _send_terminal_input(self, text: str) -> None:
+        if self._terminal_process_id is None:
+            self._set_message("Terminal is not running.", error=True)
+            return
+        if text in {"\u0003", "\u0004"}:
+            payload = text
+        else:
+            payload = text.rstrip("\n")
+            if payload:
+                self._terminal_output.append(f"> {payload}")
+        if not self._process_manager.write(self._terminal_process_id, payload):
+            self._set_message("Terminal input failed.", error=True)
+
+    def _close_terminal(self, *, kill: bool) -> None:
+        if self._terminal_process_id is not None and kill:
+            self._process_manager.stop_sync(self._terminal_process_id, timeout=0.6)
+            self._terminal_output.append("[term] stop requested")
+            self._terminal_process_id = None
+        self._terminal_input = ""
+        self._terminal_scroll = 0
+        self.mode = MODE_NORMAL
 
     def _find(self, query: str) -> bool:
         if not self.config.feature_enabled("find_replace"):
@@ -2122,6 +2353,124 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._set_message(f"Replaced {count} occurrence(s).")
         return True
 
+    def _regex_flags(self, text: str) -> int | None:
+        flags = 0
+        for ch in text.strip().lower():
+            if ch == "i":
+                flags |= re.IGNORECASE
+            elif ch == "m":
+                flags |= re.MULTILINE
+            elif ch == "s":
+                flags |= re.DOTALL
+            elif ch == "":
+                continue
+            else:
+                return None
+        return flags
+
+    def _compile_regex(self, pattern: str, flags_text: str) -> re.Pattern[str] | None:
+        flags = self._regex_flags(flags_text)
+        if flags is None:
+            self._set_message(f"Invalid regex flags: {flags_text}", error=True)
+            return None
+        try:
+            return re.compile(pattern, flags)
+        except re.error as exc:
+            self._set_message(f"Regex compile failed: {exc}", error=True)
+            return None
+
+    def _find_regex(self, pattern: str, flags_text: str = "") -> bool:
+        if not self.config.feature_enabled("find_replace"):
+            self._set_message("Find/replace is disabled in config.", error=True)
+            return False
+        if not pattern:
+            self._set_message("Usage: :findre <pattern> [flags]", error=True)
+            return False
+        compiled = self._compile_regex(pattern, flags_text)
+        if compiled is None:
+            return False
+        row = self.cy
+        for current in range(row, len(self.lines)):
+            start = self.cx + 1 if current == row else 0
+            match = compiled.search(self.lines[current], start)
+            if match is not None:
+                self.cy = current
+                self.cx = match.start()
+                self._set_message(f"Regex found: /{pattern}/")
+                return True
+        for current in range(0, row):
+            match = compiled.search(self.lines[current], 0)
+            if match is not None:
+                self.cy = current
+                self.cx = match.start()
+                self._set_message(f"Regex found: /{pattern}/")
+                return True
+        self._set_message(f"Regex not found: /{pattern}/", error=True)
+        return False
+
+    def _replace_regex_next(self, pattern: str, replacement: str, flags_text: str = "") -> bool:
+        if not self.config.feature_enabled("find_replace"):
+            self._set_message("Find/replace is disabled in config.", error=True)
+            return False
+        if not pattern:
+            self._set_message("Usage: :replacere <pattern> <replacement> [flags]", error=True)
+            return False
+        compiled = self._compile_regex(pattern, flags_text)
+        if compiled is None:
+            return False
+        row = self.cy
+        for current in range(row, len(self.lines)):
+            start = self.cx if current == row else 0
+            match = compiled.search(self.lines[current], start)
+            if match is None:
+                continue
+            replaced = match.expand(replacement)
+            line = self.lines[current]
+            self.lines[current] = line[: match.start()] + replaced + line[match.end() :]
+            self.cy = current
+            self.cx = match.start() + len(replaced)
+            self._mark_modified()
+            self._set_message("Regex replace next done.")
+            return True
+        for current in range(0, row):
+            match = compiled.search(self.lines[current], 0)
+            if match is None:
+                continue
+            replaced = match.expand(replacement)
+            line = self.lines[current]
+            self.lines[current] = line[: match.start()] + replaced + line[match.end() :]
+            self.cy = current
+            self.cx = match.start() + len(replaced)
+            self._mark_modified()
+            self._set_message("Regex replace next done.")
+            return True
+        self._set_message(f"Regex not found: /{pattern}/", error=True)
+        return False
+
+    def _replace_regex_all(self, pattern: str, replacement: str, flags_text: str = "") -> bool:
+        if not self.config.feature_enabled("find_replace"):
+            self._set_message("Find/replace is disabled in config.", error=True)
+            return False
+        if not pattern:
+            self._set_message("Usage: :replaceallre <pattern> <replacement> [flags]", error=True)
+            return False
+        compiled = self._compile_regex(pattern, flags_text)
+        if compiled is None:
+            return False
+        total = 0
+        updated: list[str] = []
+        for line in self.lines:
+            replaced, count = compiled.subn(replacement, line)
+            updated.append(replaced)
+            total += count
+        if total == 0:
+            self._set_message(f"Regex not found: /{pattern}/", error=True)
+            return False
+        self.lines = updated
+        self._mark_modified()
+        self._set_message(f"Regex replaced {total} occurrence(s).")
+        return True
+
     def _rename_symbol(self, old: str, new: str) -> bool:
         if not self.config.feature_enabled("refactor_tools"):
             self._set_message("Refactor tools are disabled in config.", error=True)
@@ -2172,9 +2521,10 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._set_message(f"Import organization finished. Changed lines: {changed}")
         return True
 
-    def _enter_command(self, initial: str = "") -> None:
+    def _enter_command(self, initial: str = "", *, prompt: str = ":") -> None:
         self.mode = MODE_COMMAND
         self.command_text = initial
+        self._command_prompt = prompt
         self.pending_operator = ""
         self.visual_anchor = None
 
@@ -2315,18 +2665,65 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             return value
         return value
 
+    def open_project(self, target: Path | str, *, force: bool, startup: bool = False) -> bool:
+        if self.modified and not force and not startup:
+            self._set_message("Unsaved changes. Save file or use :q! before opening another project.", error=True)
+            return False
+        path = self._resolve_path(target)
+        if not path.exists() or not path.is_dir():
+            self._set_message(f"Project open failed: {path} is not a directory", error=True)
+            return False
+        self.file_path = None
+        self._project_mode = True
+        self._workspace_root = path.resolve()
+        self.file_index = FileIndex(self._workspace_root, max_files=self.config.file_scan_limit())
+        self.git = GitStatusProvider(
+            self._workspace_root,
+            enabled=self.config.feature_enabled("git_status"),
+            refresh_seconds=self.config.git_refresh_seconds(),
+        )
+        self.lines = [""]
+        self.buffer.configure_piece_table(False)
+        self.cx = 0
+        self.cy = 0
+        self.row_offset = 0
+        self.col_offset = 0
+        self.modified = False
+        self.pending_operator = ""
+        self.pending_scope = ""
+        self._pending_motion = ""
+        self.visual_anchor = None
+        self._clear_multi_cursor()
+        self._history.clear()
+        self._syntax_profile = self._syntax_manager().profile_for_file(self.file_path)
+        current_view = self._capture_view_state()
+        self._split_main_view = current_view
+        self._split_secondary_view = current_view
+        if not self._sidebar_manual_override:
+            self.show_sidebar = self.config.sidebar_enabled()
+        project_label = f"{path.name}/"
+        self._tab_items = [project_label]
+        self._current_tab_index = 0
+        self._schedule_file_tree_refresh()
+        self._schedule_git_control_refresh(force=True)
+        self._set_message(f"Opened project: {path}")
+        return True
+
     def open_file(self, target: Path | str, *, force: bool, startup: bool = False) -> bool:
         if self.modified and not force and not startup:
             self._set_message("Unsaved changes. Use :e! <file> to force.", error=True)
             return False
 
         path = self._resolve_path(target)
+        if path.exists() and path.is_dir():
+            return self.open_project(path, force=force, startup=startup)
         text = ""
         if path.exists():
             try:
-                raw = path.read_bytes().decode("utf-8")
+                raw, decoded_encoding = self._decode_file_bytes(path.read_bytes())
                 normalized, detected_line_ending = self._normalize_loaded_text(raw)
                 text = normalized
+                self._current_encoding = decoded_encoding
                 if self.config.preserve_line_ending():
                     self._current_line_ending = detected_line_ending
                 else:
@@ -2338,8 +2735,10 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         else:
             self._set_message(f"New file: {path}")
             self._current_line_ending = self.config.default_line_ending()
+            self._current_encoding = self._encoding_candidates[0]
 
         self.file_path = path
+        self._project_mode = False
         self._workspace_root = self._detect_workspace_root(path)
         self.file_index = FileIndex(self._workspace_root, max_files=self.config.file_scan_limit())
         self.git = GitStatusProvider(
@@ -2367,6 +2766,9 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._clear_multi_cursor()
         self._history.clear()
         self._syntax_profile = self._syntax_manager().profile_for_file(self.file_path)
+        current_view = self._capture_view_state()
+        self._split_main_view = current_view
+        self._split_secondary_view = current_view
         if self.file_path is not None:
             tab_label = self.file_path.name
             if tab_label not in self._tab_items:
@@ -2374,9 +2776,11 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._current_tab_index = self._tab_items.index(tab_label)
         self._schedule_git_control_refresh(force=True)
         self._maybe_prompt_swap_recovery(path)
+        if not self._sidebar_manual_override:
+            self.show_sidebar = False
         return True
 
-    def save_file(self, target: Path | str | None = None) -> bool:
+    def save_file(self, target: Path | str | None = None, *, quiet: bool = False) -> bool:
         if target is not None:
             self.file_path = self._resolve_path(target)
             self._workspace_root = self._detect_workspace_root(self.file_path)
@@ -2396,12 +2800,13 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             current = self.buffer.text()
             target_newline = self._current_line_ending if self.config.preserve_line_ending() else self.config.default_line_ending()
             data = current.replace("\n", target_newline)
-            self.file_path.write_text(data, encoding="utf-8", newline="")
+            self.file_path.write_text(data, encoding=self._current_encoding, newline="")
         except OSError as exc:
             self._set_message(f"Write failed: {exc}", error=True)
             return False
 
         self.modified = False
+        self._last_auto_save = time.monotonic()
         if self.file_path is not None:
             tab_label = self.file_path.name
             if tab_label not in self._tab_items:
@@ -2410,7 +2815,8 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._schedule_git_control_refresh(force=True)
         if self.file_path is not None:
             self._persistence.remove_swap(self.file_path)
-        self._set_message(f"Wrote {self.file_path}")
+        if not quiet:
+            self._set_message(f"Wrote {self.file_path}")
         return True
 
     def request_quit(self, *, force: bool) -> bool:
@@ -2428,6 +2834,8 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         if self.mode == MODE_INSERT:
             return self.theme.ui_style("mode_insert")
         if self.mode in {MODE_COMMAND, MODE_FUZZY, MODE_FLOAT_LIST, MODE_EXPLORER, MODE_COMPLETION, MODE_KEY_HINTS, MODE_ALERT}:
+            return self.theme.ui_style("mode_command")
+        if self.mode == MODE_TERMINAL:
             return self.theme.ui_style("mode_command")
         if self.mode == MODE_VISUAL:
             return self.theme.ui_style("mode_command")
@@ -2573,6 +2981,8 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             return self._render_key_hint_row(screen_row, text_cols + gutter)
         if self.mode == MODE_ALERT:
             return self._render_alert_row(screen_row, text_cols + gutter)
+        if self.mode == MODE_TERMINAL:
+            return self._render_terminal_row(screen_row, text_rows, text_cols + gutter)
         if self._should_render_dashboard():
             return self._render_dashboard_row(screen_row, text_rows, gutter, text_cols)
 
@@ -2597,6 +3007,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                 MODE_COMPLETION,
                 MODE_KEY_HINTS,
                 MODE_ALERT,
+                MODE_TERMINAL,
             }
             if self._line_is_selected(line_index):
                 base_style = self.theme.ui_style("selection")
@@ -2644,6 +3055,43 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             )
         return f"{self.theme.ui_style('tilde')}{text}{RESET}"
 
+    def _render_editor_row_for_view(
+        self,
+        screen_row: int,
+        text_rows: int,
+        gutter: int,
+        text_cols: int,
+        view_state: tuple[int, int, int, int],
+    ) -> str:
+        saved = self._capture_view_state()
+        try:
+            self._apply_view_state(view_state)
+            return self._render_editor_row(screen_row, text_rows, gutter, text_cols)
+        finally:
+            self._apply_view_state(saved)
+
+    def _render_terminal_row(self, screen_row: int, text_rows: int, width: int) -> str:
+        base_style = self.theme.ui_style("editor")
+        border_style = self.theme.ui_style("command_line")
+        top_left, top_right, bottom_left, bottom_right, vertical, horizontal = self._box_chars()
+        if width <= 2:
+            return f"{base_style}{' ' * max(0, width)}{RESET}"
+        if screen_row == 0:
+            title = f" Terminal [{self._terminal_process_id or '-'}] Esc close Ctrl+Q stop "
+            head = pad_to_display(slice_by_display(title, 0, width - 2), width - 2)
+            return f"{border_style}{top_left}{head}{top_right}{RESET}"
+        if screen_row == text_rows - 1:
+            return f"{border_style}{bottom_left}{(horizontal * (width - 2))}{bottom_right}{RESET}"
+        body_rows = max(1, text_rows - 2)
+        total = len(self._terminal_output)
+        end = max(0, total - self._terminal_scroll)
+        start = max(0, end - body_rows)
+        visible = self._terminal_output[start:end]
+        index = screen_row - 1
+        content = visible[index] if 0 <= index < len(visible) else ""
+        text = pad_to_display(slice_by_display(content, 0, width - 2), width - 2)
+        return f"{base_style}{vertical}{text}{vertical}{RESET}"
+
     def _should_render_dashboard(self) -> bool:
         if self.file_path is not None:
             return False
@@ -2654,25 +3102,47 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
     def _render_dashboard_row(self, screen_row: int, text_rows: int, gutter: int, text_cols: int) -> str:
         base_style = self.theme.ui_style("editor")
         accent_style = self.theme.ui_style("fuzzy_selected")
+        border_style = self.theme.ui_style("command_line")
+        top_left, top_right, bottom_left, bottom_right, vertical, horizontal = self._box_chars()
         hints = [
             APP_NAME,
             f"v{APP_VERSION}",
             "",
             "i        insert mode",
             ":e FILE  open file",
+            ":project DIR open folder",
             ":help    command help",
             "F1       key hints",
         ]
-        start = max(0, (text_rows - len(hints)) // 2)
+
+        content_width = max(display_width(item) for item in hints) + 4
+        box_width = clamp(content_width + 2, 28, max(28, text_cols - 2))
+        box_height = len(hints) + 2
+        start_row = max(0, (text_rows - box_height) // 2)
+        left_pad = max(0, (text_cols - box_width) // 2)
+
         line = " " * text_cols
         style = base_style
-        if start <= screen_row < start + len(hints):
-            message = slice_by_display(hints[screen_row - start], 0, text_cols)
-            message_width = display_width(message)
-            left_pad = max(0, (text_cols - message_width) // 2)
-            line = pad_to_display((" " * left_pad) + message, text_cols)
-            if screen_row - start in {0, 1}:
-                style = accent_style
+        if start_row <= screen_row < start_row + box_height:
+            local = screen_row - start_row
+            if local == 0:
+                title = " Welcome "
+                inner = pad_to_display(slice_by_display(title, 0, box_width - 2), box_width - 2)
+                body = top_left + inner + top_right
+                line = pad_to_display((" " * left_pad) + body, text_cols)
+                style = border_style
+            elif local == box_height - 1:
+                body = bottom_left + (horizontal * max(0, box_width - 2)) + bottom_right
+                line = pad_to_display((" " * left_pad) + body, text_cols)
+                style = border_style
+            else:
+                hint = hints[local - 1]
+                shown = slice_by_display(hint, 0, max(0, box_width - 4))
+                hint_pad = max(0, (box_width - 2 - display_width(shown)) // 2)
+                content = pad_to_display((" " * hint_pad) + shown, box_width - 2)
+                body = vertical + content + vertical
+                line = pad_to_display((" " * left_pad) + body, text_cols)
+                style = accent_style if local in {1, 2} else base_style
         if gutter > 0:
             return f"{self.theme.ui_style('line_number')}{' ' * gutter}{style}{line}{RESET}"
         return f"{style}{line}{RESET}"
@@ -2685,20 +3155,30 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         except ValueError:
             return None
 
-    def _sidebar_start_index(self, files: list[Path], text_rows: int) -> int:
+    def _build_sidebar_entries(self, files: list[Path]) -> list[tuple[str, Path | None]]:
         if not files:
+            return []
+        tree_entries = self._file_tree_feature._flatten_as_tree([str(item).replace("\\", "/") for item in files])
+        entries: list[tuple[str, Path | None]] = []
+        for entry in tree_entries:
+            relative = Path(entry.relative_path) if entry.relative_path else None
+            entries.append((entry.display, relative))
+        return entries
+
+    def _sidebar_start_index(self, entries: list[tuple[str, Path | None]], text_rows: int) -> int:
+        if not entries:
             return 0
 
         current = self._current_relative_path()
         current_index = 0
         if current is not None:
-            try:
-                current_index = files.index(current)
-            except ValueError:
-                current_index = 0
+            for index, (_display, relative) in enumerate(entries):
+                if relative == current:
+                    current_index = index
+                    break
 
         visible = max(1, text_rows - 1)
-        max_start = max(0, len(files) - visible)
+        max_start = max(0, len(entries) - visible)
         return clamp(current_index - visible // 2, 0, max_start)
 
     def _render_sidebar_row(
@@ -2706,7 +3186,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         screen_row: int,
         text_rows: int,
         width: int,
-        files: list[Path],
+        entries: list[tuple[str, Path | None]],
         start_index: int,
     ) -> str:
         if width <= 0:
@@ -2717,17 +3197,19 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         current_style = self.theme.ui_style("sidebar_current")
 
         if screen_row == 0:
-            title = f" Files ({len(files)}) "
+            file_count = sum(1 for _display, relative in entries if relative is not None)
+            title = f" Files ({file_count}) "
             return f"{header_style}{pad_to_display(slice_by_display(title, 0, width), width)}{RESET}"
 
         file_index = start_index + screen_row - 1
-        if file_index < len(files):
-            relative = files[file_index]
-            marker = self.git.status_for_relative(relative) if self.config.feature_enabled("git_status") else " "
-            marker = marker if marker.strip() else " "
-            body = f"{marker} {relative}"
+        if file_index < len(entries):
+            display, relative = entries[file_index]
+            marker = " "
+            if relative is not None and self.config.feature_enabled("git_status"):
+                marker = self.git.status_for_relative(relative) or " "
+            body = f"{marker} {display}" if relative is not None else f"  {display}"
             text = pad_to_display(slice_by_display(body, 0, width), width)
-            is_current = self._current_relative_path() == relative
+            is_current = relative is not None and self._current_relative_path() == relative
             style = current_style if is_current else base_style
             return f"{style}{text}{RESET}"
 
@@ -2754,7 +3236,22 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
 
     def _render_bottom_row(self, width: int) -> tuple[str, int]:
         if self.mode == MODE_COMMAND:
-            text = ":" + self.command_text
+            if self._command_prompt == "/" and self.command_text.startswith("find "):
+                shown = self.command_text[5:]
+            else:
+                shown = self.command_text
+            text = self._command_prompt + shown
+            text_width = display_width(text)
+            if text_width <= width:
+                visible = pad_to_display(text, width)
+                cursor_col = text_width + 1
+            else:
+                visible = pad_to_display(slice_by_display(text, text_width - width, width), width)
+                cursor_col = width
+            return f"{self.theme.ui_style('command_line')}{visible}{RESET}", clamp(cursor_col, 1, width)
+
+        if self.mode == MODE_TERMINAL:
+            text = f"term> {self._terminal_input}"
             text_width = display_width(text)
             if text_width <= width:
                 visible = pad_to_display(text, width)
@@ -2811,9 +3308,14 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         gutter = self._gutter_width()
         editor_width = max(1, width - sidebar_width)
         text_cols = max(1, editor_width - gutter)
+        split_render = self._split_enabled and self.mode in {MODE_NORMAL, MODE_INSERT, MODE_VISUAL}
+        split_sizes = self._split_vertical_sizes(editor_width) if split_render and self._split_orientation == "vertical" else None
+        if split_render and self._split_orientation == "vertical" and split_sizes is None:
+            split_render = False
+        self._capture_split_active_view()
 
-        sidebar_files = self.file_index.list_files() if sidebar_width > 0 else []
-        sidebar_start = self._sidebar_start_index(sidebar_files, text_rows) if sidebar_files else 0
+        sidebar_entries = self._build_sidebar_entries(self.file_index.list_files()) if sidebar_width > 0 else []
+        sidebar_start = self._sidebar_start_index(sidebar_entries, text_rows) if sidebar_entries else 0
 
         frame: list[str] = []
         file_name = str(self.file_path) if self.file_path else "[No Name]"
@@ -2843,13 +3345,59 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             frame.append(f"{self.theme.ui_style('command_line')}{winbar}{RESET}")
 
         for screen_row in range(text_rows):
-            editor_row = self._render_editor_row(screen_row, text_rows, gutter, text_cols)
+            if split_render:
+                divider_style = self.theme.ui_style("command_line")
+                divider_char = "│" if self._unicode_ui else "|"
+                if self._split_orientation == "vertical":
+                    assert split_sizes is not None
+                    left_width, right_width = split_sizes
+                    left_text_cols = max(1, left_width - gutter)
+                    right_text_cols = max(1, right_width - gutter)
+                    left_row = self._render_editor_row_for_view(
+                        screen_row,
+                        text_rows,
+                        gutter,
+                        left_text_cols,
+                        self._split_main_view,
+                    )
+                    right_row = self._render_editor_row_for_view(
+                        screen_row,
+                        text_rows,
+                        gutter,
+                        right_text_cols,
+                        self._split_secondary_view,
+                    )
+                    editor_row = f"{left_row}{divider_style}{divider_char}{RESET}{right_row}"
+                else:
+                    top_rows = max(2, (text_rows - 1) // 2)
+                    bottom_rows = max(1, text_rows - top_rows - 1)
+                    if screen_row < top_rows:
+                        editor_row = self._render_editor_row_for_view(
+                            screen_row,
+                            top_rows,
+                            gutter,
+                            text_cols,
+                            self._split_main_view,
+                        )
+                    elif screen_row == top_rows:
+                        divider = "─" if self._unicode_ui else "-"
+                        editor_row = f"{self.theme.ui_style('command_line')}{divider * editor_width}{RESET}"
+                    else:
+                        editor_row = self._render_editor_row_for_view(
+                            screen_row - top_rows - 1,
+                            bottom_rows,
+                            gutter,
+                            text_cols,
+                            self._split_secondary_view,
+                        )
+            else:
+                editor_row = self._render_editor_row(screen_row, text_rows, gutter, text_cols)
             if sidebar_width > 0:
                 side = self._render_sidebar_row(
                     screen_row,
                     text_rows,
                     sidebar_width,
-                    sidebar_files,
+                    sidebar_entries,
                     sidebar_start,
                 )
                 frame.append(f"{side}{editor_row}")
@@ -2861,12 +3409,43 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         frame.append(bottom_row)
         self._apply_notification_overlay(frame, width)
 
-        if self.mode in {MODE_COMMAND, MODE_FUZZY}:
+        if self.mode in {MODE_COMMAND, MODE_FUZZY, MODE_TERMINAL}:
             cursor_row = height
             cursor_col = command_cursor_col
         elif self.mode in {MODE_FLOAT_LIST, MODE_EXPLORER, MODE_COMPLETION, MODE_KEY_HINTS, MODE_ALERT}:
             cursor_row = height
             cursor_col = 1
+        elif split_render:
+            line = self._line()
+            cursor_display = display_width(line[: self.cx])
+            if self._split_orientation == "vertical":
+                assert split_sizes is not None
+                left_width, right_width = split_sizes
+                pane_width = left_width if self._split_focus == "main" else right_width
+                pane_text_cols = max(1, pane_width - gutter)
+                pane_left = sidebar_width + (0 if self._split_focus == "main" else left_width + 1)
+                if self._soft_wrap_enabled:
+                    visual_row = self._cursor_softwrap_row(pane_text_cols)
+                    cursor_row = plan.editor_top + clamp(visual_row, 1, text_rows)
+                    segment_start = (cursor_display // pane_text_cols) * pane_text_cols
+                    cursor_col = clamp(pane_left + gutter + (cursor_display - segment_start) + 1, 1, width)
+                else:
+                    cursor_row = plan.editor_top + clamp(self.cy - self.row_offset + 1, 1, text_rows)
+                    cursor_col = clamp(pane_left + gutter + (cursor_display - self.col_offset) + 1, 1, width)
+            else:
+                top_rows = max(2, (text_rows - 1) // 2)
+                bottom_rows = max(1, text_rows - top_rows - 1)
+                pane_rows = top_rows if self._split_focus == "main" else bottom_rows
+                pane_top = plan.editor_top + (0 if self._split_focus == "main" else top_rows + 1)
+                pane_text_cols = max(1, text_cols)
+                if self._soft_wrap_enabled:
+                    visual_row = self._cursor_softwrap_row(pane_text_cols)
+                    cursor_row = pane_top + clamp(visual_row, 1, pane_rows)
+                    segment_start = (cursor_display // pane_text_cols) * pane_text_cols
+                    cursor_col = clamp(sidebar_width + gutter + (cursor_display - segment_start) + 1, 1, width)
+                else:
+                    cursor_row = pane_top + clamp(self.cy - self.row_offset + 1, 1, pane_rows)
+                    cursor_col = clamp(sidebar_width + gutter + (cursor_display - self.col_offset) + 1, 1, width)
         else:
             line = self._line()
             cursor_display = display_width(line[: self.cx])
@@ -2964,6 +3543,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                 MODE_COMPLETION,
                 MODE_KEY_HINTS,
                 MODE_ALERT,
+                MODE_TERMINAL,
             }
         ):
             candidate_rows = set(range(1, len(frame) + 1))
@@ -3133,6 +3713,10 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                 self._handle_completion_key(key)
                 return
 
+            if self.mode == MODE_TERMINAL:
+                self._handle_terminal_key(key)
+                return
+
             if key == "CTRL_S":
                 self.save_file()
                 return
@@ -3167,6 +3751,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._handle_normal_key(key)
             self._dispatch_plugin_key(key)
         finally:
+            self._capture_split_active_view()
             self._push_history_if_changed(before, label=f"key:{key}")
 
     def run(self) -> None:
@@ -3185,6 +3770,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                     if self.mode == MODE_EXPLORER and not self._file_tree_feature.entries:
                         self._schedule_file_tree_refresh()
                     self._write_swap_if_needed()
+                    self._auto_save_if_needed()
                     self._last_tick = time.monotonic()
                     continue
                 self._drain_async_events()
@@ -3192,6 +3778,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                 if self.mode == MODE_EXPLORER and not self._file_tree_feature.entries:
                     self._schedule_file_tree_refresh()
                 self._write_swap_if_needed()
+                self._auto_save_if_needed()
                 self.render()
                 time.sleep(0.01)
         finally:

@@ -46,6 +46,15 @@ class AsyncProcessManager:
         self._runtime.submit(f"proc-stop:{process_id}", coro)
         return True
 
+    def stop_sync(self, process_id: int, *, timeout: float = 1.0) -> bool:
+        if process_id not in self._states:
+            return False
+        try:
+            self._runtime.run_sync(self._stop(process_id), timeout=timeout)
+        except Exception:
+            return False
+        return True
+
     def status(self, process_id: int) -> str:
         state = self._states.get(process_id)
         if state is None:
@@ -85,7 +94,9 @@ class AsyncProcessManager:
         if state is None or state.process.stdin is None or state.exited:
             return
         payload = data
-        if not payload.endswith("\n"):
+        if not payload:
+            payload = "\n"
+        elif not (len(payload) == 1 and ord(payload) < 32) and not payload.endswith("\n"):
             payload = payload + "\n"
         state.process.stdin.write(payload.encode("utf-8"))
         await state.process.stdin.drain()

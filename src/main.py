@@ -16,7 +16,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         prog="pvim",
         description=f"{APP_NAME} {APP_VERSION} - modular Vim-style editor (stdlib only)",
     )
-    parser.add_argument("file", nargs="?", help="Optional file path to open.")
+    parser.add_argument("file", nargs="?", help="Optional file or folder path to open.")
     parser.add_argument(
         "--config",
         default="pvim.config.json",
