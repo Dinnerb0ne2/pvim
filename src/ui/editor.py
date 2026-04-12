@@ -9,6 +9,7 @@ import sys
 import time
 
 from ..core.async_runtime import AsyncRuntime
+from ..core.buffer import Buffer
 from ..core.config import AppConfig
 from ..core.console import CSI, ConsoleController, KeyReader
 from ..core.process_pipe import AsyncProcessManager
@@ -21,12 +22,14 @@ from ..features.refactor import find_next, rename_symbol, replace_all, replace_n
 from ..features.syntax import SyntaxManager
 from ..plugins import PluginManager
 from ..scripting import ScriptError
+from .floating_list import FloatingList
 
 MODE_NORMAL = "NORMAL"
 MODE_INSERT = "INSERT"
 MODE_COMMAND = "COMMAND"
 MODE_VISUAL = "VISUAL"
 MODE_FUZZY = "FUZZY"
+MODE_FLOAT_LIST = "FLOAT_LIST"
 MODE_KEY_HINTS = "KEY_HINTS"
 MODE_ALERT = "ALERT"
 
@@ -43,7 +46,7 @@ class PviEditor:
     def __init__(self, file_path: Path | None, config: AppConfig) -> None:
         self.config = config
 
-        self.lines: list[str] = [""]
+        self.buffer = Buffer(lines=[""])
         self.file_path: Path | None = None
 
         self.cx = 0
@@ -60,6 +63,8 @@ class PviEditor:
         self.fuzzy_query = ""
         self.fuzzy_matches: list[Path] = []
         self.fuzzy_index = 0
+        self._floating_list: FloatingList | None = None
+        self._floating_accept_mode = MODE_NORMAL
 
         self.key_hints_enabled = True
         self.key_hints_trigger = "F1"
@@ -76,6 +81,8 @@ class PviEditor:
         self.message_error = False
 
         self._last_frame: list[str] = []
+        self._last_view_state: tuple[int, int, str, int, int] | None = None
+        self._last_cursor_line = 0
         self._console = ConsoleController()
         self._async_runtime = AsyncRuntime()
         self._process_manager = AsyncProcessManager(self._async_runtime)
@@ -106,6 +113,14 @@ class PviEditor:
         if file_path is not None:
             self.open_file(file_path, force=True, startup=True)
 
+    @property
+    def lines(self) -> list[str]:
+        return self.buffer.lines
+
+    @lines.setter
+    def lines(self, value: list[str]) -> None:
+        self.buffer.set_lines(value)
+
     def _apply_runtime_config(self) -> None:
         self.show_line_numbers = self.config.show_line_numbers()
         self.tab_size = self.config.tab_size()
@@ -135,6 +150,7 @@ class PviEditor:
         startup_errors = [item["error"] for item in self.plugins.list_plugins() if item["error"]]
         if startup_errors:
             self._show_alert(f"Plugin startup error: {startup_errors[0]}")
+        self.buffer.mark_all_dirty()
         self._auto_pairs = self._load_auto_pairs()
         self._auto_pair_closers = set(self._auto_pairs.values())
 
@@ -201,6 +217,7 @@ class PviEditor:
             if row < 1 or row > len(self.lines):
                 return False
             self.lines[row - 1] = str(args[1])
+            self.buffer.mark_dirty(row - 1)
             self._mark_modified()
             return True
 
@@ -229,6 +246,41 @@ class PviEditor:
 
         if action == "current_file":
             return str(self.file_path) if self.file_path else ""
+
+        if action == "virtual.add":
+            if len(args) < 2:
+                return False
+            row = int(args[0]) - 1
+            if row < 0 or row >= len(self.lines):
+                return False
+            self.buffer.add_virtual_text(row, str(args[1]))
+            return True
+
+        if action == "virtual.set":
+            if len(args) < 2:
+                return False
+            row = int(args[0]) - 1
+            if row < 0 or row >= len(self.lines):
+                return False
+            chunks = [str(item) for item in args[1:] if str(item)]
+            self.buffer.set_virtual_text(row, chunks)
+            return True
+
+        if action == "virtual.clear":
+            if not args:
+                self.buffer.clear_virtual_text()
+                return True
+            row = int(args[0]) - 1
+            self.buffer.clear_virtual_text(row)
+            return True
+
+        if action == "virtual.get":
+            if not args:
+                return ""
+            row = int(args[0]) - 1
+            if row < 0 or row >= len(self.lines):
+                return ""
+            return " | ".join(self.buffer.get_virtual_text(row))
 
         if action == "proc.start":
             if not args:
@@ -341,6 +393,8 @@ class PviEditor:
             "  :proc read <id> [max]",
             "  :proc write <id> <text>",
             "  :proc stop <id>",
+            "  :virtual add <line> <text>",
+            "  :virtual clear [line]",
         ]
         return lines
 
@@ -392,10 +446,12 @@ class PviEditor:
 
     def _set_line(self, value: str) -> None:
         self.lines[self.cy] = value
+        self.buffer.mark_dirty(self.cy)
 
     def _mark_modified(self) -> None:
         self.modified = True
         self.pending_operator = ""
+        self.buffer.mark_dirty(self.cy)
 
     def _target_edit_rows(self) -> list[int]:
         rows = {self.cy}
@@ -414,13 +470,15 @@ class PviEditor:
     def _active_sidebar_width(self, width: int) -> int:
         if not self.show_sidebar or not self.config.sidebar_enabled():
             return 0
+        if self.mode in {MODE_FUZZY, MODE_FLOAT_LIST, MODE_KEY_HINTS, MODE_ALERT}:
+            return 0
         preferred = self.sidebar_width
         if width - preferred < 20:
             return max(0, width - 20)
         return preferred
 
     def _gutter_width(self) -> int:
-        if not self.show_line_numbers or self.mode in {MODE_FUZZY, MODE_KEY_HINTS, MODE_ALERT}:
+        if not self.show_line_numbers or self.mode in {MODE_FUZZY, MODE_FLOAT_LIST, MODE_KEY_HINTS, MODE_ALERT}:
             return 0
         return max(3, len(str(max(1, len(self.lines))))) + 1
 
@@ -517,6 +575,7 @@ class PviEditor:
             line = self.lines[row]
             column = min(self.cx, len(line))
             self.lines[row] = line[:column] + text + line[column:]
+            self.buffer.mark_dirty(row)
         self.cx += len(text)
         self._mark_modified()
 
@@ -528,6 +587,7 @@ class PviEditor:
         right = line[self.cx :]
         self._set_line(left)
         self.lines.insert(self.cy + 1, right)
+        self.buffer.mark_all_dirty()
         self.cy += 1
         self.cx = 0
         self._mark_modified()
@@ -566,6 +626,7 @@ class PviEditor:
                 column = min(self.cx, len(line))
                 if column > 0:
                     self.lines[row] = line[: column - 1] + line[column:]
+                    self.buffer.mark_dirty(row)
             self.cx -= 1
             self._mark_modified()
             return
@@ -586,6 +647,7 @@ class PviEditor:
         self.cy -= 1
         self.cx = len(prev)
         self.lines[self.cy] = prev + current
+        self.buffer.mark_all_dirty()
         self._mark_modified()
 
     def _delete_char(self) -> None:
@@ -596,6 +658,7 @@ class PviEditor:
                 column = min(self.cx, len(line))
                 if column < len(line):
                     self.lines[row] = line[:column] + line[column + 1 :]
+                    self.buffer.mark_dirty(row)
                     changed = True
             if changed:
                 self._mark_modified()
@@ -609,6 +672,7 @@ class PviEditor:
 
         if self.cy < len(self.lines) - 1:
             self.lines[self.cy] = line + self.lines.pop(self.cy + 1)
+            self.buffer.mark_all_dirty()
             self._mark_modified()
 
     def _delete_line(self) -> None:
@@ -620,6 +684,7 @@ class PviEditor:
             return
 
         self.lines.pop(self.cy)
+        self.buffer.mark_all_dirty()
         self.cy = min(self.cy, len(self.lines) - 1)
         self.cx = min(self.cx, len(self._line()))
         self._mark_modified()
@@ -628,6 +693,7 @@ class PviEditor:
         self._clear_multi_cursor()
         self.cy += 1
         self.lines.insert(self.cy, "")
+        self.buffer.mark_all_dirty()
         self.cx = 0
         self.mode = MODE_INSERT
         self._mark_modified()
@@ -649,6 +715,7 @@ class PviEditor:
         prefix = " " * self.tab_size
         for row in range(start, end + 1):
             self.lines[row] = prefix + self.lines[row]
+            self.buffer.mark_dirty(row)
         if start <= self.cy <= end:
             self.cx += self.tab_size
         self._mark_modified()
@@ -663,6 +730,7 @@ class PviEditor:
                 while strip_count < self.tab_size and strip_count < len(line) and line[strip_count] == " ":
                     strip_count += 1
                 self.lines[row] = line[strip_count:]
+            self.buffer.mark_dirty(row)
         if start <= self.cy <= end:
             self.cx = max(0, self.cx - self.tab_size)
         self._mark_modified()
@@ -705,9 +773,11 @@ class PviEditor:
                 if body.startswith(" "):
                     body = body[1:]
                 self.lines[row] = indent + body
+                self.buffer.mark_dirty(row)
             elif not should_uncomment:
                 spacer = " " if body else ""
                 self.lines[row] = f"{indent}{prefix}{spacer}{body}"
+                self.buffer.mark_dirty(row)
 
         self._mark_modified()
         self._set_message("Comment toggled.")
@@ -738,23 +808,51 @@ class PviEditor:
         self.mode = MODE_FUZZY
         self.fuzzy_query = query
         self.fuzzy_index = 0
+        self._floating_list = FloatingList(
+            title="Fuzzy Finder  (Enter=open, Esc=cancel)",
+            footer="Type to filter, Up/Down select",
+        )
         self._update_fuzzy_matches()
 
     def _update_fuzzy_matches(self) -> None:
         all_files = self.file_index.list_files()
         self.fuzzy_matches = fuzzy_filter(all_files, self.fuzzy_query, limit=40)
         self.fuzzy_index = clamp(self.fuzzy_index, 0, max(0, len(self.fuzzy_matches) - 1))
+        if self._floating_list is not None:
+            self._floating_list.selected = self.fuzzy_index
+            self._floating_list.set_items([str(path) for path in self.fuzzy_matches])
+            self.fuzzy_index = self._floating_list.selected
 
     def _accept_fuzzy_selection(self) -> None:
         if not self.fuzzy_matches:
             self._set_message("No fuzzy match to open.", error=True)
             return
+        if self._floating_list is not None:
+            self.fuzzy_index = self._floating_list.selected
         target = Path.cwd() / self.fuzzy_matches[self.fuzzy_index]
         if self.open_file(target, force=False):
             self.mode = MODE_NORMAL
             self.fuzzy_query = ""
             self.fuzzy_matches = []
             self.fuzzy_index = 0
+            self._floating_list = None
+
+    def _open_plugin_list_popup(self) -> None:
+        entries = self.plugins.list_plugins()
+        if not entries:
+            self._set_message("No plugins found.")
+            return
+        labels = [
+            f"{item['name']} | loaded={item['loaded']} | {item['error'] or 'ok'}"
+            for item in entries
+        ]
+        self._floating_list = FloatingList(
+            title="Plugins (Enter=details, Esc=close)",
+            footer="Use Up/Down to browse plugin records",
+            items=labels,
+        )
+        self._floating_accept_mode = MODE_NORMAL
+        self.mode = MODE_FLOAT_LIST
 
     def _toggle_sidebar(self) -> None:
         if not self.config.sidebar_enabled():
@@ -907,14 +1005,7 @@ class PviEditor:
 
         action = args[0]
         if action == "list":
-            entries = self.plugins.list_plugins()
-            if not entries:
-                self._set_message("No plugins found.")
-                return True
-            summary = ", ".join(
-                f"{item['name']}({item['loaded']}){'*' if item['error'] else ''}" for item in entries[:8]
-            )
-            self._set_message(f"Plugins: {summary}")
+            self._open_plugin_list_popup()
             return True
 
         if action in {"load", "reload"}:
@@ -1052,27 +1143,37 @@ class PviEditor:
     def _mode_style(self) -> str:
         if self.mode == MODE_INSERT:
             return self.theme.ui_style("mode_insert")
-        if self.mode in {MODE_COMMAND, MODE_FUZZY, MODE_KEY_HINTS, MODE_ALERT}:
+        if self.mode in {MODE_COMMAND, MODE_FUZZY, MODE_FLOAT_LIST, MODE_KEY_HINTS, MODE_ALERT}:
             return self.theme.ui_style("mode_command")
         if self.mode == MODE_VISUAL:
             return self.theme.ui_style("mode_command")
         return self.theme.ui_style("mode_normal")
 
-    def _render_fuzzy_row(self, screen_row: int, text_cols: int) -> str:
+    def _render_popup_list_row(self, screen_row: int, text_cols: int, fallback_title: str) -> str:
         base_style = self.theme.ui_style("editor")
         selected_style = self.theme.ui_style("fuzzy_selected")
-        if screen_row == 0:
-            head = "Fuzzy Finder  (Enter=open, Esc=cancel)"
-            text = head[:text_cols].ljust(text_cols)
-            return f"{base_style}{text}{RESET}"
+        popup = self._floating_list
+        title = popup.title if popup is not None else fallback_title
 
-        index = screen_row - 1
-        if index < len(self.fuzzy_matches):
-            text = str(self.fuzzy_matches[index])[:text_cols].ljust(text_cols)
-            style = selected_style if index == self.fuzzy_index else base_style
+        if screen_row == 0:
+            return f"{selected_style}{title[:text_cols].ljust(text_cols)}{RESET}"
+
+        if popup is None:
+            return f"{base_style}{' ' * text_cols}{RESET}"
+
+        index = popup.scroll + screen_row - 1
+        if 0 <= index < len(popup.items):
+            text = popup.items[index][:text_cols].ljust(text_cols)
+            style = selected_style if index == popup.selected else base_style
             return f"{style}{text}{RESET}"
 
         return f"{base_style}{' ' * text_cols}{RESET}"
+
+    def _render_fuzzy_row(self, screen_row: int, text_cols: int) -> str:
+        return self._render_popup_list_row(screen_row, text_cols, "Fuzzy Finder")
+
+    def _render_float_list_row(self, screen_row: int, text_cols: int) -> str:
+        return self._render_popup_list_row(screen_row, text_cols, "Select Item")
 
     def _render_key_hint_row(self, screen_row: int, text_cols: int) -> str:
         base_style = self.theme.ui_style("editor")
@@ -1112,6 +1213,8 @@ class PviEditor:
     ) -> str:
         if self.mode == MODE_FUZZY:
             return self._render_fuzzy_row(screen_row, text_cols + gutter)
+        if self.mode == MODE_FLOAT_LIST:
+            return self._render_float_list_row(screen_row, text_cols + gutter)
         if self.mode == MODE_KEY_HINTS:
             return self._render_key_hint_row(screen_row, text_cols + gutter)
         if self.mode == MODE_ALERT:
@@ -1120,10 +1223,22 @@ class PviEditor:
         line_index = self.row_offset + screen_row
         if line_index < len(self.lines):
             raw = self.lines[line_index]
-            visible = raw[self.col_offset : self.col_offset + text_cols]
-            padding = " " * (text_cols - len(visible))
+            visible_code = raw[self.col_offset : self.col_offset + text_cols]
+            ghost_chunks = self.buffer.get_virtual_text(line_index)
+            ghost_visible = ""
+            if ghost_chunks:
+                ghost_raw = "  ⟪" + " | ".join(ghost_chunks) + "⟫"
+                room = max(0, text_cols - len(visible_code))
+                ghost_visible = ghost_raw[:room]
+            padding = " " * max(0, text_cols - len(visible_code) - len(ghost_visible))
 
-            is_current = line_index == self.cy and self.mode not in {MODE_COMMAND, MODE_FUZZY}
+            is_current = line_index == self.cy and self.mode not in {
+                MODE_COMMAND,
+                MODE_FUZZY,
+                MODE_FLOAT_LIST,
+                MODE_KEY_HINTS,
+                MODE_ALERT,
+            }
             if self._line_is_selected(line_index):
                 base_style = self.theme.ui_style("selection")
             elif is_current:
@@ -1131,7 +1246,12 @@ class PviEditor:
             else:
                 base_style = self.theme.ui_style("editor")
 
-            colored = self.syntax.highlight_line(visible, self._syntax_profile, self.theme, base_style)
+            colored_code = self.syntax.highlight_line(visible_code, self._syntax_profile, self.theme, base_style)
+            if ghost_visible:
+                ghost_style = self.theme.ui_style("message_info") or base_style
+                colored = f"{colored_code}{ghost_style}{ghost_visible}{base_style}"
+            else:
+                colored = colored_code
             if gutter > 0:
                 number = f"{line_index + 1:>{gutter - 1}} "
                 number_style = (
@@ -1246,6 +1366,10 @@ class PviEditor:
                 cursor_col = width
             return f"{self.theme.ui_style('command_line')}{visible}{RESET}", clamp(cursor_col, 1, width)
 
+        if self.mode == MODE_FLOAT_LIST:
+            footer = self._floating_list.footer if self._floating_list is not None else "Floating list"
+            return f"{self.theme.ui_style('command_line')}{footer[:width].ljust(width)}{RESET}", 1
+
         if self.mode == MODE_KEY_HINTS:
             text = "Hints: Up/Down scroll, Esc close"
             return f"{self.theme.ui_style('command_line')}{text[:width].ljust(width)}{RESET}", 1
@@ -1295,7 +1419,7 @@ class PviEditor:
         if self.mode in {MODE_COMMAND, MODE_FUZZY}:
             cursor_row = height
             cursor_col = command_cursor_col
-        elif self.mode in {MODE_KEY_HINTS, MODE_ALERT}:
+        elif self.mode in {MODE_FLOAT_LIST, MODE_KEY_HINTS, MODE_ALERT}:
             cursor_row = height
             cursor_col = 1
         else:
@@ -1310,8 +1434,40 @@ class PviEditor:
         if len(self._last_frame) != len(frame):
             self._last_frame = [""] * len(frame)
 
+        width, _ = self._terminal_size()
+        view_state = (
+            self.row_offset,
+            self.col_offset,
+            self.mode,
+            self._active_sidebar_width(width),
+            self._gutter_width(),
+        )
+        dirty_all, dirty_lines = self.buffer.consume_dirty()
+        text_rows = max(1, len(frame) - 2)
+
+        if (
+            dirty_all
+            or self._last_view_state != view_state
+            or self.mode in {MODE_FUZZY, MODE_FLOAT_LIST, MODE_KEY_HINTS, MODE_ALERT}
+        ):
+            candidate_rows = set(range(1, len(frame) + 1))
+        else:
+            candidate_rows = {len(frame) - 1, len(frame)}
+            for line_index in dirty_lines:
+                screen_row = line_index - self.row_offset + 1
+                if 1 <= screen_row <= text_rows:
+                    candidate_rows.add(screen_row)
+
+            previous_screen_row = self._last_cursor_line - self.row_offset + 1
+            current_screen_row = self.cy - self.row_offset + 1
+            if 1 <= previous_screen_row <= text_rows:
+                candidate_rows.add(previous_screen_row)
+            if 1 <= current_screen_row <= text_rows:
+                candidate_rows.add(current_screen_row)
+
         out: list[str] = []
-        for row, line in enumerate(frame, start=1):
+        for row in sorted(candidate_rows):
+            line = frame[row - 1]
             if line != self._last_frame[row - 1]:
                 out.append(f"{CSI}{row};1H{line}")
 
@@ -1319,6 +1475,8 @@ class PviEditor:
         sys.stdout.write("".join(out))
         sys.stdout.flush()
         self._last_frame = frame
+        self._last_view_state = view_state
+        self._last_cursor_line = self.cy
 
     def execute_command(self, command: str) -> None:
         command = command.strip()
@@ -1387,7 +1545,7 @@ class PviEditor:
 
         if cmd in {"help", "h"}:
             self._set_message(
-                "Commands: :w :q :e :find :replace :rename :format :fuzzy :keys :script :plugin :proc"
+                "Commands: :w :q :e :find :replace :rename :format :fuzzy :keys :script :plugin :proc :virtual"
             )
             return
 
@@ -1498,6 +1656,38 @@ class PviEditor:
                 self._set_message(f"Process {process_id}: {self._process_manager.status(process_id)}")
                 return
             self._set_message("Usage: :proc start|read|write|stop|status ...", error=True)
+            return
+
+        if cmd == "virtual":
+            if not args:
+                self._set_message("Usage: :virtual add|set|clear|get ...", error=True)
+                return
+            action = args[0]
+            if action in {"add", "set"} and len(args) >= 3:
+                row = int(args[1]) - 1
+                if row < 0 or row >= len(self.lines):
+                    self._set_message("Invalid row for virtual text.", error=True)
+                    return
+                text = " ".join(args[2:])
+                if action == "add":
+                    self.buffer.add_virtual_text(row, text)
+                else:
+                    self.buffer.set_virtual_text(row, [text] if text else [])
+                self._set_message("Virtual text updated.")
+                return
+            if action == "clear":
+                if len(args) >= 2:
+                    self.buffer.clear_virtual_text(int(args[1]) - 1)
+                else:
+                    self.buffer.clear_virtual_text()
+                self._set_message("Virtual text cleared.")
+                return
+            if action == "get" and len(args) >= 2:
+                row = int(args[1]) - 1
+                text = " | ".join(self.buffer.get_virtual_text(row))
+                self._set_message(text or "(no virtual text)")
+                return
+            self._set_message("Usage: :virtual add|set|clear|get ...", error=True)
             return
 
         if cmd in {"sidebar"}:
@@ -1657,6 +1847,7 @@ class PviEditor:
             self.fuzzy_query = ""
             self.fuzzy_matches = []
             self.fuzzy_index = 0
+            self._floating_list = None
             self._set_message("Fuzzy cancelled.")
             return
 
@@ -1670,11 +1861,20 @@ class PviEditor:
             return
 
         if key in {"UP", "CTRL_LEFT"}:
-            self.fuzzy_index = max(0, self.fuzzy_index - 1)
+            if self._floating_list is not None:
+                self._floating_list.move_up()
+                self.fuzzy_index = self._floating_list.selected
+            else:
+                self.fuzzy_index = max(0, self.fuzzy_index - 1)
             return
 
         if key in {"DOWN", "CTRL_RIGHT"}:
-            self.fuzzy_index = min(max(0, len(self.fuzzy_matches) - 1), self.fuzzy_index + 1)
+            if self._floating_list is not None:
+                _, height = self._terminal_size()
+                self._floating_list.move_down(max(1, height - 3))
+                self.fuzzy_index = self._floating_list.selected
+            else:
+                self.fuzzy_index = min(max(0, len(self.fuzzy_matches) - 1), self.fuzzy_index + 1)
             return
 
         if len(key) == 1 and key.isprintable():
@@ -1695,6 +1895,33 @@ class PviEditor:
     def _handle_alert_key(self, key: str) -> None:
         if key in {"ESC", "ENTER"}:
             self._close_alert()
+
+    def _handle_floating_list_key(self, key: str) -> None:
+        popup = self._floating_list
+        if popup is None:
+            self.mode = MODE_NORMAL
+            return
+
+        if key == "ESC":
+            self._floating_list = None
+            self.mode = MODE_NORMAL
+            return
+
+        if key in {"UP", "CTRL_LEFT"}:
+            popup.move_up()
+            return
+
+        if key in {"DOWN", "CTRL_RIGHT"}:
+            _, height = self._terminal_size()
+            popup.move_down(max(1, height - 3))
+            return
+
+        if key == "ENTER":
+            selected = popup.selected_item()
+            if selected is not None:
+                self._set_message(selected)
+            self._floating_list = None
+            self.mode = self._floating_accept_mode
 
     def _handle_visual_key(self, key: str) -> None:
         if key in {"ESC"}:
@@ -1943,6 +2170,10 @@ class PviEditor:
 
         if self.mode == MODE_KEY_HINTS:
             self._handle_key_hints_key(key)
+            return
+
+        if self.mode == MODE_FLOAT_LIST:
+            self._handle_floating_list_key(key)
             return
 
         if key == "CTRL_S":
