@@ -57,7 +57,11 @@
     },
     "scripting": {
       "enabled": false,
-      "step_limit": 100000
+      "step_limit": 1000000
+    },
+    "piece_table": {
+      "enabled": true,
+      "large_file_line_threshold": 50000
     },
     "plugins": {
       "enabled": false,

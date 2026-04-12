@@ -18,6 +18,7 @@
     "profile_top_n": 25
   },
   "features": {
+    "piece_table": { "enabled": true, "large_file_line_threshold": 50000 },
     "tabline": { "enabled": false },
     "winbar": { "enabled": false },
     "file_tree": { "enabled": false },
@@ -29,6 +30,8 @@
   }
 }
 ```
+
+> `features.scripting.step_limit` 默认提升到 `1000000`，解释器单次执行超过上限会直接抛错并弹窗，不会带崩主程序。
 
 ## 快捷键绑定配置
 
@@ -43,3 +46,11 @@
 
 - `:reload-config` 重新加载配置
 - `:feature <name> <on|off>` 动态开关单个特性
+- `:piece` 查看 PieceTable 当前状态
+- `:termcaps` 查看终端能力探测结果
+
+## 终端能力降级
+
+- PVIM 启动时会探测终端色彩和 Unicode 支持能力。
+- 不支持 True Color 时自动降级到 256/16 色。
+- 不支持 Unicode 时浮窗边框和树形线条自动降级为 ASCII。

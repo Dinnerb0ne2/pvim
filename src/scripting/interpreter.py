@@ -117,7 +117,7 @@ class ScriptFunction(ScriptCallable):
 class ScriptInterpreter:
     __slots__ = ("step_limit", "_steps", "_builtin_env")
 
-    def __init__(self, *, step_limit: int = 100_000) -> None:
+    def __init__(self, *, step_limit: int = 1_000_000) -> None:
         self.step_limit = max(1000, int(step_limit))
         self._steps = 0
         self._builtin_env = Environment()

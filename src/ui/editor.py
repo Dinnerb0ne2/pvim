@@ -17,6 +17,7 @@ from ..core.buffer import Buffer
 from ..core.config import AppConfig
 from ..core.console import CSI, ConsoleController, KeyReader
 from ..core.process_pipe import AsyncProcessManager
+from ..core.terminal_capabilities import detect_terminal_capabilities
 from ..core.theme import RESET, Theme, load_theme
 from ..features.file_index import FileIndex
 from ..features.formatter import normalize_code_style, organize_python_imports
@@ -109,15 +110,21 @@ class PvimEditor:
         self._current_tab_index = 0
         self._git_control_task_active = False
         self._git_control_last_refresh = 0.0
+        self._git_control_requested_version = 0
+        self._git_control_running_version = 0
         self._file_tree_task_active = False
+        self._file_tree_requested_version = 0
+        self._file_tree_running_version = 0
 
         self.show_line_numbers = True
         self.tab_size = 4
         self.show_sidebar = False
         self.sidebar_width = 30
         self._lazy_load_enabled = True
+        self._terminal_capabilities = detect_terminal_capabilities()
+        self._unicode_ui = self._terminal_capabilities.unicode_ui
 
-        self.theme: Theme = load_theme(None)
+        self.theme: Theme = load_theme(None, self._terminal_capabilities)
         self.syntax: SyntaxManager | None = None
         self._syntax_profile = PLAIN_PROFILE
         self.file_index = FileIndex(Path.cwd(), max_files=3000)
@@ -258,7 +265,7 @@ class PvimEditor:
             self._notifications = NotificationCenter()
 
         theme_file = self.config.theme_file() if self.config.theme_enabled() else None
-        self.theme = load_theme(theme_file)
+        self.theme = load_theme(theme_file, self._terminal_capabilities)
         if self._lazy_load_enabled:
             self.syntax = None
             self._syntax_profile = PLAIN_PROFILE
@@ -285,8 +292,13 @@ class PvimEditor:
             if startup_errors:
                 self._show_alert(f"Plugin startup error: {startup_errors[0]}")
         self.buffer.mark_all_dirty()
+        use_piece_table = self.config.piece_table_enabled() and (
+            self.file_path is None or len(self.lines) >= self.config.piece_table_line_threshold()
+        )
+        self.buffer.configure_piece_table(use_piece_table)
         self._auto_pairs = self._load_auto_pairs()
         self._auto_pair_closers = set(self._auto_pairs.values())
+        self._file_tree_feature.unicode_art = self._unicode_ui
 
     def _load_auto_pairs(self) -> dict[str, str]:
         defaults = {
@@ -550,6 +562,8 @@ class PvimEditor:
             "  :virtual clear [line]",
             "  :ast [line] [col] [function,class]",
             "  :profile script <path>",
+            "  :piece",
+            "  :termcaps",
             "  :tree open|refresh|close|toggle",
             "  :feature <name> <on|off>",
         ]
@@ -562,8 +576,8 @@ class PvimEditor:
             ttl = 3.0 if error else 2.0
             self._notifications.push(message, ttl_seconds=ttl)
 
-    def _drain_async_events(self) -> None:
-        for event in self._async_runtime.poll_events(max_items=64):
+    def _drain_async_events(self, *, max_items: int = 64) -> None:
+        for event in self._async_runtime.poll_events(max_items=max_items):
             event_type = event.get("type", "")
             if event_type == "task_done":
                 label = str(event.get("label", "task"))
@@ -571,10 +585,27 @@ class PvimEditor:
                 result = event.get("result")
                 if label == "feature:file-tree":
                     self._file_tree_task_active = False
+                    if not self._file_tree_feature.enabled:
+                        continue
                     if error:
                         self._set_message(f"Explorer refresh failed: {error}", error=True)
-                    elif isinstance(result, list):
-                        paths = [str(item) for item in result]
+                        if self._file_tree_requested_version > self._file_tree_running_version:
+                            self._start_file_tree_task(self._file_tree_requested_version)
+                    else:
+                        version = -1
+                        paths: list[str] = []
+                        if isinstance(result, tuple) and len(result) == 2:
+                            version = int(result[0])
+                            payload = result[1]
+                            if isinstance(payload, list):
+                                paths = [str(item) for item in payload]
+                        elif isinstance(result, list):
+                            paths = [str(item) for item in result]
+                            version = self._file_tree_running_version
+                        if version != self._file_tree_requested_version:
+                            if self._file_tree_requested_version > version:
+                                self._start_file_tree_task(self._file_tree_requested_version)
+                            continue
                         self._file_tree_feature.apply_paths(paths)
                         if self.mode == MODE_EXPLORER:
                             self._sync_file_tree_popup()
@@ -582,10 +613,35 @@ class PvimEditor:
 
                 if label == "feature:git-control":
                     self._git_control_task_active = False
+                    if not self._git_control_feature.enabled:
+                        continue
                     if error:
                         self._set_message(f"Git refresh failed: {error}", error=True)
-                    elif isinstance(result, GitSnapshot):
-                        self._git_control_feature.apply(result)
+                        if self._git_control_requested_version > self._git_control_running_version:
+                            self._start_git_control_task(self._git_control_requested_version)
+                    else:
+                        version = -1
+                        target_path = self.file_path
+                        snapshot: GitSnapshot | None = None
+                        if isinstance(result, tuple) and len(result) == 3:
+                            version = int(result[0])
+                            target_raw = result[1]
+                            target_path = Path(target_raw) if isinstance(target_raw, str) and target_raw else None
+                            payload = result[2]
+                            if isinstance(payload, GitSnapshot):
+                                snapshot = payload
+                        elif isinstance(result, GitSnapshot):
+                            snapshot = result
+                            version = self._git_control_running_version
+                        stale = version != self._git_control_requested_version or target_path != self.file_path
+                        if stale:
+                            if self._git_control_requested_version > version:
+                                self._start_git_control_task(self._git_control_requested_version)
+                            continue
+                        if snapshot is not None:
+                            self._git_control_feature.apply(snapshot)
+                        if self._git_control_requested_version > version:
+                            self._start_git_control_task(self._git_control_requested_version)
                     continue
 
                 if error:
@@ -626,24 +682,48 @@ class PvimEditor:
             self._syntax_profile = self.syntax.profile_for_file(self.file_path)
         return self.syntax
 
-    def _schedule_file_tree_refresh(self) -> None:
-        if not self._file_tree_feature.enabled or self._file_tree_task_active:
-            return
+    def _start_file_tree_task(self, version: int) -> None:
         self._file_tree_task_active = True
-        self._async_runtime.submit("feature:file-tree", self._file_tree_feature.collect_paths(Path.cwd()))
+        self._file_tree_running_version = version
+
+        async def _collect() -> tuple[int, list[str]]:
+            paths = await self._file_tree_feature.collect_paths(Path.cwd())
+            return version, paths
+
+        self._async_runtime.submit("feature:file-tree", _collect())
+
+    def _schedule_file_tree_refresh(self) -> None:
+        if not self._file_tree_feature.enabled:
+            return
+        self._file_tree_requested_version += 1
+        if self._file_tree_task_active:
+            return
+        self._start_file_tree_task(self._file_tree_requested_version)
+
+    def _start_git_control_task(self, version: int) -> None:
+        target = self.file_path
+        self._git_control_task_active = True
+        self._git_control_running_version = version
+
+        async def _collect() -> tuple[int, str, GitSnapshot]:
+            snapshot = await self._git_control_feature.collect(Path.cwd(), target)
+            target_str = str(target) if target is not None else ""
+            return version, target_str, snapshot
+
+        self._async_runtime.submit("feature:git-control", _collect())
 
     def _schedule_git_control_refresh(self, *, force: bool = False) -> None:
         if not self._git_control_feature.enabled or self.file_path is None:
             return
         now = time.monotonic()
-        if self._git_control_task_active:
-            return
         refresh_interval = max(0.3, self.config.git_refresh_seconds())
         if not force and now - self._git_control_last_refresh < refresh_interval:
             return
         self._git_control_last_refresh = now
-        self._git_control_task_active = True
-        self._async_runtime.submit("feature:git-control", self._git_control_feature.collect(Path.cwd(), self.file_path))
+        self._git_control_requested_version += 1
+        if self._git_control_task_active:
+            return
+        self._start_git_control_task(self._git_control_requested_version)
 
     def _ensure_plugins_loaded(self) -> None:
         if not self.config.feature_enabled("plugins"):
@@ -1500,6 +1580,10 @@ class PvimEditor:
         self.lines = text.split("\n")
         if not self.lines:
             self.lines = [""]
+        use_piece_table = self.config.piece_table_enabled() and len(self.lines) >= self.config.piece_table_line_threshold()
+        self.buffer.configure_piece_table(use_piece_table)
+        if use_piece_table:
+            self._set_message(f"Opened {path} (piece-table mode)")
 
         self.cx = 0
         self.cy = 0
@@ -1528,7 +1612,7 @@ class PvimEditor:
 
         try:
             self.file_path.parent.mkdir(parents=True, exist_ok=True)
-            self.file_path.write_text("\n".join(self.lines), encoding="utf-8")
+            self.file_path.write_text(self.buffer.text(), encoding="utf-8")
         except OSError as exc:
             self._set_message(f"Write failed: {exc}", error=True)
             return False
@@ -1559,6 +1643,11 @@ class PvimEditor:
             return self.theme.ui_style("mode_command")
         return self.theme.ui_style("mode_normal")
 
+    def _box_chars(self) -> tuple[str, str, str, str, str, str]:
+        if self._unicode_ui:
+            return "╭", "╮", "╰", "╯", "│", "─"
+        return "+", "+", "+", "+", "|", "-"
+
     def _render_popup_list_row(
         self,
         screen_row: int,
@@ -1576,6 +1665,7 @@ class PvimEditor:
         if popup is None:
             return f"{base_style}{' ' * text_cols}{RESET}"
 
+        top_left, top_right, bottom_left, bottom_right, vertical, horizontal = self._box_chars()
         longest_item = max((len(item) for item in popup.items), default=20)
         content_width = max(len(title) + 2, len(footer) + 2, longest_item + 2)
         popup_width = clamp(content_width + 2, 24, max(24, text_cols - 2))
@@ -1593,24 +1683,24 @@ class PvimEditor:
         if row == 0:
             heading = f" {title} "
             heading = heading[:content_width]
-            top_line = "╭" + heading.center(content_width, "─") + "╮"
+            top_line = top_left + heading.center(content_width, horizontal) + top_right
             return f"{border_style}{(' ' * left) + top_line + (' ' * right_pad)}{RESET}"
 
         if row == popup_height - 1:
-            bottom_line = "╰" + ("─" * content_width) + "╯"
+            bottom_line = bottom_left + (horizontal * content_width) + bottom_right
             return f"{border_style}{(' ' * left) + bottom_line + (' ' * right_pad)}{RESET}"
 
         if row == popup_height - 2 and footer:
-            footer_line = "│" + footer[:content_width].ljust(content_width) + "│"
+            footer_line = vertical + footer[:content_width].ljust(content_width) + vertical
             return f"{border_style}{(' ' * left) + footer_line + (' ' * right_pad)}{RESET}"
 
         index = popup.scroll + row - 1
         if 0 <= index < len(popup.items):
             text = popup.items[index][:content_width].ljust(content_width)
-            middle_line = "│" + text + "│"
+            middle_line = vertical + text + vertical
             style = selected_style if index == popup.selected else base_style
             return f"{style}{(' ' * left) + middle_line + (' ' * right_pad)}{RESET}"
-        middle_line = "│" + (" " * content_width) + "│"
+        middle_line = vertical + (" " * content_width) + vertical
         return f"{base_style}{(' ' * left) + middle_line + (' ' * right_pad)}{RESET}"
 
     def _render_fuzzy_row(self, screen_row: int, text_rows: int, text_cols: int) -> str:
@@ -1911,7 +2001,13 @@ class PvimEditor:
             else (self.git.branch_label(self.file_path) if self.config.feature_enabled("git_status") else "-"),
         )
         if plan.tabline_height:
-            tabline = self._layout_manager.render_tabline(layout_context, self._tab_items or [file_name], self._current_tab_index)
+            separator = " │ " if self._unicode_ui else " | "
+            tabline = self._layout_manager.render_tabline(
+                layout_context,
+                self._tab_items or [file_name],
+                self._current_tab_index,
+                separator=separator,
+            )
             frame.append(f"{self.theme.ui_style('command_line')}{tabline}{RESET}")
         if plan.winbar_height:
             breadcrumb = self._build_winbar_breadcrumb()
@@ -1976,17 +2072,18 @@ class PvimEditor:
             return
         visible = items[-2:]
         title = " Notifications "
+        top_left, top_right, bottom_left, bottom_right, vertical, horizontal = self._box_chars()
         content_width = max(len(title), *(len(item) for item in visible))
         box_width = clamp(content_width + 2, 20, max(20, width))
         if box_width >= width:
             box_width = width
         left = max(0, width - box_width)
 
-        top = "╭" + title.center(max(0, box_width - 2), "─") + "╮"
-        bottom = "╰" + ("─" * max(0, box_width - 2)) + "╯"
+        top = top_left + title.center(max(0, box_width - 2), horizontal) + top_right
+        bottom = bottom_left + (horizontal * max(0, box_width - 2)) + bottom_right
         rows = [top]
         for item in visible:
-            rows.append("│" + item[: max(0, box_width - 2)].ljust(max(0, box_width - 2)) + "│")
+            rows.append(vertical + item[: max(0, box_width - 2)].ljust(max(0, box_width - 2)) + vertical)
         rows.append(bottom)
 
         start = max(0, len(frame) - len(rows) - 1)
@@ -2129,7 +2226,7 @@ class PvimEditor:
 
         if cmd in {"help", "h"}:
             self._set_message(
-                "Commands: :w :q :e :find :replace :rename :format :fuzzy :tree :feature :keys :script :plugin :proc :virtual :ast :profile"
+                "Commands: :w :q :e :find :replace :rename :format :fuzzy :tree :feature :keys :script :plugin :proc :virtual :ast :profile :piece :termcaps"
             )
             return
 
@@ -2292,6 +2389,20 @@ class PvimEditor:
             self._set_message(f"AST {result}")
             return
 
+        if cmd == "piece":
+            stats = self.buffer.piece_table_stats()
+            self._set_message(
+                f"PieceTable enabled={stats['enabled']} lines={stats['line_count']} len={stats['length']} dirty={stats['dirty']}"
+            )
+            return
+
+        if cmd == "termcaps":
+            caps = self._terminal_capabilities
+            self._set_message(
+                f"Terminal truecolor={caps.true_color} colors={caps.color_level} unicode={caps.unicode_ui}"
+            )
+            return
+
         if cmd in {"sidebar"}:
             if not args:
                 self._set_message("Usage: :sidebar on|off|toggle", error=True)
@@ -2346,7 +2457,9 @@ class PvimEditor:
                 return
             if name == "file_tree":
                 self._file_tree_feature.enabled = enabled
-                if not enabled:
+                if enabled:
+                    self._schedule_file_tree_refresh()
+                else:
                     self._close_explorer()
             elif name == "tab_completion":
                 self._completion_feature.enabled = enabled
@@ -2951,16 +3064,21 @@ class PvimEditor:
         self._console.enter()
         try:
             while self.running:
+                if KeyReader.has_key():
+                    key = self._read_key()
+                    self.handle_key(key)
+                    self.render()
+                    self._drain_async_events(max_items=8)
+                    self._schedule_git_control_refresh()
+                    if self.mode == MODE_EXPLORER and not self._file_tree_feature.entries:
+                        self._schedule_file_tree_refresh()
+                    self._last_tick = time.monotonic()
+                    continue
                 self._drain_async_events()
                 self._schedule_git_control_refresh()
                 if self.mode == MODE_EXPLORER and not self._file_tree_feature.entries:
                     self._schedule_file_tree_refresh()
                 self.render()
-                if KeyReader.has_key():
-                    key = self._read_key()
-                    self.handle_key(key)
-                    self._last_tick = time.monotonic()
-                    continue
                 time.sleep(0.01)
         finally:
             self._async_runtime.close()

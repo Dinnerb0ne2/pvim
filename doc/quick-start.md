@@ -25,6 +25,8 @@ python pvim.py your_file.py --config pvim.config.json
 - `:format`
 - `:tree open|refresh|close|toggle`
 - `:feature <name> <on|off>`
+- `:piece`
+- `:termcaps`
 - `:proc start|read|write|stop|status ...`
 - `:script run <file>`
 - `:profile script <file>`

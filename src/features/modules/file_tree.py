@@ -13,7 +13,7 @@ class TreeEntry:
 
 
 class FileTreeFeature:
-    __slots__ = ("enabled", "visible", "entries", "selected", "scroll", "title")
+    __slots__ = ("enabled", "visible", "entries", "selected", "scroll", "title", "unicode_art")
 
     def __init__(self, *, enabled: bool = False) -> None:
         self.enabled = enabled
@@ -22,6 +22,7 @@ class FileTreeFeature:
         self.selected = 0
         self.scroll = 0
         self.title = "EXPLORER"
+        self.unicode_art = True
 
     async def collect_paths(self, root: Path) -> list[str]:
         if not self.enabled:
@@ -117,10 +118,16 @@ class FileTreeFeature:
         keys = sorted(node.keys(), key=lambda item: item.lower())
         for index, key in enumerate(keys):
             is_last = index == len(keys) - 1
-            branch = "└── " if is_last else "├── "
+            if self.unicode_art:
+                branch = "└── " if is_last else "├── "
+            else:
+                branch = "`-- " if is_last else "|-- "
             prefix = ""
             if depth > 0:
-                prefix = "".join("    " if done else "│   " for done in prefix_stack)
+                if self.unicode_art:
+                    prefix = "".join("    " if done else "│   " for done in prefix_stack)
+                else:
+                    prefix = "".join("    " if done else "|   " for done in prefix_stack)
             payload = node[key]
             if isinstance(payload, dict):
                 display = f"{prefix}{branch}{key}/"

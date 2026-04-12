@@ -64,7 +64,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
         "scripting": {
             "enabled": False,
-            "step_limit": 100000,
+            "step_limit": 1000000,
+        },
+        "piece_table": {
+            "enabled": True,
+            "large_file_line_threshold": 50000,
         },
         "plugins": {
             "enabled": False,
@@ -269,8 +273,18 @@ class AppConfig:
 
     def script_step_limit(self) -> int:
         return _as_int(
-            self._lookup("features", "scripting", "step_limit", default=100000),
-            default=100000,
+            self._lookup("features", "scripting", "step_limit", default=1000000),
+            default=1000000,
+            minimum=1000,
+        )
+
+    def piece_table_enabled(self) -> bool:
+        return _as_bool(self._lookup("features", "piece_table", "enabled", default=True), default=True)
+
+    def piece_table_line_threshold(self) -> int:
+        return _as_int(
+            self._lookup("features", "piece_table", "large_file_line_threshold", default=50000),
+            default=50000,
             minimum=1000,
         )
 

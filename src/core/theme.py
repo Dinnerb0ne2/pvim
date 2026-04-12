@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from .terminal_capabilities import TerminalCapabilities
+
 CSI = "\x1b["
 RESET = f"{CSI}0m"
 
@@ -63,7 +65,48 @@ def _hex_to_rgb(color: str) -> tuple[int, int, int]:
     return (int(clean[0:2], 16), int(clean[2:4], 16), int(clean[4:6], 16))
 
 
-def _style_from_spec(spec: Mapping[str, Any]) -> str:
+def _rgb_to_ansi_256(r: int, g: int, b: int) -> int:
+    if r == g == b:
+        if r < 8:
+            return 16
+        if r > 248:
+            return 231
+        return 232 + int((r - 8) / 247 * 24)
+    return 16 + (36 * round(r / 255 * 5)) + (6 * round(g / 255 * 5)) + round(b / 255 * 5)
+
+
+ANSI16_RGB: tuple[tuple[int, int, int, int, int], ...] = (
+    (0, 0, 0, 30, 40),
+    (205, 49, 49, 31, 41),
+    (13, 188, 121, 32, 42),
+    (229, 229, 16, 33, 43),
+    (36, 114, 200, 34, 44),
+    (188, 63, 188, 35, 45),
+    (17, 168, 205, 36, 46),
+    (229, 229, 229, 37, 47),
+    (102, 102, 102, 90, 100),
+    (241, 76, 76, 91, 101),
+    (35, 209, 139, 92, 102),
+    (245, 245, 67, 93, 103),
+    (59, 142, 234, 94, 104),
+    (214, 112, 214, 95, 105),
+    (41, 184, 219, 96, 106),
+    (255, 255, 255, 97, 107),
+)
+
+
+def _rgb_to_ansi_16(r: int, g: int, b: int, *, background: bool) -> int:
+    best_code = 30 if not background else 40
+    best_distance: float | None = None
+    for pr, pg, pb, fg_code, bg_code in ANSI16_RGB:
+        distance = float((r - pr) ** 2 + (g - pg) ** 2 + (b - pb) ** 2)
+        if best_distance is None or distance < best_distance:
+            best_distance = distance
+            best_code = bg_code if background else fg_code
+    return best_code
+
+
+def _style_from_spec(spec: Mapping[str, Any], capabilities: TerminalCapabilities) -> str:
     parts: list[str] = []
     if bool(spec.get("bold")):
         parts.append(f"{CSI}1m")
@@ -73,12 +116,22 @@ def _style_from_spec(spec: Mapping[str, Any]) -> str:
     fg = spec.get("fg")
     if isinstance(fg, str):
         r, g, b = _hex_to_rgb(fg)
-        parts.append(f"{CSI}38;2;{r};{g};{b}m")
+        if capabilities.true_color:
+            parts.append(f"{CSI}38;2;{r};{g};{b}m")
+        elif capabilities.color_level >= 256:
+            parts.append(f"{CSI}38;5;{_rgb_to_ansi_256(r, g, b)}m")
+        else:
+            parts.append(f"{CSI}{_rgb_to_ansi_16(r, g, b, background=False)}m")
 
     bg = spec.get("bg")
     if isinstance(bg, str):
         r, g, b = _hex_to_rgb(bg)
-        parts.append(f"{CSI}48;2;{r};{g};{b}m")
+        if capabilities.true_color:
+            parts.append(f"{CSI}48;2;{r};{g};{b}m")
+        elif capabilities.color_level >= 256:
+            parts.append(f"{CSI}48;5;{_rgb_to_ansi_256(r, g, b)}m")
+        else:
+            parts.append(f"{CSI}{_rgb_to_ansi_16(r, g, b, background=True)}m")
 
     return "".join(parts)
 
@@ -87,6 +140,7 @@ def _style_from_spec(spec: Mapping[str, Any]) -> str:
 class Theme:
     ui: dict[str, str]
     syntax: dict[str, str]
+    capabilities: TerminalCapabilities
 
     def ui_style(self, key: str) -> str:
         return self.ui.get(key, "")
@@ -95,7 +149,8 @@ class Theme:
         return self.syntax.get(key, "")
 
 
-def load_theme(path: Path | None) -> Theme:
+def load_theme(path: Path | None, capabilities: TerminalCapabilities | None = None) -> Theme:
+    caps = capabilities or TerminalCapabilities(true_color=True, color_level=24, unicode_ui=True)
     merged = _deep_copy(DEFAULT_THEME_SPEC)
     if path is not None and path.exists():
         loaded = json.loads(path.read_text(encoding="utf-8"))
@@ -111,13 +166,13 @@ def load_theme(path: Path | None) -> Theme:
         syntax_spec = {}
 
     ui = {
-        key: _style_from_spec(spec)
+        key: _style_from_spec(spec, caps)
         for key, spec in ui_spec.items()
         if isinstance(spec, Mapping)
     }
     syntax = {
-        key: _style_from_spec(spec)
+        key: _style_from_spec(spec, caps)
         for key, spec in syntax_spec.items()
         if isinstance(spec, Mapping)
     }
-    return Theme(ui=ui, syntax=syntax)
+    return Theme(ui=ui, syntax=syntax, capabilities=caps)

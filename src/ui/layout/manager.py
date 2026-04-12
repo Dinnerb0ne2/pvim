@@ -68,7 +68,7 @@ class LayoutManager:
             editor_height=editor_height,
         )
 
-    def render_tabline(self, context: LayoutContext, tabs: list[str], current_index: int) -> str:
+    def render_tabline(self, context: LayoutContext, tabs: list[str], current_index: int, *, separator: str = " │ ") -> str:
         if not tabs:
             line = " [No Buffers] "
             return line[: context.width].ljust(context.width)
@@ -76,7 +76,7 @@ class LayoutManager:
         for index, item in enumerate(tabs):
             label = f"[{item}]" if index == current_index else item
             parts.append(label)
-        text = " │ ".join(parts)
+        text = separator.join(parts)
         return text[: context.width].ljust(context.width)
 
     def render_winbar(self, context: LayoutContext, breadcrumb: str) -> str:
