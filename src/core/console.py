@@ -50,6 +50,7 @@ CONTROL_KEYS = {
     "\x04": "CTRL_D",
     "\x12": "CTRL_R",
     "\x15": "CTRL_U",
+    "\x0e": "CTRL_N",
     "\x10": "CTRL_P",
     "\x1f": "CTRL_SLASH",
 }

@@ -12,7 +12,10 @@ src/
   features/
     syntax.py
     ast_query.py
-    ...
+    modules/
+      file_tree.py
+      tab_completion.py
+      git_control.py
   scripting/
     lexer.py
     parser.py
@@ -23,12 +26,17 @@ src/
   ui/
     editor.py
     floating_list.py
+    layout/
+      component.py
+      feature_registry.py
+      manager.py
 ```
 
 ## 核心链路
 
-1. UI 主循环非阻塞轮询按键 + 渲染
-2. 后台 asyncio 事件循环调度异步任务与进程 IO
-3. Buffer 保存真实文本 + 虚拟文本叠加层
-4. 脚本通过 Facade API 驱动编辑器能力
-5. AST 查询优先 tree-sitter，缺失时回退 Python AST（`.py`）
+1. `editor.py` 维护主循环，按键读取与渲染始终非阻塞。
+2. `AsyncRuntime` 在后台线程运行 `asyncio` 循环，承载文件树/ Git 刷新和外部进程任务。
+3. `LayoutManager + FeatureRegistry` 负责 Tabline / Winbar / Statusline 的空间分配与动态开关。
+4. 文件树、补全、Git 控制通过 `features` 模块接入，禁用后自动退化到最简界面。
+5. Buffer 提供真实文本与虚拟文本叠加层（如 Git 行标记）。
+6. 脚本系统独立执行环境，错误只弹窗，不影响主程序。

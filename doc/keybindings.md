@@ -4,7 +4,7 @@
 
 - `Ctrl+S` 保存
 - `Ctrl+Q` / `Ctrl+C` 退出
-- `F1` 快捷键提示面板
+- `F1` 快捷键提示面板（启用 `key_hints` 时）
 
 ## 编辑
 
@@ -13,6 +13,8 @@
 - `Ctrl+U` 清空多光标
 - `Ctrl+Left` / `Ctrl+Right` 按单词移动
 - `Tab` / `Shift+Tab` 缩进/反缩进
+- `Tab`（插入模式）可触发补全菜单（启用 `tab_completion` 时）
+- `Ctrl+N` 手动触发补全菜单（启用 `tab_completion` 时）
 
 ## 导航与工具
 
@@ -20,10 +22,11 @@
 - `Ctrl+F` 快速查找
 - `Ctrl+G` 快速替换
 - `Ctrl+R` 重命名入口
-- `F4` 侧边栏开关
+- `F3` 文件树开关（启用 `file_tree` 时）
+- `F4` 侧边栏开关（启用 `sidebar` 时）
 - `F8` 风格归一化
 
-## 浮动列表交互（统一组件）
+## 浮动窗口交互
 
 - `Up/Down` 移动选项
 - `Enter` 选择当前项

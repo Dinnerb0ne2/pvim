@@ -1,0 +1,37 @@
+{
+  "name": "pvimscript",
+  "line_comment": "#",
+  "keywords": [
+    "let",
+    "fn",
+    "if",
+    "else",
+    "while",
+    "return",
+    "break",
+    "continue",
+    "true",
+    "false",
+    "null",
+    "and",
+    "or"
+  ],
+  "builtins": [
+    "api",
+    "len",
+    "push",
+    "pop",
+    "slice",
+    "sort",
+    "split",
+    "join",
+    "str",
+    "int",
+    "float",
+    "print"
+  ],
+  "string_delimiters": [
+    "\"",
+    "'"
+  ]
+}

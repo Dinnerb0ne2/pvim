@@ -26,7 +26,7 @@
       "config_file": "autopairs.json"
     },
     "sidebar": {
-      "enabled": true,
+      "enabled": false,
       "width": 30,
       "max_files": 3000
     },
@@ -40,40 +40,63 @@
         "word_right": "CTRL_RIGHT",
         "quick_find": "CTRL_F",
         "quick_replace": "CTRL_G",
+        "open_completion": "CTRL_N",
         "fuzzy_finder": "CTRL_P",
+        "toggle_file_tree": "F3",
         "toggle_sidebar": "F4",
         "format_code": "F8",
         "refactor_rename": "CTRL_R"
       }
     },
     "key_hints": {
-      "enabled": true,
+      "enabled": false,
       "trigger": "F1"
     },
     "fuzzy_finder": {
-      "enabled": true
+      "enabled": false
     },
     "scripting": {
-      "enabled": true,
+      "enabled": false,
       "step_limit": 100000
     },
     "plugins": {
-      "enabled": true,
+      "enabled": false,
       "directory": "plugins",
       "auto_load": true
     },
+    "plugin_keyhooks": {
+      "enabled": false
+    },
+    "tabline": {
+      "enabled": false
+    },
+    "winbar": {
+      "enabled": false
+    },
+    "file_tree": {
+      "enabled": false
+    },
+    "tab_completion": {
+      "enabled": false
+    },
+    "git_control": {
+      "enabled": false
+    },
+    "notifications": {
+      "enabled": false
+    },
     "git_status": {
-      "enabled": true,
+      "enabled": false,
       "refresh_seconds": 2.0
     },
     "refactor_tools": {
-      "enabled": true
+      "enabled": false
     },
     "find_replace": {
       "enabled": true
     },
     "code_style_normalizer": {
-      "enabled": true
+      "enabled": false
     }
   }
 }

@@ -11,6 +11,7 @@ import shlex
 import sys
 import time
 
+from .. import APP_NAME, APP_VERSION
 from ..core.async_runtime import AsyncRuntime
 from ..core.buffer import Buffer
 from ..core.config import AppConfig
@@ -22,11 +23,14 @@ from ..features.formatter import normalize_code_style, organize_python_imports
 from ..features.fuzzy import fuzzy_filter
 from ..features.git_status import GitStatusProvider
 from ..features.ast_query import AstQueryService
+from ..features.modules import FileTreeFeature, GitControlFeature, TabCompletionFeature
+from ..features.modules.git_control import GitSnapshot
 from ..features.refactor import find_next, rename_symbol, replace_all, replace_next, word_at_cursor
 from ..features.syntax import PLAIN_PROFILE, SyntaxManager
 from ..plugins import PluginManager
 from ..scripting import ScriptError
 from .floating_list import FloatingList
+from .layout import FeatureDescriptor, FeatureRegistry, LayoutContext, LayoutManager, NotificationCenter
 
 MODE_NORMAL = "NORMAL"
 MODE_INSERT = "INSERT"
@@ -34,6 +38,8 @@ MODE_COMMAND = "COMMAND"
 MODE_VISUAL = "VISUAL"
 MODE_FUZZY = "FUZZY"
 MODE_FLOAT_LIST = "FLOAT_LIST"
+MODE_EXPLORER = "EXPLORER"
+MODE_COMPLETION = "COMPLETION"
 MODE_KEY_HINTS = "KEY_HINTS"
 MODE_ALERT = "ALERT"
 
@@ -69,6 +75,11 @@ class PvimEditor:
         self.fuzzy_index = 0
         self._floating_list: FloatingList | None = None
         self._floating_accept_mode = MODE_NORMAL
+        self._floating_source = "generic"
+        self._completion_prefix = ""
+        self._completion_insert_col = 0
+        self._completion_insert_row = 0
+        self._completion_replace_end = 0
 
         self.key_hints_enabled = True
         self.key_hints_trigger = "F1"
@@ -85,12 +96,20 @@ class PvimEditor:
         self.message_error = False
 
         self._last_frame: list[str] = []
-        self._last_view_state: tuple[int, int, str, int, int] | None = None
+        self._last_view_state: tuple[object, ...] | None = None
         self._last_cursor_line = 0
         self._console = ConsoleController()
         self._async_runtime = AsyncRuntime()
         self._process_manager = AsyncProcessManager(self._async_runtime)
         self._last_tick = time.monotonic()
+        self._feature_registry = FeatureRegistry()
+        self._layout_manager = LayoutManager(self._feature_registry)
+        self._notifications = NotificationCenter()
+        self._tab_items: list[str] = []
+        self._current_tab_index = 0
+        self._git_control_task_active = False
+        self._git_control_last_refresh = 0.0
+        self._file_tree_task_active = False
 
         self.show_line_numbers = True
         self.tab_size = 4
@@ -104,6 +123,9 @@ class PvimEditor:
         self.file_index = FileIndex(Path.cwd(), max_files=3000)
         self.git = GitStatusProvider(Path.cwd(), enabled=False, refresh_seconds=2.0)
         self._ast_query_service: AstQueryService | None = None
+        self._file_tree_feature = FileTreeFeature(enabled=False)
+        self._completion_feature = TabCompletionFeature(enabled=False)
+        self._git_control_feature = GitControlFeature(enabled=False)
         self.plugins = PluginManager(
             plugins_root=Path.cwd() / "plugins",
             enabled=False,
@@ -114,6 +136,7 @@ class PvimEditor:
         self._plugins_loaded = False
         self._auto_pairs: dict[str, str] = {}
         self._auto_pair_closers: set[str] = set()
+        self._register_feature_descriptors()
 
         self._apply_runtime_config()
 
@@ -128,6 +151,86 @@ class PvimEditor:
     def lines(self, value: list[str]) -> None:
         self.buffer.set_lines(value)
 
+    def _register_feature_descriptors(self) -> None:
+        self._feature_registry.register(
+            FeatureDescriptor(
+                name="core",
+                enabled=True,
+                ui_components={"statusline"},
+                trigger="always",
+            )
+        )
+        self._feature_registry.register(
+            FeatureDescriptor(
+                name="tabline",
+                enabled=False,
+                ui_components={"tabline"},
+                trigger="always",
+            )
+        )
+        self._feature_registry.register(
+            FeatureDescriptor(
+                name="winbar",
+                enabled=False,
+                ui_components={"winbar"},
+                trigger="cursor-move",
+            )
+        )
+        self._feature_registry.register(
+            FeatureDescriptor(
+                name="file_tree",
+                enabled=False,
+                ui_components={"float"},
+                trigger="command",
+            )
+        )
+        self._feature_registry.register(
+            FeatureDescriptor(
+                name="tab_completion",
+                enabled=False,
+                ui_components={"float"},
+                trigger="insert-tab",
+            )
+        )
+        self._feature_registry.register(
+            FeatureDescriptor(
+                name="git_control",
+                enabled=False,
+                ui_components={"statusline_segment", "virtual_text"},
+                trigger="async-refresh",
+            )
+        )
+        self._feature_registry.register(
+            FeatureDescriptor(
+                name="notifications",
+                enabled=False,
+                ui_components={"float"},
+                trigger="message",
+            )
+        )
+        self._feature_registry.register_status_segment(
+            "left",
+            "core",
+            self._status_left_segment,
+        )
+        self._feature_registry.register_status_segment(
+            "right",
+            "core",
+            self._status_right_segment,
+        )
+        self._feature_registry.register_status_segment(
+            "center",
+            "git_control",
+            lambda _context: self._git_control_feature.status_segment(),
+        )
+
+    def _status_left_segment(self, _context: LayoutContext) -> str:
+        dirty = " [+]" if self.modified else ""
+        return f"{self.mode} {self.file_path.name if self.file_path else '[No Name]'}{dirty}"
+
+    def _status_right_segment(self, context: LayoutContext) -> str:
+        return f"utf-8 Ln {context.row}, Col {context.col}"
+
     def _apply_runtime_config(self) -> None:
         self.show_line_numbers = self.config.show_line_numbers()
         self.tab_size = self.config.tab_size()
@@ -136,6 +239,23 @@ class PvimEditor:
         self.key_hints_enabled = self.config.key_hints_enabled()
         self.key_hints_trigger = self.config.key_hints_trigger()
         self._lazy_load_enabled = self.config.lazy_load_enabled()
+        self._feature_registry.set_enabled("tabline", self.config.feature_enabled("tabline"))
+        self._feature_registry.set_enabled("winbar", self.config.feature_enabled("winbar"))
+        self._feature_registry.set_enabled("file_tree", self.config.feature_enabled("file_tree"))
+        self._feature_registry.set_enabled("tab_completion", self.config.feature_enabled("tab_completion"))
+        self._feature_registry.set_enabled("git_control", self.config.feature_enabled("git_control"))
+        self._feature_registry.set_enabled("notifications", self.config.feature_enabled("notifications"))
+        self._file_tree_feature.enabled = self.config.feature_enabled("file_tree")
+        self._completion_feature.enabled = self.config.feature_enabled("tab_completion")
+        self._git_control_feature.enabled = self.config.feature_enabled("git_control")
+        self._tab_items = [self.file_path.name] if self.file_path else ["[No Name]"]
+        self._current_tab_index = 0
+        if not self._file_tree_feature.enabled:
+            self._close_explorer()
+        if not self._completion_feature.enabled:
+            self._close_tab_completion()
+        if not self.config.feature_enabled("notifications"):
+            self._notifications = NotificationCenter()
 
         theme_file = self.config.theme_file() if self.config.theme_enabled() else None
         self.theme = load_theme(theme_file)
@@ -403,8 +523,10 @@ class PvimEditor:
             "Tools",
             "  Ctrl+F quick find",
             "  Ctrl+G quick replace",
+            "  Ctrl+N tab completion",
             "  Ctrl+P fuzzy finder",
             "  Ctrl+R rename symbol",
+            "  F3 file tree",
             "  F4 toggle sidebar",
             "  F8 normalize code style",
             "",
@@ -428,12 +550,17 @@ class PvimEditor:
             "  :virtual clear [line]",
             "  :ast [line] [col] [function,class]",
             "  :profile script <path>",
+            "  :tree open|refresh|close|toggle",
+            "  :feature <name> <on|off>",
         ]
         return lines
 
     def _set_message(self, message: str, *, error: bool = False) -> None:
         self.message = message
         self.message_error = error
+        if self.config.feature_enabled("notifications") and message:
+            ttl = 3.0 if error else 2.0
+            self._notifications.push(message, ttl_seconds=ttl)
 
     def _drain_async_events(self) -> None:
         for event in self._async_runtime.poll_events(max_items=64):
@@ -441,6 +568,26 @@ class PvimEditor:
             if event_type == "task_done":
                 label = str(event.get("label", "task"))
                 error = str(event.get("error", "") or "")
+                result = event.get("result")
+                if label == "feature:file-tree":
+                    self._file_tree_task_active = False
+                    if error:
+                        self._set_message(f"Explorer refresh failed: {error}", error=True)
+                    elif isinstance(result, list):
+                        paths = [str(item) for item in result]
+                        self._file_tree_feature.apply_paths(paths)
+                        if self.mode == MODE_EXPLORER:
+                            self._sync_file_tree_popup()
+                    continue
+
+                if label == "feature:git-control":
+                    self._git_control_task_active = False
+                    if error:
+                        self._set_message(f"Git refresh failed: {error}", error=True)
+                    elif isinstance(result, GitSnapshot):
+                        self._git_control_feature.apply(result)
+                    continue
+
                 if error:
                     self._show_alert(f"Async task failed ({label}): {error}")
                 else:
@@ -464,11 +611,39 @@ class PvimEditor:
             self._ast_query_service = AstQueryService()
         return self._ast_query_service
 
+    def _get_ast_query_service(self) -> AstQueryService | None:
+        if self._ast_query_service is None:
+            if self._lazy_load_enabled and not (
+                self.config.feature_enabled("winbar") or self.config.feature_enabled("tab_completion")
+            ):
+                return None
+            self._ast_query_service = AstQueryService()
+        return self._ast_query_service
+
     def _syntax_manager(self) -> SyntaxManager:
         if self.syntax is None:
             self.syntax = SyntaxManager(self.config)
             self._syntax_profile = self.syntax.profile_for_file(self.file_path)
         return self.syntax
+
+    def _schedule_file_tree_refresh(self) -> None:
+        if not self._file_tree_feature.enabled or self._file_tree_task_active:
+            return
+        self._file_tree_task_active = True
+        self._async_runtime.submit("feature:file-tree", self._file_tree_feature.collect_paths(Path.cwd()))
+
+    def _schedule_git_control_refresh(self, *, force: bool = False) -> None:
+        if not self._git_control_feature.enabled or self.file_path is None:
+            return
+        now = time.monotonic()
+        if self._git_control_task_active:
+            return
+        refresh_interval = max(0.3, self.config.git_refresh_seconds())
+        if not force and now - self._git_control_last_refresh < refresh_interval:
+            return
+        self._git_control_last_refresh = now
+        self._git_control_task_active = True
+        self._async_runtime.submit("feature:git-control", self._git_control_feature.collect(Path.cwd(), self.file_path))
 
     def _ensure_plugins_loaded(self) -> None:
         if not self.config.feature_enabled("plugins"):
@@ -526,7 +701,7 @@ class PvimEditor:
     def _active_sidebar_width(self, width: int) -> int:
         if not self.show_sidebar or not self.config.sidebar_enabled():
             return 0
-        if self.mode in {MODE_FUZZY, MODE_FLOAT_LIST, MODE_KEY_HINTS, MODE_ALERT}:
+        if self.mode in {MODE_FUZZY, MODE_FLOAT_LIST, MODE_EXPLORER, MODE_COMPLETION, MODE_KEY_HINTS, MODE_ALERT}:
             return 0
         preferred = self.sidebar_width
         if width - preferred < 20:
@@ -534,7 +709,14 @@ class PvimEditor:
         return preferred
 
     def _gutter_width(self) -> int:
-        if not self.show_line_numbers or self.mode in {MODE_FUZZY, MODE_FLOAT_LIST, MODE_KEY_HINTS, MODE_ALERT}:
+        if not self.show_line_numbers or self.mode in {
+            MODE_FUZZY,
+            MODE_FLOAT_LIST,
+            MODE_EXPLORER,
+            MODE_COMPLETION,
+            MODE_KEY_HINTS,
+            MODE_ALERT,
+        }:
             return 0
         return max(3, len(str(max(1, len(self.lines))))) + 1
 
@@ -868,6 +1050,7 @@ class PvimEditor:
             title="Fuzzy Finder  (Enter=open, Esc=cancel)",
             footer="Type to filter, Up/Down select",
         )
+        self._floating_source = "fuzzy"
         self._update_fuzzy_matches()
 
     def _update_fuzzy_matches(self) -> None:
@@ -892,6 +1075,135 @@ class PvimEditor:
             self.fuzzy_matches = []
             self.fuzzy_index = 0
             self._floating_list = None
+            self._floating_source = ""
+
+    def _sync_file_tree_popup(self) -> None:
+        entries = [entry.display for entry in self._file_tree_feature.entries]
+        if not entries:
+            entries = ["(loading...)" if self._file_tree_task_active else "(empty)"]
+        popup = self._floating_list
+        if popup is None or self._floating_source != "file_tree":
+            popup = FloatingList(
+                title="EXPLORER",
+                footer="<Esc> close  <Enter> open  <Up/Down> move",
+            )
+            self._floating_list = popup
+            self._floating_source = "file_tree"
+        popup.set_items(entries)
+        popup.selected = self._file_tree_feature.selected
+        popup.scroll = self._file_tree_feature.scroll
+
+    def _open_explorer(self, *, refresh: bool = False) -> None:
+        if not self._file_tree_feature.enabled:
+            self._set_message("File tree feature is disabled in config.", error=True)
+            return
+        self._file_tree_feature.open()
+        self.mode = MODE_EXPLORER
+        self._floating_accept_mode = MODE_NORMAL
+        if refresh or not self._file_tree_feature.entries:
+            self._schedule_file_tree_refresh()
+        self._sync_file_tree_popup()
+
+    def _close_explorer(self) -> None:
+        self._file_tree_feature.close()
+        self._floating_list = None
+        self._floating_source = ""
+        if self.mode == MODE_EXPLORER:
+            self.mode = MODE_NORMAL
+
+    def _completion_prefix_range(self) -> tuple[int, int, str]:
+        line = self._line()
+        start = self.cx
+        while start > 0 and _is_word_char(line[start - 1]):
+            start -= 1
+        end = self.cx
+        while end < len(line) and _is_word_char(line[end]):
+            end += 1
+        return start, end, line[start:self.cx]
+
+    def _sync_completion_popup(self) -> None:
+        popup = self._floating_list
+        if popup is None or self._floating_source != "completion":
+            popup = FloatingList(
+                title="COMPLETION",
+                footer="<Tab/Enter> accept  <Esc> close",
+            )
+            self._floating_list = popup
+            self._floating_source = "completion"
+        items = [
+            self._format_completion_item(candidate, indices)
+            for candidate, indices in self._completion_feature.items
+        ]
+        popup.set_items(items)
+        popup.selected = self._completion_feature.selected
+        popup.scroll = self._completion_feature.scroll
+
+    def _format_completion_item(self, candidate: str, indices: list[int]) -> str:
+        if not indices:
+            return candidate
+        highlights = set(indices)
+        out: list[str] = []
+        for index, char in enumerate(candidate):
+            if index in highlights:
+                out.append(char.upper())
+            else:
+                out.append(char)
+        return "".join(out)
+
+    def _open_tab_completion(self) -> bool:
+        if not self._completion_feature.enabled:
+            return False
+        start_col, end_col, prefix = self._completion_prefix_range()
+        if not prefix:
+            return False
+        ast_hint = ""
+        service = self._get_ast_query_service()
+        if service is not None and self.file_path is not None:
+            try:
+                node = service.node_at(self.file_path, self.lines, self.cy + 1, self.cx + 1)
+            except Exception:
+                node = None
+            if node is not None:
+                ast_hint = f"{node.kind} {node.name or ''}"
+        self._completion_feature.open(prefix, self.lines, ast_hint)
+        if not self._completion_feature.visible:
+            return False
+        self._completion_prefix = prefix
+        self._completion_insert_col = start_col
+        self._completion_insert_row = self.cy
+        self._completion_replace_end = end_col
+        self._floating_accept_mode = MODE_INSERT
+        self.mode = MODE_COMPLETION
+        self._sync_completion_popup()
+        return True
+
+    def _close_tab_completion(self) -> None:
+        self._completion_feature.close()
+        self._completion_replace_end = 0
+        self._floating_list = None
+        self._floating_source = ""
+        if self.mode == MODE_COMPLETION:
+            self.mode = MODE_INSERT
+
+    def _accept_tab_completion(self) -> None:
+        value = self._completion_feature.selected_text()
+        if not value:
+            self._close_tab_completion()
+            return
+        row = self._completion_insert_row
+        if not (0 <= row < len(self.lines)):
+            self._close_tab_completion()
+            return
+        line = self.lines[row]
+        start = self._completion_insert_col
+        end = self._completion_replace_end if row == self.cy else start + len(self._completion_prefix)
+        end = clamp(end, start, len(line))
+        self.lines[row] = line[:start] + value + line[end:]
+        self.cy = row
+        self.cx = start + len(value)
+        self.buffer.mark_dirty(row)
+        self._mark_modified()
+        self._close_tab_completion()
 
     def _open_plugin_list_popup(self) -> None:
         self._ensure_plugins_loaded()
@@ -908,6 +1220,7 @@ class PvimEditor:
             footer="Use Up/Down to browse plugin records",
             items=labels,
         )
+        self._floating_source = "plugin_list"
         self._floating_accept_mode = MODE_NORMAL
         self.mode = MODE_FLOAT_LIST
 
@@ -1197,6 +1510,12 @@ class PvimEditor:
         self.visual_anchor = None
         self._clear_multi_cursor()
         self._syntax_profile = self._syntax_manager().profile_for_file(self.file_path)
+        if self.file_path is not None:
+            tab_label = self.file_path.name
+            if tab_label not in self._tab_items:
+                self._tab_items.append(tab_label)
+            self._current_tab_index = self._tab_items.index(tab_label)
+        self._schedule_git_control_refresh(force=True)
         return True
 
     def save_file(self, target: Path | str | None = None) -> bool:
@@ -1215,6 +1534,12 @@ class PvimEditor:
             return False
 
         self.modified = False
+        if self.file_path is not None:
+            tab_label = self.file_path.name
+            if tab_label not in self._tab_items:
+                self._tab_items.append(tab_label)
+            self._current_tab_index = self._tab_items.index(tab_label)
+        self._schedule_git_control_refresh(force=True)
         self._set_message(f"Wrote {self.file_path}")
         return True
 
@@ -1228,37 +1553,71 @@ class PvimEditor:
     def _mode_style(self) -> str:
         if self.mode == MODE_INSERT:
             return self.theme.ui_style("mode_insert")
-        if self.mode in {MODE_COMMAND, MODE_FUZZY, MODE_FLOAT_LIST, MODE_KEY_HINTS, MODE_ALERT}:
+        if self.mode in {MODE_COMMAND, MODE_FUZZY, MODE_FLOAT_LIST, MODE_EXPLORER, MODE_COMPLETION, MODE_KEY_HINTS, MODE_ALERT}:
             return self.theme.ui_style("mode_command")
         if self.mode == MODE_VISUAL:
             return self.theme.ui_style("mode_command")
         return self.theme.ui_style("mode_normal")
 
-    def _render_popup_list_row(self, screen_row: int, text_cols: int, fallback_title: str) -> str:
+    def _render_popup_list_row(
+        self,
+        screen_row: int,
+        text_rows: int,
+        text_cols: int,
+        fallback_title: str,
+    ) -> str:
         base_style = self.theme.ui_style("editor")
         selected_style = self.theme.ui_style("fuzzy_selected")
+        border_style = self.theme.ui_style("command_line")
         popup = self._floating_list
         title = popup.title if popup is not None else fallback_title
-
-        if screen_row == 0:
-            return f"{selected_style}{title[:text_cols].ljust(text_cols)}{RESET}"
+        footer = popup.footer if popup is not None else ""
 
         if popup is None:
             return f"{base_style}{' ' * text_cols}{RESET}"
 
-        index = popup.scroll + screen_row - 1
+        longest_item = max((len(item) for item in popup.items), default=20)
+        content_width = max(len(title) + 2, len(footer) + 2, longest_item + 2)
+        popup_width = clamp(content_width + 2, 24, max(24, text_cols - 2))
+        popup_height = clamp(min(text_rows - 2, len(popup.items) + 4), 6, max(6, text_rows - 1))
+        top = max(0, (text_rows - popup_height) // 2)
+        left = max(0, (text_cols - popup_width) // 2)
+        right_pad = max(0, text_cols - left - popup_width)
+        blank = " " * text_cols
+
+        if screen_row < top or screen_row >= top + popup_height:
+            return f"{base_style}{blank}{RESET}"
+
+        row = screen_row - top
+        content_width = popup_width - 2
+        if row == 0:
+            heading = f" {title} "
+            heading = heading[:content_width]
+            top_line = "╭" + heading.center(content_width, "─") + "╮"
+            return f"{border_style}{(' ' * left) + top_line + (' ' * right_pad)}{RESET}"
+
+        if row == popup_height - 1:
+            bottom_line = "╰" + ("─" * content_width) + "╯"
+            return f"{border_style}{(' ' * left) + bottom_line + (' ' * right_pad)}{RESET}"
+
+        if row == popup_height - 2 and footer:
+            footer_line = "│" + footer[:content_width].ljust(content_width) + "│"
+            return f"{border_style}{(' ' * left) + footer_line + (' ' * right_pad)}{RESET}"
+
+        index = popup.scroll + row - 1
         if 0 <= index < len(popup.items):
-            text = popup.items[index][:text_cols].ljust(text_cols)
+            text = popup.items[index][:content_width].ljust(content_width)
+            middle_line = "│" + text + "│"
             style = selected_style if index == popup.selected else base_style
-            return f"{style}{text}{RESET}"
+            return f"{style}{(' ' * left) + middle_line + (' ' * right_pad)}{RESET}"
+        middle_line = "│" + (" " * content_width) + "│"
+        return f"{base_style}{(' ' * left) + middle_line + (' ' * right_pad)}{RESET}"
 
-        return f"{base_style}{' ' * text_cols}{RESET}"
+    def _render_fuzzy_row(self, screen_row: int, text_rows: int, text_cols: int) -> str:
+        return self._render_popup_list_row(screen_row, text_rows, text_cols, "Fuzzy Finder")
 
-    def _render_fuzzy_row(self, screen_row: int, text_cols: int) -> str:
-        return self._render_popup_list_row(screen_row, text_cols, "Fuzzy Finder")
-
-    def _render_float_list_row(self, screen_row: int, text_cols: int) -> str:
-        return self._render_popup_list_row(screen_row, text_cols, "Select Item")
+    def _render_float_list_row(self, screen_row: int, text_rows: int, text_cols: int) -> str:
+        return self._render_popup_list_row(screen_row, text_rows, text_cols, "Select Item")
 
     def _render_key_hint_row(self, screen_row: int, text_cols: int) -> str:
         base_style = self.theme.ui_style("editor")
@@ -1297,13 +1656,15 @@ class PvimEditor:
         text_cols: int,
     ) -> str:
         if self.mode == MODE_FUZZY:
-            return self._render_fuzzy_row(screen_row, text_cols + gutter)
-        if self.mode == MODE_FLOAT_LIST:
-            return self._render_float_list_row(screen_row, text_cols + gutter)
+            return self._render_fuzzy_row(screen_row, text_rows, text_cols + gutter)
+        if self.mode in {MODE_FLOAT_LIST, MODE_EXPLORER, MODE_COMPLETION}:
+            return self._render_float_list_row(screen_row, text_rows, text_cols + gutter)
         if self.mode == MODE_KEY_HINTS:
             return self._render_key_hint_row(screen_row, text_cols + gutter)
         if self.mode == MODE_ALERT:
             return self._render_alert_row(screen_row, text_cols + gutter)
+        if self._should_render_dashboard():
+            return self._render_dashboard_row(screen_row, text_rows, gutter, text_cols)
 
         line_index = self.row_offset + screen_row
         if line_index < len(self.lines):
@@ -1312,7 +1673,7 @@ class PvimEditor:
             ghost_chunks = self.buffer.get_virtual_text(line_index)
             ghost_visible = ""
             if ghost_chunks:
-                ghost_raw = "  ⟪" + " | ".join(ghost_chunks) + "⟫"
+                ghost_raw = "  <<" + " | ".join(ghost_chunks) + ">>"
                 room = max(0, text_cols - len(visible_code))
                 ghost_visible = ghost_raw[:room]
             padding = " " * max(0, text_cols - len(visible_code) - len(ghost_visible))
@@ -1321,6 +1682,8 @@ class PvimEditor:
                 MODE_COMMAND,
                 MODE_FUZZY,
                 MODE_FLOAT_LIST,
+                MODE_EXPLORER,
+                MODE_COMPLETION,
                 MODE_KEY_HINTS,
                 MODE_ALERT,
             }
@@ -1343,7 +1706,12 @@ class PvimEditor:
             else:
                 colored = colored_code
             if gutter > 0:
-                number = f"{line_index + 1:>{gutter - 1}} "
+                marker = " "
+                if self._git_control_feature.enabled:
+                    marker = self._git_control_feature.line_markers.get(line_index + 1, " ")
+                    marker = marker if marker.strip() else " "
+                number_width = max(1, gutter - 2)
+                number = f"{line_index + 1:>{number_width}}{marker} "
                 number_style = (
                     self.theme.ui_style("line_number_current")
                     if is_current
@@ -1361,6 +1729,37 @@ class PvimEditor:
                 f"{self.theme.ui_style('tilde')}{text}{RESET}"
             )
         return f"{self.theme.ui_style('tilde')}{text}{RESET}"
+
+    def _should_render_dashboard(self) -> bool:
+        if self.file_path is not None:
+            return False
+        if self.modified or self.lines != [""]:
+            return False
+        return self.mode == MODE_NORMAL
+
+    def _render_dashboard_row(self, screen_row: int, text_rows: int, gutter: int, text_cols: int) -> str:
+        base_style = self.theme.ui_style("editor")
+        accent_style = self.theme.ui_style("fuzzy_selected")
+        hints = [
+            APP_NAME,
+            f"v{APP_VERSION}",
+            "",
+            "i        insert mode",
+            ":e FILE  open file",
+            ":help    command help",
+            "F1       key hints",
+        ]
+        start = max(0, (text_rows - len(hints)) // 2)
+        line = " " * text_cols
+        style = base_style
+        if start <= screen_row < start + len(hints):
+            message = hints[screen_row - start][:text_cols]
+            line = message.center(text_cols)
+            if screen_row - start in {0, 1}:
+                style = accent_style
+        if gutter > 0:
+            return f"{self.theme.ui_style('line_number')}{' ' * gutter}{style}{line}{RESET}"
+        return f"{style}{line}{RESET}"
 
     def _current_relative_path(self) -> Path | None:
         if self.file_path is None:
@@ -1419,21 +1818,23 @@ class PvimEditor:
         return f"{base_style}{' ' * width}{RESET}"
 
     def _render_status_row(self, width: int) -> str:
-        mode_text = f" {self.mode} "
-        mode_text = mode_text[:width]
-        mode_len = len(mode_text)
-
         file_name = str(self.file_path) if self.file_path else "[No Name]"
-        dirty = " [+]" if self.modified else ""
-        multi = f" | MC {1 + len(self.extra_cursor_lines)}" if self.extra_cursor_lines else ""
-        git_label = self.git.branch_label(self.file_path) if self.config.feature_enabled("git_status") else "-"
-        hint = f" | {self.key_hints_trigger} hints" if self.key_hints_enabled else ""
-
-        rest = (
-            f" {file_name}{dirty}{multi} | Ln {self.cy + 1}, Col {self.cx + 1} | Git {git_label}{hint} "
+        git_label = (
+            self._git_control_feature.branch
+            if self._git_control_feature.enabled
+            else (self.git.branch_label(self.file_path) if self.config.feature_enabled("git_status") else "-")
         )
-        rest = rest[: max(0, width - mode_len)].ljust(max(0, width - mode_len))
-        return f"{self._mode_style()}{mode_text}{self.theme.ui_style('status')}{rest}{RESET}"
+        context = LayoutContext(
+            width=width,
+            height=1,
+            mode=self.mode,
+            file_name=file_name,
+            row=self.cy + 1,
+            col=self.cx + 1,
+            branch=git_label,
+        )
+        text = self._layout_manager.render_statusline(context)
+        return f"{self.theme.ui_style('status')}{text}{RESET}"
 
     def _render_bottom_row(self, width: int) -> tuple[str, int]:
         if self.mode == MODE_COMMAND:
@@ -1460,6 +1861,14 @@ class PvimEditor:
             footer = self._floating_list.footer if self._floating_list is not None else "Floating list"
             return f"{self.theme.ui_style('command_line')}{footer[:width].ljust(width)}{RESET}", 1
 
+        if self.mode == MODE_EXPLORER:
+            text = "Explorer: Enter open, Esc close, :tree refresh"
+            return f"{self.theme.ui_style('command_line')}{text[:width].ljust(width)}{RESET}", 1
+
+        if self.mode == MODE_COMPLETION:
+            text = "Completion: Tab/Enter accept, Esc close"
+            return f"{self.theme.ui_style('command_line')}{text[:width].ljust(width)}{RESET}", 1
+
         if self.mode == MODE_KEY_HINTS:
             text = "Hints: Up/Down scroll, Esc close"
             return f"{self.theme.ui_style('command_line')}{text[:width].ljust(width)}{RESET}", 1
@@ -1476,10 +1885,11 @@ class PvimEditor:
         width, height = self._terminal_size()
         self._ensure_cursor_bounds()
 
+        plan = self._layout_manager.plan(width, height)
         sidebar_width = self._active_sidebar_width(width)
-        self._ensure_cursor_visible(width, height, sidebar_width)
+        self._ensure_cursor_visible(width, plan.editor_height + 2, sidebar_width)
 
-        text_rows = max(1, height - 2)
+        text_rows = max(1, plan.editor_height)
         gutter = self._gutter_width()
         editor_width = max(1, width - sidebar_width)
         text_cols = max(1, editor_width - gutter)
@@ -1488,6 +1898,26 @@ class PvimEditor:
         sidebar_start = self._sidebar_start_index(sidebar_files, text_rows) if sidebar_files else 0
 
         frame: list[str] = []
+        file_name = str(self.file_path) if self.file_path else "[No Name]"
+        layout_context = LayoutContext(
+            width=width,
+            height=height,
+            mode=self.mode,
+            file_name=file_name,
+            row=self.cy + 1,
+            col=self.cx + 1,
+            branch=self._git_control_feature.branch
+            if self._git_control_feature.enabled
+            else (self.git.branch_label(self.file_path) if self.config.feature_enabled("git_status") else "-"),
+        )
+        if plan.tabline_height:
+            tabline = self._layout_manager.render_tabline(layout_context, self._tab_items or [file_name], self._current_tab_index)
+            frame.append(f"{self.theme.ui_style('command_line')}{tabline}{RESET}")
+        if plan.winbar_height:
+            breadcrumb = self._build_winbar_breadcrumb()
+            winbar = self._layout_manager.render_winbar(layout_context, breadcrumb)
+            frame.append(f"{self.theme.ui_style('command_line')}{winbar}{RESET}")
+
         for screen_row in range(text_rows):
             editor_row = self._render_editor_row(screen_row, text_rows, gutter, text_cols)
             if sidebar_width > 0:
@@ -1505,18 +1935,68 @@ class PvimEditor:
         frame.append(self._render_status_row(width))
         bottom_row, command_cursor_col = self._render_bottom_row(width)
         frame.append(bottom_row)
+        self._apply_notification_overlay(frame, width)
 
         if self.mode in {MODE_COMMAND, MODE_FUZZY}:
             cursor_row = height
             cursor_col = command_cursor_col
-        elif self.mode in {MODE_FLOAT_LIST, MODE_KEY_HINTS, MODE_ALERT}:
+        elif self.mode in {MODE_FLOAT_LIST, MODE_EXPLORER, MODE_COMPLETION, MODE_KEY_HINTS, MODE_ALERT}:
             cursor_row = height
             cursor_col = 1
         else:
-            cursor_row = clamp(self.cy - self.row_offset + 1, 1, text_rows)
+            cursor_row = plan.editor_top + clamp(self.cy - self.row_offset + 1, 1, text_rows)
             cursor_col = clamp(sidebar_width + gutter + (self.cx - self.col_offset) + 1, 1, width)
 
         return frame, cursor_row, cursor_col
+
+    def _build_winbar_breadcrumb(self) -> str:
+        if self.file_path is None:
+            return "[No Name]"
+        parts: list[str] = []
+        parent_name = self.file_path.parent.name
+        if parent_name:
+            parts.append(parent_name)
+        parts.append(self.file_path.name)
+        service = self._get_ast_query_service()
+        if service is not None:
+            try:
+                node = service.node_at(self.file_path, self.lines, self.cy + 1, self.cx + 1)
+            except Exception:
+                node = None
+            if node and node.name:
+                suffix = "()" if node.kind in {"function", "method"} else ""
+                parts.append(f"{node.name}{suffix}")
+        return " > ".join(parts[-3:])
+
+    def _apply_notification_overlay(self, frame: list[str], width: int) -> None:
+        if not self.config.feature_enabled("notifications"):
+            return
+        items = self._notifications.active()
+        if not items:
+            return
+        visible = items[-2:]
+        title = " Notifications "
+        content_width = max(len(title), *(len(item) for item in visible))
+        box_width = clamp(content_width + 2, 20, max(20, width))
+        if box_width >= width:
+            box_width = width
+        left = max(0, width - box_width)
+
+        top = "╭" + title.center(max(0, box_width - 2), "─") + "╮"
+        bottom = "╰" + ("─" * max(0, box_width - 2)) + "╯"
+        rows = [top]
+        for item in visible:
+            rows.append("│" + item[: max(0, box_width - 2)].ljust(max(0, box_width - 2)) + "│")
+        rows.append(bottom)
+
+        start = max(0, len(frame) - len(rows) - 1)
+        style = self.theme.ui_style("command_line")
+        for index, row_text in enumerate(rows):
+            row_index = start + index
+            if row_index >= len(frame):
+                break
+            full = (" " * left) + row_text
+            frame[row_index] = f"{style}{full[:width].ljust(width)}{RESET}"
 
     def render(self) -> None:
         frame, cursor_row, cursor_col = self._build_frame()
@@ -1524,36 +2004,50 @@ class PvimEditor:
         if len(self._last_frame) != len(frame):
             self._last_frame = [""] * len(frame)
 
-        width, _ = self._terminal_size()
+        width, height = self._terminal_size()
+        plan = self._layout_manager.plan(width, height)
         view_state = (
             self.row_offset,
             self.col_offset,
             self.mode,
             self._active_sidebar_width(width),
             self._gutter_width(),
+            frozenset(self._feature_registry.enabled_components()),
         )
         dirty_all, dirty_lines = self.buffer.consume_dirty()
-        text_rows = max(1, len(frame) - 2)
+        text_rows = max(1, plan.editor_height)
+        editor_top = plan.editor_top
 
         if (
             dirty_all
             or self._last_view_state != view_state
-            or self.mode in {MODE_FUZZY, MODE_FLOAT_LIST, MODE_KEY_HINTS, MODE_ALERT}
+            or self.mode in {
+                MODE_FUZZY,
+                MODE_FLOAT_LIST,
+                MODE_EXPLORER,
+                MODE_COMPLETION,
+                MODE_KEY_HINTS,
+                MODE_ALERT,
+            }
         ):
             candidate_rows = set(range(1, len(frame) + 1))
         else:
             candidate_rows = {len(frame) - 1, len(frame)}
             for line_index in dirty_lines:
-                screen_row = line_index - self.row_offset + 1
-                if 1 <= screen_row <= text_rows:
+                screen_row = line_index - self.row_offset + 1 + editor_top
+                if editor_top < screen_row <= editor_top + text_rows:
                     candidate_rows.add(screen_row)
 
-            previous_screen_row = self._last_cursor_line - self.row_offset + 1
-            current_screen_row = self.cy - self.row_offset + 1
-            if 1 <= previous_screen_row <= text_rows:
+            previous_screen_row = self._last_cursor_line - self.row_offset + 1 + editor_top
+            current_screen_row = self.cy - self.row_offset + 1 + editor_top
+            if editor_top < previous_screen_row <= editor_top + text_rows:
                 candidate_rows.add(previous_screen_row)
-            if 1 <= current_screen_row <= text_rows:
+            if editor_top < current_screen_row <= editor_top + text_rows:
                 candidate_rows.add(current_screen_row)
+
+        for row_index, line in enumerate(frame, start=1):
+            if line != self._last_frame[row_index - 1]:
+                candidate_rows.add(row_index)
 
         out: list[str] = []
         for row in sorted(candidate_rows):
@@ -1635,7 +2129,7 @@ class PvimEditor:
 
         if cmd in {"help", "h"}:
             self._set_message(
-                "Commands: :w :q :e :find :replace :rename :format :fuzzy :keys :script :plugin :proc :virtual :ast :profile"
+                "Commands: :w :q :e :find :replace :rename :format :fuzzy :tree :feature :keys :script :plugin :proc :virtual :ast :profile"
             )
             return
 
@@ -1817,6 +2311,58 @@ class PvimEditor:
             self._set_message("Usage: :sidebar on|off|toggle", error=True)
             return
 
+        if cmd in {"tree", "explorer"}:
+            action = args[0] if args else "open"
+            if action in {"open", "show"}:
+                self._open_explorer(refresh=False)
+                return
+            if action in {"refresh", "reload"}:
+                self._open_explorer(refresh=True)
+                return
+            if action in {"close", "hide"}:
+                self._close_explorer()
+                return
+            if action == "toggle":
+                if self.mode == MODE_EXPLORER:
+                    self._close_explorer()
+                else:
+                    self._open_explorer(refresh=False)
+                return
+            self._set_message("Usage: :tree open|refresh|close|toggle", error=True)
+            return
+
+        if cmd == "feature":
+            if len(args) < 2:
+                self._set_message("Usage: :feature <name> <on|off>", error=True)
+                return
+            name = args[0]
+            state = args[1].lower()
+            enabled = state == "on"
+            if state not in {"on", "off"}:
+                self._set_message("Usage: :feature <name> <on|off>", error=True)
+                return
+            if not self._feature_registry.set_enabled(name, enabled):
+                self._set_message(f"Unknown feature: {name}", error=True)
+                return
+            if name == "file_tree":
+                self._file_tree_feature.enabled = enabled
+                if not enabled:
+                    self._close_explorer()
+            elif name == "tab_completion":
+                self._completion_feature.enabled = enabled
+                if not enabled:
+                    self._close_tab_completion()
+            elif name == "git_control":
+                self._git_control_feature.enabled = enabled
+                if enabled:
+                    self._schedule_git_control_refresh(force=True)
+                else:
+                    self._git_control_feature.apply(GitSnapshot(branch="-", file_state="clean", line_markers={}))
+            elif name == "notifications" and not enabled:
+                self._notifications = NotificationCenter()
+            self._set_message(f"Feature {name}: {'on' if enabled else 'off'}")
+            return
+
         if cmd in {"reload-config", "config-reload"}:
             self.config = AppConfig.load(self.config.path)
             self._apply_runtime_config()
@@ -1890,6 +2436,18 @@ class PvimEditor:
             self._toggle_sidebar()
             return True
 
+        if key == self._shortcut("toggle_file_tree", "F3"):
+            if self.mode == MODE_EXPLORER:
+                self._close_explorer()
+            else:
+                self._open_explorer(refresh=False)
+            return True
+
+        if key == self._shortcut("open_completion", "CTRL_N"):
+            if self.mode == MODE_INSERT:
+                return self._open_tab_completion()
+            return False
+
         if key == self._shortcut("format_code", "F8"):
             self._format_code()
             return True
@@ -1956,6 +2514,7 @@ class PvimEditor:
             self.fuzzy_matches = []
             self.fuzzy_index = 0
             self._floating_list = None
+            self._floating_source = ""
             self._set_message("Fuzzy cancelled.")
             return
 
@@ -2012,6 +2571,7 @@ class PvimEditor:
 
         if key == "ESC":
             self._floating_list = None
+            self._floating_source = ""
             self.mode = MODE_NORMAL
             return
 
@@ -2029,7 +2589,61 @@ class PvimEditor:
             if selected is not None:
                 self._set_message(selected)
             self._floating_list = None
+            self._floating_source = ""
             self.mode = self._floating_accept_mode
+
+    def _handle_explorer_key(self, key: str) -> None:
+        if key == "ESC":
+            self._close_explorer()
+            return
+        visible_rows = max(1, self._terminal_size()[1] - 8)
+        if key in {"UP", "CTRL_LEFT"}:
+            self._file_tree_feature.move_up()
+            self._sync_file_tree_popup()
+            return
+        if key in {"DOWN", "CTRL_RIGHT"}:
+            self._file_tree_feature.move_down(visible_rows)
+            self._sync_file_tree_popup()
+            return
+        if key == "ENTER":
+            selected = self._file_tree_feature.selected_path()
+            if not selected:
+                return
+            if self.open_file(Path.cwd() / selected, force=False):
+                self._close_explorer()
+
+    def _handle_completion_key(self, key: str) -> None:
+        visible_rows = max(1, self._terminal_size()[1] - 8)
+        if key == "ESC":
+            self._close_tab_completion()
+            return
+        if key in {"UP", "CTRL_LEFT"}:
+            self._completion_feature.move_up()
+            self._sync_completion_popup()
+            return
+        if key in {"DOWN", "CTRL_RIGHT"}:
+            self._completion_feature.move_down(visible_rows)
+            self._sync_completion_popup()
+            return
+        if key in {"TAB", "ENTER"}:
+            self._accept_tab_completion()
+            return
+        if key == "BACKSPACE":
+            self._close_tab_completion()
+            self._backspace()
+            return
+        if len(key) == 1 and key.isprintable():
+            self._close_tab_completion()
+            self._insert_printable(key)
+            return
+        if key == "LEFT":
+            self._close_tab_completion()
+            self._move_left()
+            return
+        if key == "RIGHT":
+            self._close_tab_completion()
+            self._move_right()
+            return
 
     def _handle_visual_key(self, key: str) -> None:
         if key in {"ESC"}:
@@ -2093,6 +2707,8 @@ class PvimEditor:
             return
 
         if key == "TAB":
+            if self._open_tab_completion():
+                return
             self._insert_text_multi(" " * self.tab_size)
             return
 
@@ -2262,6 +2878,10 @@ class PvimEditor:
     def _dispatch_plugin_key(self, key: str) -> None:
         if not self.config.feature_enabled("plugins"):
             return
+        if not self.config.feature_enabled("plugin_keyhooks"):
+            return
+        if self.mode == MODE_INSERT and len(key) == 1 and key.isprintable():
+            return
         self._ensure_plugins_loaded()
         responses = self.plugins.run_on_key(key)
         if not responses:
@@ -2283,6 +2903,14 @@ class PvimEditor:
 
         if self.mode == MODE_FLOAT_LIST:
             self._handle_floating_list_key(key)
+            return
+
+        if self.mode == MODE_EXPLORER:
+            self._handle_explorer_key(key)
+            return
+
+        if self.mode == MODE_COMPLETION:
+            self._handle_completion_key(key)
             return
 
         if key == "CTRL_S":
@@ -2324,6 +2952,9 @@ class PvimEditor:
         try:
             while self.running:
                 self._drain_async_events()
+                self._schedule_git_control_refresh()
+                if self.mode == MODE_EXPLORER and not self._file_tree_feature.entries:
+                    self._schedule_file_tree_refresh()
                 self.render()
                 if KeyReader.has_key():
                     key = self._read_key()

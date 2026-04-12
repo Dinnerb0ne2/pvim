@@ -13,20 +13,18 @@ python pvim.py your_file.py
 python pvim.py your_file.py --config pvim.config.json
 ```
 
-## 第一轮建议操作
+## 首次启动
 
-1. `F1` 打开快捷键提示面板
-2. `Ctrl+P` 模糊搜索文件
-3. `:plugin list` 打开插件浮动列表
-4. `:proc start "<command>"` 启动外部进程管道
-5. `:ast` 查询光标所在函数/类边界
+- 未打开文件时会显示 PVIM 封面页（类似 Vim 启动界面）。
+- 默认只启用基础功能，高级特性需在配置中打开。
 
 ## 常用命令
 
 - `:w` / `:q` / `:wq`
 - `:find` / `:replace` / `:replaceall`
 - `:format`
-- `:virtual add <line> <text>`
+- `:tree open|refresh|close|toggle`
+- `:feature <name> <on|off>`
 - `:proc start|read|write|stop|status ...`
 - `:script run <file>`
 - `:profile script <file>`

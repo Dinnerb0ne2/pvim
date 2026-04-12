@@ -1,5 +1,9 @@
 {
   ".py": "syntax\\python.json",
+  ".pyi": "syntax\\python.json",
+  ".pyw": "syntax\\python.json",
+  ".pvi": "syntax\\pvimscript.json",
+  ".pvs": "syntax\\pvimscript.json",
   ".json": "syntax\\json.json",
   ".txt": "syntax\\plaintext.json",
   ".md": "syntax\\plaintext.json",

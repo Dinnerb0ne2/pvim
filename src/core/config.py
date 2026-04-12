@@ -33,7 +33,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "config_file": "autopairs.json",
         },
         "sidebar": {
-            "enabled": True,
+            "enabled": False,
             "width": 30,
             "max_files": 3000,
         },
@@ -47,40 +47,63 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "word_right": "CTRL_RIGHT",
                 "quick_find": "CTRL_F",
                 "quick_replace": "CTRL_G",
+                "open_completion": "CTRL_N",
                 "fuzzy_finder": "CTRL_P",
+                "toggle_file_tree": "F3",
                 "toggle_sidebar": "F4",
                 "format_code": "F8",
                 "refactor_rename": "CTRL_R",
             },
         },
         "key_hints": {
-            "enabled": True,
+            "enabled": False,
             "trigger": "F1",
         },
         "fuzzy_finder": {
-            "enabled": True,
+            "enabled": False,
         },
         "scripting": {
-            "enabled": True,
+            "enabled": False,
             "step_limit": 100000,
         },
         "plugins": {
-            "enabled": True,
+            "enabled": False,
             "directory": "plugins",
             "auto_load": True,
         },
+        "plugin_keyhooks": {
+            "enabled": False,
+        },
+        "tabline": {
+            "enabled": False,
+        },
+        "winbar": {
+            "enabled": False,
+        },
+        "file_tree": {
+            "enabled": False,
+        },
+        "tab_completion": {
+            "enabled": False,
+        },
+        "git_control": {
+            "enabled": False,
+        },
+        "notifications": {
+            "enabled": False,
+        },
         "git_status": {
-            "enabled": True,
+            "enabled": False,
             "refresh_seconds": 2.0,
         },
         "refactor_tools": {
-            "enabled": True,
+            "enabled": False,
         },
         "find_replace": {
             "enabled": True,
         },
         "code_style_normalizer": {
-            "enabled": True,
+            "enabled": False,
         },
     },
 }

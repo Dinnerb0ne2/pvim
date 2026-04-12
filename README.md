@@ -1,12 +1,15 @@
-# PVIM - v0.2
+# PVIM - v0.2.x
 
-PVIM 是一个基于 **Python 3.14.3** 的终端编辑器，核心能力包括：
+PVIM 是一个基于 **Python 3.14.3**、纯标准库实现的终端编辑器。
 
-- 异步事件循环与外部进程管道（不阻塞 TUI）
-- 脚本语言 + 插件系统
-- 虚拟文本叠加层
-- 通用浮动列表组件
-- AST 节点查询接口（tree-sitter 集成路径 + Python AST 回退）
+## 核心能力
+
+- asyncio 异步调度与外部进程管道（不阻塞渲染）
+- Layout Manager + Feature Registry（Tabline / Winbar / Statusline 动态布局）
+- 文件树、Tab 补全、Git 控制可插拔模块
+- 虚拟文本叠加层与浮动窗口
+- 自定义脚本语言 + 插件系统（单插件独立环境）
+- Python 与 PVIM Script 语法高亮
 
 ## 启动
 
@@ -16,7 +19,7 @@ python pvim.py your_file.py
 python pvim.py your_file.py --config pvim.config.json
 ```
 
-## 目录结构
+## 目录
 
 ```text
 src/
@@ -25,12 +28,7 @@ src/
   scripting/
   plugins/
   ui/
-pvim.py
-pvim.config.json
-plugins/
 doc/
 ```
 
-## 文档
-
-- [doc/README.md](./doc/README.md)
+详细文档见 [doc/README.md](./doc/README.md)。

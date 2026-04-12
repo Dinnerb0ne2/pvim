@@ -23,3 +23,7 @@ env/
 # Build artifacts
 build/
 dist/
+
+# other
+.DS_Store
+p.txt
