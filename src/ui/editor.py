@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
 import shlex
 import sys
+import time
 
+from ..core.async_runtime import AsyncRuntime
 from ..core.config import AppConfig
 from ..core.console import CSI, ConsoleController, KeyReader
+from ..core.process_pipe import AsyncProcessManager
 from ..core.theme import RESET, Theme, load_theme
 from ..features.file_index import FileIndex
 from ..features.formatter import normalize_code_style, organize_python_imports
@@ -73,6 +77,9 @@ class PviEditor:
 
         self._last_frame: list[str] = []
         self._console = ConsoleController()
+        self._async_runtime = AsyncRuntime()
+        self._process_manager = AsyncProcessManager(self._async_runtime)
+        self._last_tick = time.monotonic()
 
         self.show_line_numbers = True
         self.tab_size = 4
@@ -223,6 +230,48 @@ class PviEditor:
         if action == "current_file":
             return str(self.file_path) if self.file_path else ""
 
+        if action == "proc.start":
+            if not args:
+                return 0
+            command = str(args[0]).strip()
+            if not command:
+                return 0
+            cwd = str(args[1]) if len(args) > 1 else None
+            return self._process_manager.start(command, cwd=cwd)
+
+        if action == "proc.write":
+            if len(args) < 2:
+                return False
+            return self._process_manager.write(int(args[0]), str(args[1]))
+
+        if action == "proc.read":
+            if not args:
+                return ""
+            process_id = int(args[0])
+            max_lines = int(args[1]) if len(args) > 1 else 20
+            lines = self._process_manager.read(process_id, max_lines=max_lines)
+            return "\n".join(lines)
+
+        if action == "proc.stop":
+            if not args:
+                return False
+            return self._process_manager.stop(int(args[0]))
+
+        if action == "proc.status":
+            if not args:
+                return "unknown"
+            return self._process_manager.status(int(args[0]))
+
+        if action == "task.sleep":
+            seconds = float(args[0]) if args else 0.0
+            label = str(args[1]) if len(args) > 1 else f"sleep:{seconds}"
+
+            async def _sleep_task() -> str:
+                await asyncio.sleep(max(0.0, seconds))
+                return label
+
+            return self._async_runtime.submit(label, _sleep_task())
+
         raise ValueError(f"Unknown api action: {action}")
 
     def _show_alert(self, text: str) -> None:
@@ -284,12 +333,44 @@ class PviEditor:
             "",
             "Script commands",
             "  :script run <file>",
+            "  api(pvim, 'task.sleep', sec, label)",
+            "",
+            "Process commands",
+            "  :proc start <command>",
+            "  :proc status <id>",
+            "  :proc read <id> [max]",
+            "  :proc write <id> <text>",
+            "  :proc stop <id>",
         ]
         return lines
 
     def _set_message(self, message: str, *, error: bool = False) -> None:
         self.message = message
         self.message_error = error
+
+    def _drain_async_events(self) -> None:
+        for event in self._async_runtime.poll_events(max_items=64):
+            event_type = event.get("type", "")
+            if event_type == "task_done":
+                label = str(event.get("label", "task"))
+                error = str(event.get("error", "") or "")
+                if error:
+                    self._show_alert(f"Async task failed ({label}): {error}")
+                else:
+                    self._set_message(f"Async task done: {label}")
+                continue
+
+            if event_type == "process_output":
+                process_id = int(event.get("process_id", 0))
+                line = str(event.get("line", ""))
+                if line:
+                    self._set_message(f"[proc:{process_id}] {line}")
+                continue
+
+            if event_type == "process_exit":
+                process_id = int(event.get("process_id", 0))
+                code = event.get("return_code", None)
+                self._set_message(f"Process {process_id} exited ({code}).")
 
     def _resolve_path(self, target: Path | str) -> Path:
         path = Path(target).expanduser()
@@ -1306,7 +1387,7 @@ class PviEditor:
 
         if cmd in {"help", "h"}:
             self._set_message(
-                "Commands: :w :q :e :find :replace :rename :format :fuzzy :keys :script :plugin"
+                "Commands: :w :q :e :find :replace :rename :format :fuzzy :keys :script :plugin :proc"
             )
             return
 
@@ -1380,6 +1461,43 @@ class PviEditor:
 
         if cmd == "plugin":
             self._handle_plugin_command(args)
+            return
+
+        if cmd == "proc":
+            if not args:
+                self._set_message("Usage: :proc start|read|write|stop|status ...", error=True)
+                return
+            action = args[0]
+            if action == "start" and len(args) >= 2:
+                command_text = " ".join(args[1:])
+                process_id = self._process_manager.start(command_text)
+                self._set_message(f"Process started: {process_id}")
+                return
+            if action == "read" and len(args) >= 2:
+                process_id = int(args[1])
+                max_lines = int(args[2]) if len(args) >= 3 else 20
+                lines = self._process_manager.read(process_id, max_lines=max_lines)
+                if lines:
+                    self._show_alert("\n".join(lines))
+                else:
+                    self._set_message("No process output.")
+                return
+            if action == "write" and len(args) >= 3:
+                process_id = int(args[1])
+                text = " ".join(args[2:])
+                ok = self._process_manager.write(process_id, text)
+                self._set_message("Process write sent." if ok else "Process write failed.")
+                return
+            if action == "stop" and len(args) >= 2:
+                process_id = int(args[1])
+                ok = self._process_manager.stop(process_id)
+                self._set_message("Process stop sent." if ok else "Process stop failed.")
+                return
+            if action == "status" and len(args) >= 2:
+                process_id = int(args[1])
+                self._set_message(f"Process {process_id}: {self._process_manager.status(process_id)}")
+                return
+            self._set_message("Usage: :proc start|read|write|stop|status ...", error=True)
             return
 
         if cmd in {"sidebar"}:
@@ -1865,8 +1983,14 @@ class PviEditor:
         self._console.enter()
         try:
             while self.running:
+                self._drain_async_events()
                 self.render()
-                key = self._read_key()
-                self.handle_key(key)
+                if KeyReader.has_key():
+                    key = self._read_key()
+                    self.handle_key(key)
+                    self._last_tick = time.monotonic()
+                    continue
+                time.sleep(0.01)
         finally:
+            self._async_runtime.close()
             self._console.exit()

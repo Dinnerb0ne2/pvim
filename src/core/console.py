@@ -89,6 +89,10 @@ class ConsoleController:
 
 class KeyReader:
     @staticmethod
+    def has_key() -> bool:
+        return bool(msvcrt.kbhit())
+
+    @staticmethod
     def read_key() -> str:
         key = msvcrt.getwch()
         if key in ("\x00", "\xe0"):
