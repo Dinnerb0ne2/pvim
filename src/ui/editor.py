@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import cProfile
+import io
 import json
 import os
 from pathlib import Path
+import pstats
 import shlex
 import sys
 import time
@@ -18,8 +21,9 @@ from ..features.file_index import FileIndex
 from ..features.formatter import normalize_code_style, organize_python_imports
 from ..features.fuzzy import fuzzy_filter
 from ..features.git_status import GitStatusProvider
+from ..features.ast_query import AstQueryService
 from ..features.refactor import find_next, rename_symbol, replace_all, replace_next, word_at_cursor
-from ..features.syntax import SyntaxManager
+from ..features.syntax import PLAIN_PROFILE, SyntaxManager
 from ..plugins import PluginManager
 from ..scripting import ScriptError
 from .floating_list import FloatingList
@@ -42,7 +46,7 @@ def _is_word_char(char: str) -> bool:
     return char.isalnum() or char == "_"
 
 
-class PviEditor:
+class PvimEditor:
     def __init__(self, file_path: Path | None, config: AppConfig) -> None:
         self.config = config
 
@@ -92,12 +96,14 @@ class PviEditor:
         self.tab_size = 4
         self.show_sidebar = False
         self.sidebar_width = 30
+        self._lazy_load_enabled = True
 
         self.theme: Theme = load_theme(None)
-        self.syntax = SyntaxManager(self.config)
-        self._syntax_profile = self.syntax.profile_for_file(None)
+        self.syntax: SyntaxManager | None = None
+        self._syntax_profile = PLAIN_PROFILE
         self.file_index = FileIndex(Path.cwd(), max_files=3000)
         self.git = GitStatusProvider(Path.cwd(), enabled=False, refresh_seconds=2.0)
+        self._ast_query_service: AstQueryService | None = None
         self.plugins = PluginManager(
             plugins_root=Path.cwd() / "plugins",
             enabled=False,
@@ -105,6 +111,7 @@ class PviEditor:
             auto_load=False,
             host_api=self._plugin_api_dispatch,
         )
+        self._plugins_loaded = False
         self._auto_pairs: dict[str, str] = {}
         self._auto_pair_closers: set[str] = set()
 
@@ -128,11 +135,16 @@ class PviEditor:
         self.sidebar_width = self.config.sidebar_width()
         self.key_hints_enabled = self.config.key_hints_enabled()
         self.key_hints_trigger = self.config.key_hints_trigger()
+        self._lazy_load_enabled = self.config.lazy_load_enabled()
 
         theme_file = self.config.theme_file() if self.config.theme_enabled() else None
         self.theme = load_theme(theme_file)
-        self.syntax = SyntaxManager(self.config)
-        self._syntax_profile = self.syntax.profile_for_file(self.file_path)
+        if self._lazy_load_enabled:
+            self.syntax = None
+            self._syntax_profile = PLAIN_PROFILE
+        else:
+            self.syntax = SyntaxManager(self.config)
+            self._syntax_profile = self.syntax.profile_for_file(self.file_path)
 
         self.file_index = FileIndex(Path.cwd(), max_files=self.config.file_scan_limit())
         self.git = GitStatusProvider(
@@ -144,12 +156,14 @@ class PviEditor:
             plugins_root=self.config.plugins_directory(),
             enabled=self.config.feature_enabled("plugins"),
             step_limit=self.config.script_step_limit(),
-            auto_load=self.config.plugins_auto_load(),
+            auto_load=self.config.plugins_auto_load() and not self._lazy_load_enabled,
             host_api=self._plugin_api_dispatch,
         )
-        startup_errors = [item["error"] for item in self.plugins.list_plugins() if item["error"]]
-        if startup_errors:
-            self._show_alert(f"Plugin startup error: {startup_errors[0]}")
+        self._plugins_loaded = not self._lazy_load_enabled
+        if self._plugins_loaded:
+            startup_errors = [item["error"] for item in self.plugins.list_plugins() if item["error"]]
+            if startup_errors:
+                self._show_alert(f"Plugin startup error: {startup_errors[0]}")
         self.buffer.mark_all_dirty()
         self._auto_pairs = self._load_auto_pairs()
         self._auto_pair_closers = set(self._auto_pairs.values())
@@ -282,6 +296,23 @@ class PviEditor:
                 return ""
             return " | ".join(self.buffer.get_virtual_text(row))
 
+        if action == "ast.node_at":
+            row = int(args[0]) if len(args) >= 1 else self.cy + 1
+            col = int(args[1]) if len(args) >= 2 else self.cx + 1
+            kind_text = str(args[2]) if len(args) >= 3 else "function,class"
+            kinds = {item.strip() for item in kind_text.split(",") if item.strip()}
+            source = "\n".join(self.lines)
+            match = self._ast_query().query_at(
+                file_path=self.file_path,
+                source=source,
+                row=row,
+                col=col,
+                kinds=kinds or {"function", "class"},
+            )
+            if match is None:
+                return ""
+            return match.to_compact()
+
         if action == "proc.start":
             if not args:
                 return 0
@@ -395,6 +426,8 @@ class PviEditor:
             "  :proc stop <id>",
             "  :virtual add <line> <text>",
             "  :virtual clear [line]",
+            "  :ast [line] [col] [function,class]",
+            "  :profile script <path>",
         ]
         return lines
 
@@ -425,6 +458,29 @@ class PviEditor:
                 process_id = int(event.get("process_id", 0))
                 code = event.get("return_code", None)
                 self._set_message(f"Process {process_id} exited ({code}).")
+
+    def _ast_query(self) -> AstQueryService:
+        if self._ast_query_service is None:
+            self._ast_query_service = AstQueryService()
+        return self._ast_query_service
+
+    def _syntax_manager(self) -> SyntaxManager:
+        if self.syntax is None:
+            self.syntax = SyntaxManager(self.config)
+            self._syntax_profile = self.syntax.profile_for_file(self.file_path)
+        return self.syntax
+
+    def _ensure_plugins_loaded(self) -> None:
+        if not self.config.feature_enabled("plugins"):
+            return
+        if self._plugins_loaded:
+            return
+        results = self.plugins.load_all()
+        self._plugins_loaded = True
+        for result in results:
+            if "error" in result.lower():
+                self._show_alert(result)
+                break
 
     def _resolve_path(self, target: Path | str) -> Path:
         path = Path(target).expanduser()
@@ -746,7 +802,7 @@ class PviEditor:
         rows = self._comment_rows()
         if not rows:
             return
-        prefix = self.syntax.line_comment_for_file(self.file_path).strip()
+        prefix = self._syntax_manager().line_comment_for_file(self.file_path).strip()
         if not prefix:
             self._set_message("Current language has no line-comment prefix.", error=True)
             return
@@ -838,6 +894,7 @@ class PviEditor:
             self._floating_list = None
 
     def _open_plugin_list_popup(self) -> None:
+        self._ensure_plugins_loaded()
         entries = self.plugins.list_plugins()
         if not entries:
             self._set_message("No plugins found.")
@@ -983,6 +1040,7 @@ class PviEditor:
         if not self.config.feature_enabled("scripting"):
             self._set_message("Scripting is disabled in config.", error=True)
             return False
+        self._ensure_plugins_loaded()
         path = self._resolve_path(target)
         try:
             result = self.plugins.execute_script(path)
@@ -995,10 +1053,37 @@ class PviEditor:
         self._set_message(result)
         return True
 
+    def _profile_script_file(self, target: str) -> bool:
+        if not self.config.feature_enabled("scripting"):
+            self._set_message("Scripting is disabled in config.", error=True)
+            return False
+        self._ensure_plugins_loaded()
+        path = self._resolve_path(target)
+        profiler = cProfile.Profile()
+        try:
+            profiler.enable()
+            result = self.plugins.execute_script(path)
+            profiler.disable()
+        except ScriptError as exc:
+            self._show_alert(f"Script error: {exc}")
+            return False
+        except Exception as exc:
+            self._show_alert(f"Script host error: {exc}")
+            return False
+
+        stats_stream = io.StringIO()
+        stats = pstats.Stats(profiler, stream=stats_stream).sort_stats("cumtime")
+        stats.print_stats(self.config.profile_top_n())
+        profile_text = stats_stream.getvalue()
+        summary = f"{result}\n\n{profile_text}"
+        self._show_alert(summary[:7000])
+        return True
+
     def _handle_plugin_command(self, args: list[str]) -> bool:
         if not self.config.feature_enabled("plugins"):
             self._set_message("Plugin system is disabled in config.", error=True)
             return False
+        self._ensure_plugins_loaded()
         if not args:
             self._set_message("Usage: :plugin list|load|install|run ...", error=True)
             return False
@@ -1111,7 +1196,7 @@ class PviEditor:
         self.pending_operator = ""
         self.visual_anchor = None
         self._clear_multi_cursor()
-        self._syntax_profile = self.syntax.profile_for_file(self.file_path)
+        self._syntax_profile = self._syntax_manager().profile_for_file(self.file_path)
         return True
 
     def save_file(self, target: Path | str | None = None) -> bool:
@@ -1246,7 +1331,12 @@ class PviEditor:
             else:
                 base_style = self.theme.ui_style("editor")
 
-            colored_code = self.syntax.highlight_line(visible_code, self._syntax_profile, self.theme, base_style)
+            colored_code = self._syntax_manager().highlight_line(
+                visible_code,
+                self._syntax_profile,
+                self.theme,
+                base_style,
+            )
             if ghost_visible:
                 ghost_style = self.theme.ui_style("message_info") or base_style
                 colored = f"{colored_code}{ghost_style}{ghost_visible}{base_style}"
@@ -1545,7 +1635,7 @@ class PviEditor:
 
         if cmd in {"help", "h"}:
             self._set_message(
-                "Commands: :w :q :e :find :replace :rename :format :fuzzy :keys :script :plugin :proc :virtual"
+                "Commands: :w :q :e :find :replace :rename :format :fuzzy :keys :script :plugin :proc :virtual :ast :profile"
             )
             return
 
@@ -1615,6 +1705,13 @@ class PviEditor:
                 self._run_script_file(args[1])
                 return
             self._set_message("Usage: :script run <path>", error=True)
+            return
+
+        if cmd == "profile":
+            if len(args) >= 2 and args[0] == "script":
+                self._profile_script_file(args[1])
+                return
+            self._set_message("Usage: :profile script <path>", error=True)
             return
 
         if cmd == "plugin":
@@ -1688,6 +1785,17 @@ class PviEditor:
                 self._set_message(text or "(no virtual text)")
                 return
             self._set_message("Usage: :virtual add|set|clear|get ...", error=True)
+            return
+
+        if cmd == "ast":
+            row = int(args[0]) if len(args) >= 1 else self.cy + 1
+            col = int(args[1]) if len(args) >= 2 else self.cx + 1
+            kinds = args[2] if len(args) >= 3 else "function,class"
+            result = self._plugin_api_dispatch(1, "ast.node_at", [row, col, kinds])
+            if not isinstance(result, str) or not result:
+                self._set_message("AST node not found.", error=True)
+                return
+            self._set_message(f"AST {result}")
             return
 
         if cmd in {"sidebar"}:
@@ -2154,6 +2262,7 @@ class PviEditor:
     def _dispatch_plugin_key(self, key: str) -> None:
         if not self.config.feature_enabled("plugins"):
             return
+        self._ensure_plugins_loaded()
         responses = self.plugins.run_on_key(key)
         if not responses:
             return
@@ -2225,3 +2334,7 @@ class PviEditor:
         finally:
             self._async_runtime.close()
             self._console.exit()
+
+
+# Backward-compat alias for older imports.
+PviEditor = PvimEditor

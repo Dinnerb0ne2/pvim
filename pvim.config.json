@@ -10,6 +10,11 @@
     "enabled": true,
     "config_file": "pvim.theme.default.json"
   },
+  "performance": {
+    "experimental_jit": true,
+    "lazy_load": true,
+    "profile_top_n": 25
+  },
   "features": {
     "syntax_highlighting": {
       "enabled": true,

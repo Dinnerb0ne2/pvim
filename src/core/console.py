@@ -5,7 +5,7 @@ import os
 import sys
 
 if os.name != "nt":
-    raise SystemExit("PVI 目前仅支持 Windows 终端（纯标准库实现）。")
+    raise SystemExit("PVIM 目前仅支持 Windows 终端（纯标准库实现）。")
 
 import msvcrt
 

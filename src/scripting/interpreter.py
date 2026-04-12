@@ -31,6 +31,8 @@ from .parser import Parser
 
 
 class Environment:
+    __slots__ = ("parent", "values")
+
     def __init__(self, parent: Environment | None = None) -> None:
         self.parent = parent
         self.values: dict[str, Any] = {}
@@ -113,6 +115,8 @@ class ScriptFunction(ScriptCallable):
 
 
 class ScriptInterpreter:
+    __slots__ = ("step_limit", "_steps", "_builtin_env")
+
     def __init__(self, *, step_limit: int = 100_000) -> None:
         self.step_limit = max(1000, int(step_limit))
         self._steps = 0
@@ -139,55 +143,48 @@ class ScriptInterpreter:
 
     def _execute_statement(self, statement: Statement, env: Environment) -> None:
         self._tick(statement.line)
-
-        if isinstance(statement, LetStmt):
-            env.define(statement.name, self._evaluate(statement.value, env))
-            return
-
-        if isinstance(statement, ExprStmt):
-            self._evaluate(statement.expr, env)
-            return
-
-        if isinstance(statement, FunctionDecl):
-            function = ScriptFunction(
-                params=statement.params,
-                body=statement.body,
-                closure=env,
-                name=statement.name,
-            )
-            env.define(statement.name, function)
-            return
-
-        if isinstance(statement, IfStmt):
-            condition = self._evaluate(statement.condition, env)
-            if self._is_truthy(condition):
-                self._execute_block(statement.then_block, env)
-            elif statement.else_block is not None:
-                self._execute_block(statement.else_block, env)
-            return
-
-        if isinstance(statement, WhileStmt):
-            while self._is_truthy(self._evaluate(statement.condition, env)):
-                self._tick(statement.line)
-                try:
-                    self._execute_block(statement.body, env)
-                except _ContinueSignal:
-                    continue
-                except _BreakSignal:
-                    break
-            return
-
-        if isinstance(statement, ReturnStmt):
-            value = self._evaluate(statement.value, env) if statement.value is not None else None
-            raise _ReturnSignal(value)
-
-        if isinstance(statement, BreakStmt):
-            raise _BreakSignal()
-
-        if isinstance(statement, ContinueStmt):
-            raise _ContinueSignal()
-
-        raise ScriptRuntimeError("Unsupported statement.", line=statement.line)
+        match statement:
+            case LetStmt(name=name, value=value):
+                env.define(name, self._evaluate(value, env))
+                return
+            case ExprStmt(expr=expr):
+                self._evaluate(expr, env)
+                return
+            case FunctionDecl(name=name, params=params, body=body):
+                function = ScriptFunction(
+                    params=params,
+                    body=body,
+                    closure=env,
+                    name=name,
+                )
+                env.define(name, function)
+                return
+            case IfStmt(condition=condition, then_block=then_block, else_block=else_block):
+                result = self._evaluate(condition, env)
+                if self._is_truthy(result):
+                    self._execute_block(then_block, env)
+                elif else_block is not None:
+                    self._execute_block(else_block, env)
+                return
+            case WhileStmt(condition=condition, body=body):
+                while self._is_truthy(self._evaluate(condition, env)):
+                    self._tick(statement.line)
+                    try:
+                        self._execute_block(body, env)
+                    except _ContinueSignal:
+                        continue
+                    except _BreakSignal:
+                        break
+                return
+            case ReturnStmt(value=value):
+                result = self._evaluate(value, env) if value is not None else None
+                raise _ReturnSignal(result)
+            case BreakStmt():
+                raise _BreakSignal()
+            case ContinueStmt():
+                raise _ContinueSignal()
+            case _:
+                raise ScriptRuntimeError("Unsupported statement.", line=statement.line)
 
     def _execute_block(self, block: Block, env: Environment) -> None:
         local = Environment(parent=env)
@@ -198,86 +195,81 @@ class ScriptInterpreter:
             return None
 
         self._tick(expression.line)
+        match expression:
+            case LiteralExpr(value=value):
+                return value
+            case StringExpr(value=value, formatted=formatted, line=line):
+                if formatted:
+                    return self._format_string(value, env, line=line)
+                return value
+            case IdentifierExpr(name=name, line=line):
+                return env.get(name, line=line)
+            case AssignExpr(name=name, value=value_expr, line=line):
+                result = self._evaluate(value_expr, env)
+                env.assign(name, result, line=line)
+                return result
+            case UnaryExpr(operator=operator, right=right, line=line):
+                value = self._evaluate(right, env)
+                match operator:
+                    case "-":
+                        return -self._to_number(value, line=line)
+                    case "!":
+                        return not self._is_truthy(value)
+                    case _:
+                        raise ScriptRuntimeError(f"Unsupported unary operator: {operator}", line=line)
+            case BinaryExpr(left=left_expr, operator=operator, right=right_expr, line=line):
+                if operator == "and":
+                    left_value = self._evaluate(left_expr, env)
+                    return self._evaluate(right_expr, env) if self._is_truthy(left_value) else left_value
+                if operator == "or":
+                    left_value = self._evaluate(left_expr, env)
+                    return left_value if self._is_truthy(left_value) else self._evaluate(right_expr, env)
 
-        if isinstance(expression, LiteralExpr):
-            return expression.value
-
-        if isinstance(expression, StringExpr):
-            if expression.formatted:
-                return self._format_string(expression.value, env, line=expression.line)
-            return expression.value
-
-        if isinstance(expression, IdentifierExpr):
-            return env.get(expression.name, line=expression.line)
-
-        if isinstance(expression, AssignExpr):
-            value = self._evaluate(expression.value, env)
-            env.assign(expression.name, value, line=expression.line)
-            return value
-
-        if isinstance(expression, UnaryExpr):
-            right = self._evaluate(expression.right, env)
-            if expression.operator == "-":
-                return -self._to_number(right, line=expression.line)
-            if expression.operator == "!":
-                return not self._is_truthy(right)
-            raise ScriptRuntimeError(f"Unsupported unary operator: {expression.operator}", line=expression.line)
-
-        if isinstance(expression, BinaryExpr):
-            op = expression.operator
-            if op == "and":
-                left = self._evaluate(expression.left, env)
-                return self._evaluate(expression.right, env) if self._is_truthy(left) else left
-            if op == "or":
-                left = self._evaluate(expression.left, env)
-                return left if self._is_truthy(left) else self._evaluate(expression.right, env)
-
-            left = self._evaluate(expression.left, env)
-            right = self._evaluate(expression.right, env)
-            if op == "+":
-                if isinstance(left, str) or isinstance(right, str):
-                    return f"{self._to_string(left)}{self._to_string(right)}"
-                return self._to_number(left, line=expression.line) + self._to_number(right, line=expression.line)
-            if op == "-":
-                return self._to_number(left, line=expression.line) - self._to_number(right, line=expression.line)
-            if op == "*":
-                return self._to_number(left, line=expression.line) * self._to_number(right, line=expression.line)
-            if op == "/":
-                right_value = self._to_number(right, line=expression.line)
-                if right_value == 0:
-                    raise ScriptRuntimeError("Division by zero.", line=expression.line)
-                return self._to_number(left, line=expression.line) / right_value
-            if op == "%":
-                right_value = self._to_number(right, line=expression.line)
-                if right_value == 0:
-                    raise ScriptRuntimeError("Modulo by zero.", line=expression.line)
-                return self._to_number(left, line=expression.line) % right_value
-            if op == "==":
-                return left == right
-            if op == "!=":
-                return left != right
-            if op == "<":
-                return self._to_number(left, line=expression.line) < self._to_number(right, line=expression.line)
-            if op == "<=":
-                return self._to_number(left, line=expression.line) <= self._to_number(right, line=expression.line)
-            if op == ">":
-                return self._to_number(left, line=expression.line) > self._to_number(right, line=expression.line)
-            if op == ">=":
-                return self._to_number(left, line=expression.line) >= self._to_number(right, line=expression.line)
-            raise ScriptRuntimeError(f"Unsupported binary operator: {op}", line=expression.line)
-
-        if isinstance(expression, CallExpr):
-            callee = self._evaluate(expression.callee, env)
-            args = [self._evaluate(item, env) for item in expression.args]
-            return self._call_callable(callee, args, line=expression.line)
-
-        if isinstance(expression, FunctionExpr):
-            return ScriptFunction(params=expression.params, body=expression.body, closure=env, name=None)
-
-        if isinstance(expression, ListExpr):
-            return [self._evaluate(item, env) for item in expression.items]
-
-        raise ScriptRuntimeError("Unsupported expression.", line=expression.line)
+                left_value = self._evaluate(left_expr, env)
+                right_value = self._evaluate(right_expr, env)
+                match operator:
+                    case "+":
+                        if isinstance(left_value, str) or isinstance(right_value, str):
+                            return f"{self._to_string(left_value)}{self._to_string(right_value)}"
+                        return self._to_number(left_value, line=line) + self._to_number(right_value, line=line)
+                    case "-":
+                        return self._to_number(left_value, line=line) - self._to_number(right_value, line=line)
+                    case "*":
+                        return self._to_number(left_value, line=line) * self._to_number(right_value, line=line)
+                    case "/":
+                        divider = self._to_number(right_value, line=line)
+                        if divider == 0:
+                            raise ScriptRuntimeError("Division by zero.", line=line)
+                        return self._to_number(left_value, line=line) / divider
+                    case "%":
+                        divider = self._to_number(right_value, line=line)
+                        if divider == 0:
+                            raise ScriptRuntimeError("Modulo by zero.", line=line)
+                        return self._to_number(left_value, line=line) % divider
+                    case "==":
+                        return left_value == right_value
+                    case "!=":
+                        return left_value != right_value
+                    case "<":
+                        return self._to_number(left_value, line=line) < self._to_number(right_value, line=line)
+                    case "<=":
+                        return self._to_number(left_value, line=line) <= self._to_number(right_value, line=line)
+                    case ">":
+                        return self._to_number(left_value, line=line) > self._to_number(right_value, line=line)
+                    case ">=":
+                        return self._to_number(left_value, line=line) >= self._to_number(right_value, line=line)
+                    case _:
+                        raise ScriptRuntimeError(f"Unsupported binary operator: {operator}", line=line)
+            case CallExpr(callee=callee_expr, args=args_expr, line=line):
+                callee = self._evaluate(callee_expr, env)
+                args = [self._evaluate(item, env) for item in args_expr]
+                return self._call_callable(callee, args, line=line)
+            case FunctionExpr(params=params, body=body):
+                return ScriptFunction(params=params, body=body, closure=env, name=None)
+            case ListExpr(items=items):
+                return [self._evaluate(item, env) for item in items]
+            case _:
+                raise ScriptRuntimeError("Unsupported expression.", line=expression.line)
 
     def _call_callable(self, callee: Any, args: list[Any], *, line: int) -> Any:
         if not isinstance(callee, ScriptCallable):

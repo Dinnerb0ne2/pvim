@@ -17,6 +17,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
         "config_file": "pvim.theme.default.json",
     },
+    "performance": {
+        "experimental_jit": True,
+        "lazy_load": True,
+        "profile_top_n": 25,
+    },
     "features": {
         "syntax_highlighting": {
             "enabled": True,
@@ -255,3 +260,12 @@ class AppConfig:
 
     def plugins_auto_load(self) -> bool:
         return _as_bool(self._lookup("features", "plugins", "auto_load", default=True), default=True)
+
+    def experimental_jit_enabled(self) -> bool:
+        return _as_bool(self._lookup("performance", "experimental_jit", default=True), default=True)
+
+    def lazy_load_enabled(self) -> bool:
+        return _as_bool(self._lookup("performance", "lazy_load", default=True), default=True)
+
+    def profile_top_n(self) -> int:
+        return _as_int(self._lookup("performance", "profile_top_n", default=25), default=25, minimum=5)

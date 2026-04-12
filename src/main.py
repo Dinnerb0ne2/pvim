@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import sys
 from typing import Iterable
 
 from . import APP_NAME, APP_VERSION
 from .core.config import AppConfig
-from .ui.editor import PviEditor
+from .ui.editor import PvimEditor
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
@@ -44,6 +45,9 @@ def main(argv: Iterable[str] | None = None) -> None:
     except Exception as exc:
         raise SystemExit(f"Config load failed: {exc}") from exc
 
+    if config.experimental_jit_enabled():
+        os.environ.setdefault("PYTHON_JIT", "1")
+
     required = _parse_version_tuple(config.required_python())
     if required is not None and sys.version_info[:3] < required:
         print(
@@ -53,5 +57,5 @@ def main(argv: Iterable[str] | None = None) -> None:
         )
 
     file_path = Path(args.file).expanduser() if args.file else None
-    editor = PviEditor(file_path=file_path, config=config)
+    editor = PvimEditor(file_path=file_path, config=config)
     editor.run()

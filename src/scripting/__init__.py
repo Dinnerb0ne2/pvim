@@ -1,4 +1,4 @@
-"""PVI script language parser and interpreter."""
+"""PVIM script language parser and interpreter."""
 
 from .errors import ScriptError, ScriptLexError, ScriptParseError, ScriptRuntimeError
 from .interpreter import Environment, ScriptInterpreter, ScriptFunction

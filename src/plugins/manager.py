@@ -48,6 +48,7 @@ class PluginManager:
         self._specs: dict[str, PluginSpec] = {}
         self._runtimes: dict[str, PluginRuntime] = {}
         self._errors: dict[str, str] = {}
+        self._ast_cache: dict[Path, tuple[int, Any]] = {}
 
         if self.enabled:
             self.plugins_root.mkdir(parents=True, exist_ok=True)
@@ -184,8 +185,7 @@ class PluginManager:
         if not path.exists():
             raise ScriptRuntimeError(f"Script not found: {path}", line=1)
 
-        source = path.read_text(encoding="utf-8")
-        program = Parser.parse_script(source)
+        program = self._load_program(path)
 
         interpreter = ScriptInterpreter(step_limit=self.step_limit)
         interpreter.register_native("api", self._native_api)
@@ -239,8 +239,7 @@ class PluginManager:
         return hasattr(value, "call")
 
     def _create_runtime(self, spec: PluginSpec) -> PluginRuntime:
-        source = spec.entry_path.read_text(encoding="utf-8")
-        program = Parser.parse_script(source)
+        program = self._load_program(spec.entry_path)
 
         interpreter = ScriptInterpreter(step_limit=self.step_limit)
         interpreter.register_native("api", self._native_api)
@@ -257,6 +256,18 @@ class PluginManager:
         )
         interpreter.execute(program, env)
         return runtime
+
+    def _load_program(self, path: Path) -> Any:
+        entry = path.resolve()
+        stat = entry.stat()
+        fingerprint = int(stat.st_mtime_ns)
+        cached = self._ast_cache.get(entry)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
+        source = entry.read_text(encoding="utf-8")
+        program = Parser.parse_script(source)
+        self._ast_cache[entry] = (fingerprint, program)
+        return program
 
     def _native_print(self, args: list[Any], line: int) -> str:
         return " ".join(str(item) for item in args)
