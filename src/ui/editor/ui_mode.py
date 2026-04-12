@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from .modes import MODE_INSERT, MODE_NORMAL
 
 
@@ -143,7 +141,7 @@ class UIModeMixin:
             selected = self._file_tree_feature.selected_path()
             if not selected:
                 return
-            if self.open_file(Path.cwd() / selected, force=False):
+            if self.open_file(self._workspace_root / selected, force=False):
                 self._close_explorer()
 
     def _handle_completion_key(self, key: str) -> None:

@@ -5,9 +5,12 @@ PVIM 是一个基于 **Python 3.14.3**、纯标准库实现的终端编辑器。
 ## 核心能力
 
 - asyncio 异步调度与外部进程管道（不阻塞渲染）
+- 跨平台终端输入层（Windows / Linux / macOS）
 - 预测性渲染（输入优先，后台状态低优先级回填）
 - Layout Manager + Feature Registry（Tabline / Winbar / Statusline 动态布局）
 - 文件树、Tab 补全、Git 控制可插拔模块
+- 可选 LSP 客户端（配置命令后支持定义跳转/悬浮/补全）
+- 工作区根目录自动检测（.git / pyproject.toml / package.json）
 - 子进程刷新版本号丢弃机制（只接收最新结果）
 - 虚拟文本叠加层与浮动窗口
 - PieceTable 底层结构（大文件编辑基础）
@@ -22,6 +25,15 @@ python pvim.py
 python pvim.py your_file.py
 python pvim.py your_file.py --config pvim.config.json
 ```
+
+## LSP（可选）
+
+在 `pvim.config.json` 的 `features.lsp` 中设置 `command` 后可启用：
+
+- `gd`：跳转定义（优先 LSP，失败回退本地搜索）
+- `K`：悬浮文档
+- `:lsp status|start|stop`：查看/控制 LSP 会话
+- `:diag`：查看当前文件的 LSP 诊断列表
 
 ## 目录
 

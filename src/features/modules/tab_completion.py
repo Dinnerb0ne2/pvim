@@ -17,10 +17,16 @@ class TabCompletionFeature:
         self.scroll = 0
         self.title = "COMPLETION"
 
-    def open(self, query: str, lines: Iterable[str], ast_hint: str = "") -> None:
+    def open(
+        self,
+        query: str,
+        lines: Iterable[str],
+        ast_hint: str = "",
+        extra_candidates: Iterable[str] = (),
+    ) -> None:
         if not self.enabled:
             return
-        candidates = self._collect_candidates(lines, ast_hint)
+        candidates = self._collect_candidates(lines, ast_hint, extra_candidates)
         self.items = self._filter(query, candidates, limit=30)
         self.selected = 0
         self.scroll = 0
@@ -52,7 +58,12 @@ class TabCompletionFeature:
         end = min(len(self.items), self.scroll + rows)
         return self.items[self.scroll : end]
 
-    def _collect_candidates(self, lines: Iterable[str], ast_hint: str) -> list[str]:
+    def _collect_candidates(
+        self,
+        lines: Iterable[str],
+        ast_hint: str,
+        extra_candidates: Iterable[str],
+    ) -> list[str]:
         bucket: set[str] = set()
         for line in lines:
             for match in WORD_RE.findall(line):
@@ -61,6 +72,10 @@ class TabCompletionFeature:
         for item in WORD_RE.findall(ast_hint):
             if len(item) >= 2:
                 bucket.add(item)
+        for item in extra_candidates:
+            clean = str(item).strip()
+            if len(clean) >= 2:
+                bucket.add(clean)
         return sorted(bucket, key=lambda item: (len(item), item.lower()))
 
     def _filter(self, query: str, candidates: list[str], *, limit: int) -> list[tuple[str, list[int]]]:

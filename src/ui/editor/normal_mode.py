@@ -196,6 +196,13 @@ class NormalModeMixin:
             self._set_message("g")
             return
 
+        if key == "K":
+            self._show_hover()
+            self.pending_operator = ""
+            self.pending_scope = ""
+            self._pending_motion = ""
+            return
+
         if key == ":":
             self._enter_command()
             return

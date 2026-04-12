@@ -84,7 +84,7 @@ class CommandsMixin:
 
         if cmd in {"help", "h"}:
             self._set_message(
-                "Commands: :w :q :e :find :replace :rename :format :fuzzy :grep :tree :feature :session :swap :keys :script :plugin :proc :virtual :ast :profile :piece :termcaps"
+                "Commands: :w :q :e :find :replace :rename :format :fuzzy :grep :tree :feature :workspace :session :swap :keys :script :plugin :proc :virtual :ast :profile :piece :termcaps :lsp :diag"
             )
             return
 
@@ -144,6 +144,14 @@ class CommandsMixin:
             self._open_live_grep(" ".join(args))
             return
 
+        if cmd in {"workspace", "project"}:
+            self._set_message(f"Workspace: {self._workspace_root}")
+            return
+
+        if cmd in {"diag", "diagnostic", "diagnostics"}:
+            self._show_lsp_diagnostics()
+            return
+
         if cmd in {"files-refresh", "refresh-files"}:
             self.file_index.refresh(force=True)
             self._set_message("File index refreshed.")
@@ -165,6 +173,37 @@ class CommandsMixin:
                 self._profile_script_file(args[1])
                 return
             self._set_message("Usage: :profile script <path>", error=True)
+            return
+
+        if cmd == "lsp":
+            action = args[0] if args else "status"
+            if action == "status":
+                if not self._lsp_enabled:
+                    self._set_message("LSP: disabled")
+                    return
+                if not self._lsp_command:
+                    self._set_message("LSP: command not configured", error=True)
+                    return
+                running = self._lsp_client.running if self._lsp_client is not None else False
+                state = "running" if running else "idle"
+                self._set_message(f"LSP: {state} ({' '.join(self._lsp_command)})")
+                return
+            if action == "start":
+                client = self._ensure_lsp_ready(show_error=True)
+                if client is not None:
+                    self._set_message("LSP started.")
+                return
+            if action == "stop":
+                if self._lsp_client is None:
+                    self._set_message("LSP: not running.")
+                    return
+                try:
+                    self._async_runtime.run_sync(self._lsp_client.stop(), timeout=self._lsp_timeout_seconds)
+                    self._set_message("LSP stopped.")
+                except Exception as exc:
+                    self._set_message(f"LSP stop failed: {exc}", error=True)
+                return
+            self._set_message("Usage: :lsp status|start|stop  (:diag to show diagnostics)", error=True)
             return
 
         if cmd == "plugin":

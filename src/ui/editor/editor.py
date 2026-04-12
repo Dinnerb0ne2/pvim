@@ -28,6 +28,7 @@ from ...features.file_index import FileIndex
 from ...features.formatter import normalize_code_style, organize_python_imports
 from ...features.fuzzy import fuzzy_filter
 from ...features.git_status import GitStatusProvider
+from ...features.lsp import LspClient
 from ...features.live_grep import GrepMatch, LiveGrep
 from ...features.modules import FileTreeFeature, GitControlFeature, TabCompletionFeature
 from ...features.modules.git_control import GitSnapshot
@@ -67,6 +68,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
 
         self.buffer = Buffer(lines=[""])
         self.file_path: Path | None = None
+        self._workspace_root = Path.cwd().resolve()
 
         self.cx = 0
         self.cy = 0
@@ -98,6 +100,10 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._live_grep_task_active = False
         self._live_grep_query = ""
         self._live_grep_mode = False
+        self._lsp_enabled = False
+        self._lsp_command: list[str] = []
+        self._lsp_timeout_seconds = 1.2
+        self._lsp_client: LspClient | None = None
 
         self._history = HistoryStack(max_actions=400)
         self._history_enabled = True
@@ -167,8 +173,8 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self.theme: Theme = load_theme(None, self._terminal_capabilities)
         self.syntax: SyntaxManager | None = None
         self._syntax_profile = PLAIN_PROFILE
-        self.file_index = FileIndex(Path.cwd(), max_files=3000)
-        self.git = GitStatusProvider(Path.cwd(), enabled=False, refresh_seconds=2.0)
+        self.file_index = FileIndex(self._workspace_root, max_files=3000)
+        self.git = GitStatusProvider(self._workspace_root, enabled=False, refresh_seconds=2.0)
         self._ast_query_service: AstQueryService | None = None
         self._file_tree_feature = FileTreeFeature(enabled=False)
         self._completion_feature = TabCompletionFeature(enabled=False)
@@ -304,6 +310,9 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._file_tree_feature.enabled = self.config.feature_enabled("file_tree")
         self._completion_feature.enabled = self.config.feature_enabled("tab_completion")
         self._git_control_feature.enabled = self.config.feature_enabled("git_control")
+        self._lsp_enabled = self.config.lsp_enabled()
+        self._lsp_command = self.config.lsp_command()
+        self._lsp_timeout_seconds = self.config.lsp_timeout_seconds()
         self._tab_items = [self.file_path.name] if self.file_path else ["[No Name]"]
         self._current_tab_index = 0
         if not self._file_tree_feature.enabled:
@@ -312,6 +321,11 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._close_tab_completion()
         if not self.config.feature_enabled("notifications"):
             self._notifications = NotificationCenter()
+        if (not self._lsp_enabled or not self._lsp_command) and self._lsp_client is not None:
+            try:
+                self._async_runtime.run_sync(self._lsp_client.stop(), timeout=0.8)
+            except Exception:
+                pass
 
         theme_file = self.config.theme_file() if self.config.theme_enabled() else None
         self.theme = load_theme(theme_file, self._terminal_capabilities)
@@ -322,9 +336,11 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self.syntax = SyntaxManager(self.config)
             self._syntax_profile = self.syntax.profile_for_file(self.file_path)
 
-        self.file_index = FileIndex(Path.cwd(), max_files=self.config.file_scan_limit())
+        anchor = self.file_path if self.file_path is not None else self._workspace_root
+        self._workspace_root = self._detect_workspace_root(anchor)
+        self.file_index = FileIndex(self._workspace_root, max_files=self.config.file_scan_limit())
         self.git = GitStatusProvider(
-            Path.cwd(),
+            self._workspace_root,
             enabled=self.config.feature_enabled("git_status"),
             refresh_seconds=self.config.git_refresh_seconds(),
         )
@@ -583,6 +599,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             "  Ctrl+Left / Ctrl+Right move by word",
             "  Tab / Shift+Tab indent / outdent",
             "  u undo / Ctrl+Y redo",
+            "  gd goto definition (LSP/fallback)",
             "  q a ... q record macro / @a replay",
             "  ciw da\" vap cif text objects",
             "",
@@ -593,6 +610,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             "  Ctrl+P fuzzy finder",
             "  :grep <text> project search",
             "  Ctrl+R rename symbol",
+            "  K hover docs (when LSP enabled)",
             "  F3 file tree",
             "  F4 toggle sidebar",
             "  F8 normalize code style",
@@ -619,10 +637,13 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             "  :profile script <path>",
             "  :piece",
             "  :termcaps",
+            "  :workspace",
             "  :session save|load",
             "  :swap write|clear",
             "  :tree open|refresh|close|toggle",
             "  :feature <name> <on|off>",
+            "  :lsp status|start|stop",
+            "  :diag show LSP diagnostics",
         ]
         return lines
 
@@ -829,7 +850,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
 
         async def _search() -> tuple[int, str, list[GrepMatch]]:
             matches = await self._live_grep.search(
-                Path.cwd(),
+                self._workspace_root,
                 query,
                 limit=self.config.live_grep_max_results(),
             )
@@ -962,7 +983,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                     self._live_grep_query = query
                     self._live_grep_matches = matches
                     if self._floating_source == "live_grep" and self._floating_list is not None:
-                        labels = [match.label(Path.cwd()) for match in matches]
+                        labels = [match.label(self._workspace_root) for match in matches]
                         if not labels:
                             labels = ["(no matches)"]
                         self._floating_list.set_items(labels)
@@ -1001,6 +1022,138 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._ast_query_service = AstQueryService()
         return self._ast_query_service
 
+    def _language_id_for_file(self, path: Path | None) -> str:
+        if path is None:
+            return "plaintext"
+        extension = path.suffix.lower()
+        mapping = {
+            ".py": "python",
+            ".js": "javascript",
+            ".ts": "typescript",
+            ".tsx": "typescriptreact",
+            ".jsx": "javascriptreact",
+            ".json": "json",
+            ".go": "go",
+            ".rs": "rust",
+            ".java": "java",
+            ".c": "c",
+            ".h": "c",
+            ".cpp": "cpp",
+            ".hpp": "cpp",
+            ".md": "markdown",
+            ".html": "html",
+            ".css": "css",
+            ".sh": "shellscript",
+        }
+        return mapping.get(extension, "plaintext")
+
+    def _ensure_lsp_ready(self, *, show_error: bool) -> LspClient | None:
+        if not self._lsp_enabled:
+            if show_error:
+                self._set_message("LSP is disabled in config.", error=True)
+            return None
+        if not self._lsp_command:
+            if show_error:
+                self._set_message("LSP command is not configured.", error=True)
+            return None
+        if self.file_path is None:
+            if show_error:
+                self._set_message("No file path for LSP.", error=True)
+            return None
+
+        if self._lsp_client is None:
+            self._lsp_client = LspClient()
+
+        client = self._lsp_client
+        language_id = self._language_id_for_file(self.file_path)
+        try:
+            self._async_runtime.run_sync(
+                client.ensure_started(self._lsp_command, self._workspace_root),
+                timeout=self._lsp_timeout_seconds,
+            )
+            self._async_runtime.run_sync(
+                client.sync_document(self.file_path, self.lines, language_id),
+                timeout=self._lsp_timeout_seconds,
+            )
+        except Exception as exc:
+            if show_error:
+                self._set_message(f"LSP unavailable: {exc}", error=True)
+            return None
+        return client
+
+    def _goto_definition_lsp(self, symbol: str) -> bool:
+        client = self._ensure_lsp_ready(show_error=False)
+        if client is None or self.file_path is None:
+            return False
+        try:
+            locations = self._async_runtime.run_sync(
+                client.definition(self.file_path, self.cy, self.cx),
+                timeout=self._lsp_timeout_seconds,
+            )
+        except Exception:
+            return False
+        if not locations:
+            return False
+        target_path, line, col = locations[0]
+        if not self.open_file(target_path, force=False):
+            return False
+        self.cy = clamp(line - 1, 0, len(self.lines) - 1)
+        self.cx = clamp(col - 1, 0, len(self._line()))
+        self._set_message(f"LSP definition: {symbol}")
+        return True
+
+    def _show_hover(self) -> None:
+        symbol = word_at_cursor(self._line(), self.cx)
+        if not symbol:
+            self._set_message("No symbol under cursor.", error=True)
+            return
+        client = self._ensure_lsp_ready(show_error=True)
+        if client is None or self.file_path is None:
+            return
+        try:
+            text = self._async_runtime.run_sync(
+                client.hover(self.file_path, self.cy, self.cx),
+                timeout=self._lsp_timeout_seconds,
+            )
+        except Exception as exc:
+            self._set_message(f"LSP hover failed: {exc}", error=True)
+            return
+        if not text:
+            self._set_message(f"No hover docs: {symbol}", error=True)
+            return
+        self._show_alert(text[:7000])
+
+    def _show_lsp_diagnostics(self) -> None:
+        client = self._ensure_lsp_ready(show_error=True)
+        if client is None or self.file_path is None:
+            return
+        try:
+            items = self._async_runtime.run_sync(
+                client.diagnostics(self.file_path),
+                timeout=self._lsp_timeout_seconds,
+            )
+        except Exception as exc:
+            self._set_message(f"LSP diagnostics failed: {exc}", error=True)
+            return
+        if not items:
+            self._set_message("No diagnostics.")
+            return
+        rendered = "\n".join(items[:240])
+        self._show_alert(rendered[:7000])
+
+    def _lsp_completion_candidates(self) -> list[str]:
+        client = self._ensure_lsp_ready(show_error=False)
+        if client is None or self.file_path is None:
+            return []
+        try:
+            items = self._async_runtime.run_sync(
+                client.completion(self.file_path, self.cy, self.cx),
+                timeout=self._lsp_timeout_seconds,
+            )
+        except Exception:
+            return []
+        return [item for item in items if item.strip()]
+
     def _syntax_manager(self) -> SyntaxManager:
         if self.syntax is None:
             self.syntax = SyntaxManager(self.config)
@@ -1012,7 +1165,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._file_tree_running_version = version
 
         async def _collect() -> tuple[int, list[str]]:
-            paths = await self._file_tree_feature.collect_paths(Path.cwd())
+            paths = await self._file_tree_feature.collect_paths(self._workspace_root)
             return version, paths
 
         self._async_runtime.submit("feature:file-tree", _collect())
@@ -1031,7 +1184,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._git_control_running_version = version
 
         async def _collect() -> tuple[int, str, GitSnapshot]:
-            snapshot = await self._git_control_feature.collect(Path.cwd(), target)
+            snapshot = await self._git_control_feature.collect(self._workspace_root, target)
             target_str = str(target) if target is not None else ""
             return version, target_str, snapshot
 
@@ -1062,12 +1215,22 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                 self._show_alert(result)
                 break
 
+    def _detect_workspace_root(self, anchor: Path | None) -> Path:
+        base = anchor if anchor is not None else self._workspace_root
+        start = base if base.is_dir() else base.parent
+        start = start.resolve()
+        markers = (".git", ".pvim.project.json", "pyproject.toml", "package.json")
+        for candidate in (start, *start.parents):
+            if any((candidate / marker).exists() for marker in markers):
+                return candidate
+        return start
+
     def _resolve_path(self, target: Path | str) -> Path:
         path = Path(target).expanduser()
         if path.is_absolute():
             return path
 
-        base = self.file_path.parent if self.file_path else Path.cwd()
+        base = self.file_path.parent if self.file_path else self._workspace_root
         return (base / path).resolve()
 
     def _terminal_size(self) -> tuple[int, int]:
@@ -1539,6 +1702,9 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._set_message("No symbol under cursor.", error=True)
             return
 
+        if self._goto_definition_lsp(symbol):
+            return
+
         pattern = re.compile(rf"^\s*(def|class)\s+{re.escape(symbol)}\b")
         for index, line in enumerate(self.lines):
             if pattern.search(line):
@@ -1549,7 +1715,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
 
         self.file_index.refresh()
         for relative in self.file_index.list_files()[:2000]:
-            path = Path.cwd() / relative
+            path = self._workspace_root / relative
             if self.file_path is not None and path.resolve() == self.file_path.resolve():
                 continue
             try:
@@ -1684,7 +1850,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             return
         if self._floating_list is not None:
             self.fuzzy_index = self._floating_list.selected
-        target = Path.cwd() / self.fuzzy_matches[self.fuzzy_index]
+        target = self._workspace_root / self.fuzzy_matches[self.fuzzy_index]
         if self.open_file(target, force=False):
             self.mode = MODE_NORMAL
             self.fuzzy_query = ""
@@ -1766,6 +1932,55 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                 out.append(char)
         return "".join(out)
 
+    def _snippet_completion_candidates(self, prefix: str) -> list[str]:
+        language = self._syntax_profile.name.lower()
+        shared = {
+            "if",
+            "for",
+            "while",
+            "try",
+            "with",
+            "class",
+            "def",
+            "return",
+            "import",
+            "from",
+        }
+        if language == "python":
+            shared.update({"lambda", "yield", "async", "await", "except"})
+        elif language in {"javascript", "typescript"}:
+            shared.update({"function", "const", "let", "export", "interface"})
+        clean = prefix.strip().lower()
+        if not clean:
+            return sorted(shared)
+        return sorted(item for item in shared if item.lower().startswith(clean))
+
+    def _path_completion_candidates(self, prefix: str) -> list[str]:
+        clean = prefix.strip()
+        if len(clean) < 1:
+            return []
+        root = self.file_path.parent if self.file_path is not None else self._workspace_root
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            return []
+        out: list[str] = []
+        for entry in entries:
+            name = entry.name
+            if not name.startswith(clean):
+                continue
+            out.append(f"{name}/" if entry.is_dir() else name)
+            if len(out) >= 40:
+                break
+        return out
+
+    def _completion_extra_candidates(self, prefix: str) -> list[str]:
+        bucket: set[str] = set()
+        bucket.update(self._snippet_completion_candidates(prefix))
+        bucket.update(self._path_completion_candidates(prefix))
+        bucket.update(self._lsp_completion_candidates())
+        return sorted(item for item in bucket if item and len(item) >= 2)
+
     def _open_tab_completion(self) -> bool:
         if not self._completion_feature.enabled:
             return False
@@ -1781,7 +1996,12 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                 node = None
             if node is not None:
                 ast_hint = f"{node.kind} {node.name or ''}"
-        self._completion_feature.open(prefix, self.lines, ast_hint)
+        self._completion_feature.open(
+            prefix,
+            self.lines,
+            ast_hint,
+            extra_candidates=self._completion_extra_candidates(prefix),
+        )
         if not self._completion_feature.visible:
             return False
         self._completion_prefix = prefix
@@ -2120,6 +2340,13 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._current_line_ending = self.config.default_line_ending()
 
         self.file_path = path
+        self._workspace_root = self._detect_workspace_root(path)
+        self.file_index = FileIndex(self._workspace_root, max_files=self.config.file_scan_limit())
+        self.git = GitStatusProvider(
+            self._workspace_root,
+            enabled=self.config.feature_enabled("git_status"),
+            refresh_seconds=self.config.git_refresh_seconds(),
+        )
         self.lines = text.split("\n")
         if not self.lines:
             self.lines = [""]
@@ -2152,6 +2379,13 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
     def save_file(self, target: Path | str | None = None) -> bool:
         if target is not None:
             self.file_path = self._resolve_path(target)
+            self._workspace_root = self._detect_workspace_root(self.file_path)
+            self.file_index = FileIndex(self._workspace_root, max_files=self.config.file_scan_limit())
+            self.git = GitStatusProvider(
+                self._workspace_root,
+                enabled=self.config.feature_enabled("git_status"),
+                refresh_seconds=self.config.git_refresh_seconds(),
+            )
 
         if self.file_path is None:
             self._set_message("No file name. Use :w <path>.", error=True)
@@ -2447,7 +2681,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         if self.file_path is None:
             return None
         try:
-            return self.file_path.resolve().relative_to(Path.cwd().resolve())
+            return self.file_path.resolve().relative_to(self._workspace_root.resolve())
         except ValueError:
             return None
 
@@ -2963,6 +3197,11 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         finally:
             self._save_session()
             self._write_swap_if_needed(force=True)
+            if self._lsp_client is not None:
+                try:
+                    self._async_runtime.run_sync(self._lsp_client.stop(), timeout=0.8)
+                except Exception:
+                    pass
             self._async_runtime.close()
             self._console.exit()
 

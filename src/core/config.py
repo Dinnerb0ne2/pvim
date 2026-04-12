@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -69,6 +70,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "enabled": True,
             "max_results": 200,
         },
+        "lsp": {
+            "enabled": False,
+            "command": [],
+            "timeout_seconds": 1.2,
+        },
         "text_objects": {
             "enabled": True,
         },
@@ -113,16 +119,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "enabled": False,
         },
         "tab_completion": {
-            "enabled": False,
+            "enabled": True,
         },
         "git_control": {
-            "enabled": False,
+            "enabled": True,
         },
         "notifications": {
             "enabled": False,
         },
         "git_status": {
-            "enabled": False,
+            "enabled": True,
             "refresh_seconds": 2.0,
         },
         "refactor_tools": {
@@ -336,6 +342,31 @@ class AppConfig:
             self._lookup("features", "live_grep", "max_results", default=200),
             default=200,
             minimum=20,
+        )
+
+    def lsp_enabled(self) -> bool:
+        return self.feature_enabled("lsp")
+
+    def lsp_command(self) -> list[str]:
+        value = self._lookup("features", "lsp", "command", default=[])
+        if isinstance(value, str):
+            return [item for item in shlex.split(value) if item.strip()]
+        if isinstance(value, list):
+            parsed: list[str] = []
+            for item in value:
+                if not isinstance(item, str):
+                    continue
+                clean = item.strip()
+                if clean:
+                    parsed.append(clean)
+            return parsed
+        return []
+
+    def lsp_timeout_seconds(self) -> float:
+        return _as_float(
+            self._lookup("features", "lsp", "timeout_seconds", default=1.2),
+            default=1.2,
+            minimum=0.2,
         )
 
     def text_objects_enabled(self) -> bool:

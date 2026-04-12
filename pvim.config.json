@@ -62,6 +62,11 @@
       "enabled": true,
       "max_results": 200
     },
+    "lsp": {
+      "enabled": false,
+      "command": [],
+      "timeout_seconds": 1.2
+    },
     "text_objects": {
       "enabled": true
     },
@@ -106,16 +111,16 @@
       "enabled": false
     },
     "tab_completion": {
-      "enabled": false
+      "enabled": true
     },
     "git_control": {
-      "enabled": false
+      "enabled": true
     },
     "notifications": {
       "enabled": false
     },
     "git_status": {
-      "enabled": false,
+      "enabled": true,
       "refresh_seconds": 2.0
     },
     "refactor_tools": {

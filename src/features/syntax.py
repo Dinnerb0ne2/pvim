@@ -174,6 +174,7 @@ class SyntaxManager:
     ) -> str:
         out: list[str] = []
         cursor = 0
+        previous_token = ""
         for match in TOKEN_RE.finditer(segment):
             start, end = match.span()
             if start > cursor:
@@ -186,12 +187,23 @@ class SyntaxManager:
                 style = theme.syntax_style("keyword")
             elif token in profile.builtins:
                 style = theme.syntax_style("builtin")
+            elif previous_token == "def":
+                style = theme.syntax_style("function")
+            elif previous_token == "class":
+                style = theme.syntax_style("type")
+            else:
+                probe = end
+                while probe < len(segment) and segment[probe].isspace():
+                    probe += 1
+                if probe < len(segment) and segment[probe] == "(":
+                    style = theme.syntax_style("function")
 
             if style:
                 out.append(f"{style}{token}{base_style}")
             else:
                 out.append(token)
             cursor = end
+            previous_token = token
 
         if cursor < len(segment):
             out.append(segment[cursor:])
