@@ -107,6 +107,10 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._lsp_timeout_seconds = 1.2
         self._lsp_client: LspClient | None = None
         self._lsp_code_actions: list[dict[str, Any]] = []
+        self._lsp_nav_locations: list[tuple[Path, int, int]] = []
+        self._jump_back_stack: list[tuple[str, int, int, int, int]] = []
+        self._jump_forward_stack: list[tuple[str, int, int, int, int]] = []
+        self._jump_history_limit = 240
 
         self._history = HistoryStack(max_actions=400)
         self._history_enabled = True
@@ -134,6 +138,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._swap_prompt_payload: SwapPayload | None = None
         self._session_enabled = True
         self._session_path = Path.cwd() / ".pvim.session.json"
+        self._session_profiles_dir = Path.cwd() / ".pvim.sessions"
         self._soft_wrap_enabled = True
 
         self.key_hints_enabled = True
@@ -157,6 +162,10 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._async_runtime = AsyncRuntime()
         self._process_manager = AsyncProcessManager(self._async_runtime)
         self._last_tick = time.monotonic()
+        self._config_watch_enabled = True
+        self._config_watch_interval = 1.0
+        self._last_config_watch = 0.0
+        self._config_watch_mtimes: dict[str, int] = {}
         self._feature_registry = FeatureRegistry()
         self._layout_manager = LayoutManager(self._feature_registry)
         self._notifications = NotificationCenter()
@@ -329,6 +338,9 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._current_encoding = self._encoding_candidates[0]
         self._session_enabled = self.config.session_enabled()
         self._session_path = self.config.session_file()
+        self._session_profiles_dir = self.config.session_profiles_directory()
+        self._config_watch_enabled = self.config.config_reload_enabled()
+        self._config_watch_interval = self.config.config_reload_interval_seconds()
         self._history_enabled = self.config.undo_tree_enabled()
         self._history.set_limit(self.config.undo_tree_max_actions())
         self._feature_registry.set_enabled("tabline", self.config.feature_enabled("tabline"))
@@ -394,6 +406,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._auto_pairs = self._load_auto_pairs()
         self._auto_pair_closers = set(self._auto_pairs.values())
         self._file_tree_feature.unicode_art = self._unicode_ui
+        self._config_watch_mtimes = self._snapshot_config_mtimes()
 
     def _load_auto_pairs(self) -> dict[str, str]:
         defaults = {
@@ -425,6 +438,65 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                 parsed[key] = value
 
         return parsed or defaults
+
+    def _config_watch_paths(self) -> list[Path]:
+        candidates: list[Path | None] = [
+            self.config.path,
+            self.config.theme_file() if self.config.theme_enabled() else None,
+            self.config.syntax_language_map_file(),
+            self.config.syntax_default_file(),
+            self.config.auto_pairs_file(),
+        ]
+        unique: list[Path] = []
+        seen: set[str] = set()
+        for path in candidates:
+            if path is None:
+                continue
+            key = str(path.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(path.resolve())
+        return unique
+
+    def _snapshot_config_mtimes(self) -> dict[str, int]:
+        snapshot: dict[str, int] = {}
+        for path in self._config_watch_paths():
+            key = str(path)
+            try:
+                snapshot[key] = path.stat().st_mtime_ns
+            except OSError:
+                snapshot[key] = -1
+        return snapshot
+
+    def _poll_config_reload(self) -> None:
+        if not self._config_watch_enabled:
+            return
+        now = time.monotonic()
+        if now - self._last_config_watch < self._config_watch_interval:
+            return
+        self._last_config_watch = now
+
+        current = self._snapshot_config_mtimes()
+        if not self._config_watch_mtimes:
+            self._config_watch_mtimes = current
+            return
+        changed = set(current.keys()) != set(self._config_watch_mtimes.keys())
+        if not changed:
+            for key, value in current.items():
+                if self._config_watch_mtimes.get(key) != value:
+                    changed = True
+                    break
+        if not changed:
+            return
+
+        try:
+            self.config = AppConfig.load(self.config.path)
+            self._apply_runtime_config()
+            self._set_message("Configuration reloaded (detected file changes).")
+        except Exception as exc:
+            self._set_message(f"Config auto-reload failed: {exc}", error=True)
+            self._config_watch_mtimes = current
 
     def _plugin_api_dispatch(self, object_id: int, action: str, args: list[object]) -> object:
         if action == "message":
@@ -628,7 +700,9 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             "  Ctrl+U clear multi-cursor",
             "  Ctrl+Left / Ctrl+Right move by word",
             "  Tab / Shift+Tab indent / outdent",
+            "  % jump to matching bracket",
             "  u undo / Ctrl+Y redo",
+            "  Ctrl+O / gb jump back, gf jump forward",
             "  gd goto definition (LSP/fallback)",
             "  q a ... q record macro / @a replay",
             "  ciw da\" vap cif text objects",
@@ -640,6 +714,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             "  Ctrl+P fuzzy finder",
             "  :grep <text> project search",
             "  :findre / :replacere / :replaceallre regex search-replace",
+            "  :replaceproj / :replaceprojre project-wide replace",
             "  Ctrl+R rename symbol",
             "  K hover docs (when LSP enabled)",
             "  ga code action (LSP)",
@@ -674,12 +749,15 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             "  :project <dir> open folder workspace",
             "  :split / :vsplit / :only / :wincmd w|h|l|q",
             "  :term [cmd] built-in terminal panel",
+            "  :git status|diff|blame|stage|unstage|branches|checkout",
             "  :encoding [name]",
-            "  :session save|load",
+            "  :session save|load|list  (optional profile name)",
             "  :swap write|clear",
             "  :tree open|refresh|close|toggle  (- fold in explorer)",
             "  :feature <name> <on|off>",
-            "  :lsp status|start|stop",
+            "  :syntax reload",
+            "  :jump back|forward|list",
+            "  :lsp status|start|stop|refs|impl|symbols|wsymbol|rename|format",
             "  :diag show LSP diagnostics",
         ]
         return lines
@@ -884,10 +962,39 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._swap_prompt_payload = None
         self._close_alert()
 
-    def _restore_session(self) -> None:
-        data = self._persistence.load_session(self._session_path)
+    def _session_payload(self) -> dict[str, object]:
+        return {
+            "current_file": str(self.file_path) if self.file_path else "",
+            "cursor_x": self.cx,
+            "cursor_y": self.cy,
+            "tabs": list(self._tab_items),
+            "tab_index": self._current_tab_index,
+            "workspace_root": str(self._workspace_root),
+        }
+
+    def _sanitize_session_name(self, name: str) -> str:
+        cleaned = "".join(ch for ch in name.strip() if ch.isalnum() or ch in {"_", "-", "."})
+        return cleaned.strip(" .")
+
+    def _session_profile_path(self, name: str) -> Path | None:
+        clean = self._sanitize_session_name(name)
+        if not clean:
+            return None
+        return (self._session_profiles_dir / f"{clean}.json").resolve()
+
+    def _session_profile_names(self) -> list[str]:
+        path = self._session_profiles_dir
+        try:
+            entries = list(path.glob("*.json"))
+        except OSError:
+            return []
+        names = sorted({entry.stem for entry in entries if entry.is_file() and entry.stem.strip()})
+        return names
+
+    def _restore_session_from(self, session_path: Path) -> bool:
+        data = self._persistence.load_session(session_path)
         if not data:
-            return
+            return False
         project_root = data.get("workspace_root")
         if isinstance(project_root, str) and project_root:
             project_path = Path(project_root)
@@ -909,22 +1016,22 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         current_index = data.get("tab_index")
         if isinstance(current_index, int):
             self._current_tab_index = clamp(current_index, 0, max(0, len(self._tab_items) - 1))
+        return True
+
+    def _restore_session(self) -> None:
+        self._restore_session_from(self._session_path)
+
+    def _save_session_to(self, session_path: Path) -> bool:
+        if not self._session_enabled:
+            return False
+        try:
+            self._persistence.save_session(session_path, self._session_payload())
+        except OSError:
+            return False
+        return True
 
     def _save_session(self) -> None:
-        if not self._session_enabled:
-            return
-        payload = {
-            "current_file": str(self.file_path) if self.file_path else "",
-            "cursor_x": self.cx,
-            "cursor_y": self.cy,
-            "tabs": list(self._tab_items),
-            "tab_index": self._current_tab_index,
-            "workspace_root": str(self._workspace_root),
-        }
-        try:
-            self._persistence.save_session(self._session_path, payload)
-        except OSError:
-            return
+        self._save_session_to(self._session_path)
 
     def _start_live_grep_task(self, version: int, query: str) -> None:
         self._live_grep_task_active = True
@@ -968,6 +1075,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         if index < 0 or index >= len(self._live_grep_matches):
             return
         match = self._live_grep_matches[index]
+        self._record_jump_origin()
         if self.open_file(match.file_path, force=False):
             self.cy = clamp(match.line - 1, 0, len(self.lines) - 1)
             self.cx = clamp(match.column - 1, 0, len(self._line()))
@@ -1187,6 +1295,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         if not locations:
             return False
         target_path, line, col = locations[0]
+        self._record_jump_origin()
         if not self.open_file(target_path, force=False):
             return False
         self.cy = clamp(line - 1, 0, len(self.lines) - 1)
@@ -1233,6 +1342,184 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         rendered = "\n".join(items[:240])
         self._show_alert(rendered[:7000])
 
+    def _location_label(self, path: Path, line: int, col: int, *, prefix: str = "") -> str:
+        try:
+            relative = path.resolve().relative_to(self._workspace_root.resolve())
+            base = str(relative)
+        except ValueError:
+            base = str(path)
+        core = f"{base}:{max(1, line)}:{max(1, col)}"
+        return f"{prefix} {core}".strip()
+
+    def _open_lsp_navigation(
+        self,
+        title: str,
+        locations: list[tuple[Path, int, int]],
+        *,
+        labels: list[str] | None = None,
+    ) -> None:
+        if not locations:
+            self._set_message(f"{title}: no result.")
+            return
+        self._lsp_nav_locations = locations
+        rendered = labels if labels is not None else [self._location_label(path, line, col) for path, line, col in locations]
+        if len(rendered) != len(locations):
+            rendered = [self._location_label(path, line, col) for path, line, col in locations]
+        self._floating_list = FloatingList(
+            title=title,
+            footer="<Enter> open  <Esc> close",
+            items=rendered,
+        )
+        self._floating_source = "lsp_nav"
+        self._floating_accept_mode = MODE_NORMAL
+        self.mode = MODE_FLOAT_LIST
+
+    def _accept_lsp_navigation_selection(self) -> None:
+        popup = self._floating_list
+        if popup is None:
+            return
+        index = popup.selected
+        if not (0 <= index < len(self._lsp_nav_locations)):
+            return
+        target_path, line, col = self._lsp_nav_locations[index]
+        self._record_jump_origin()
+        if self.open_file(target_path, force=False):
+            self.cy = clamp(line - 1, 0, len(self.lines) - 1)
+            self.cx = clamp(col - 1, 0, len(self._line()))
+            self.mode = MODE_NORMAL
+            self._floating_list = None
+            self._floating_source = ""
+            self._set_message(f"LSP jump: {self._location_label(target_path, line, col)}")
+
+    def _show_lsp_references(self) -> None:
+        client = self._ensure_lsp_ready(show_error=True)
+        if client is None or self.file_path is None:
+            return
+        try:
+            locations = self._async_runtime.run_sync(
+                client.references(self.file_path, self.cy, self.cx, include_declaration=False),
+                timeout=self._lsp_timeout_seconds,
+            )
+        except Exception as exc:
+            self._set_message(f"LSP references failed: {exc}", error=True)
+            return
+        deduped: list[tuple[Path, int, int]] = []
+        seen: set[tuple[str, int, int]] = set()
+        for path, line, col in locations:
+            key = (str(path.resolve()), int(line), int(col))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append((path, line, col))
+        if not deduped:
+            self._set_message("LSP references: no result.")
+            return
+        self._open_lsp_navigation("LSP References", deduped)
+
+    def _show_lsp_implementation(self) -> None:
+        client = self._ensure_lsp_ready(show_error=True)
+        if client is None or self.file_path is None:
+            return
+        try:
+            locations = self._async_runtime.run_sync(
+                client.implementation(self.file_path, self.cy, self.cx),
+                timeout=self._lsp_timeout_seconds,
+            )
+        except Exception as exc:
+            self._set_message(f"LSP implementation failed: {exc}", error=True)
+            return
+        if not locations:
+            self._set_message("LSP implementation: no result.")
+            return
+        self._open_lsp_navigation("LSP Implementations", locations)
+
+    def _show_lsp_document_symbols(self, query: str = "") -> None:
+        client = self._ensure_lsp_ready(show_error=True)
+        if client is None or self.file_path is None:
+            return
+        try:
+            symbols = self._async_runtime.run_sync(
+                client.document_symbols(self.file_path),
+                timeout=self._lsp_timeout_seconds,
+            )
+        except Exception as exc:
+            self._set_message(f"LSP symbols failed: {exc}", error=True)
+            return
+        clean = query.strip().lower()
+        if clean:
+            symbols = [item for item in symbols if clean in item[0].lower()]
+        if not symbols:
+            self._set_message("LSP symbols: no result.")
+            return
+        labels = [self._location_label(path, line, col, prefix=label) for label, path, line, col in symbols]
+        locations = [(path, line, col) for _label, path, line, col in symbols]
+        self._open_lsp_navigation("LSP Symbols", locations, labels=labels)
+
+    def _show_lsp_workspace_symbols(self, query: str) -> None:
+        client = self._ensure_lsp_ready(show_error=True)
+        if client is None:
+            return
+        clean = query.strip() or word_at_cursor(self._line(), self.cx)
+        if not clean:
+            self._set_message("Usage: :lsp wsymbol <query>", error=True)
+            return
+        try:
+            symbols = self._async_runtime.run_sync(
+                client.workspace_symbols(clean),
+                timeout=self._lsp_timeout_seconds,
+            )
+        except Exception as exc:
+            self._set_message(f"LSP workspace symbols failed: {exc}", error=True)
+            return
+        if not symbols:
+            self._set_message(f"LSP workspace symbols: no result for '{clean}'.")
+            return
+        labels = [self._location_label(path, line, col, prefix=label) for label, path, line, col in symbols]
+        locations = [(path, line, col) for _label, path, line, col in symbols]
+        self._open_lsp_navigation(f'Workspace Symbols "{clean}"', locations, labels=labels)
+
+    def _lsp_rename_symbol(self, new_name: str) -> bool:
+        client = self._ensure_lsp_ready(show_error=True)
+        if client is None or self.file_path is None:
+            return False
+        clean = new_name.strip()
+        if not clean:
+            self._set_message("Usage: :lsp rename <new_name>", error=True)
+            return False
+        try:
+            payload = self._async_runtime.run_sync(
+                client.rename(self.file_path, self.cy, self.cx, clean),
+                timeout=self._lsp_timeout_seconds,
+            )
+        except Exception as exc:
+            self._set_message(f"LSP rename failed: {exc}", error=True)
+            return False
+        if not payload:
+            self._set_message("LSP rename: no changes.")
+            return False
+        changed = self._apply_workspace_edit(payload)
+        self._set_message(f"LSP rename {'applied' if changed else 'returned no editable changes'}.")
+        return changed
+
+    def _lsp_format_document(self) -> bool:
+        client = self._ensure_lsp_ready(show_error=True)
+        if client is None or self.file_path is None:
+            return False
+        try:
+            edits = self._async_runtime.run_sync(
+                client.formatting(self.file_path, tab_size=self.tab_size, insert_spaces=True),
+                timeout=self._lsp_timeout_seconds,
+            )
+        except Exception as exc:
+            self._set_message(f"LSP format failed: {exc}", error=True)
+            return False
+        if not edits:
+            self._set_message("LSP format: no changes.")
+            return False
+        changed = self._apply_text_edits(self.file_path, edits)
+        self._set_message("LSP format applied." if changed else "LSP format produced no editable changes.")
+        return changed
+
     def _lsp_uri_to_path(self, uri: str) -> Path | None:
         from urllib.parse import unquote, urlparse
 
@@ -1244,14 +1531,10 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             raw = raw[1:]
         return Path(raw)
 
-    def _apply_text_edits(self, path: Path, edits: list[dict[str, Any]]) -> bool:
-        if self.file_path is None:
-            return False
-        if path.resolve() != self.file_path.resolve():
-            self._set_message(f"Code action skipped external file: {path}", error=True)
-            return False
+    def _apply_edits_to_lines(self, source_lines: list[str], edits: list[dict[str, Any]]) -> tuple[list[str], bool]:
         if not edits:
-            return False
+            return source_lines, False
+        lines = list(source_lines) if source_lines else [""]
         sorted_edits = sorted(
             edits,
             key=lambda item: (
@@ -1272,28 +1555,53 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             if not isinstance(start, dict) or not isinstance(end, dict):
                 continue
             try:
-                start_line = clamp(int(start.get("line", 0)), 0, len(self.lines) - 1)
+                start_line = clamp(int(start.get("line", 0)), 0, len(lines) - 1)
                 start_col = max(0, int(start.get("character", 0)))
-                end_line = clamp(int(end.get("line", 0)), 0, len(self.lines) - 1)
+                end_line = clamp(int(end.get("line", 0)), 0, len(lines) - 1)
                 end_col = max(0, int(end.get("character", 0)))
             except (TypeError, ValueError):
                 continue
             new_text = str(edit.get("newText", ""))
             if start_line == end_line:
-                line = self.lines[start_line]
+                line = lines[start_line]
                 start_col = clamp(start_col, 0, len(line))
                 end_col = clamp(end_col, start_col, len(line))
-                self.lines[start_line] = line[:start_col] + new_text + line[end_col:]
+                lines[start_line] = line[:start_col] + new_text + line[end_col:]
             else:
-                head = self.lines[start_line][: clamp(start_col, 0, len(self.lines[start_line]))]
-                tail = self.lines[end_line][clamp(end_col, 0, len(self.lines[end_line])) :]
+                head = lines[start_line][: clamp(start_col, 0, len(lines[start_line]))]
+                tail = lines[end_line][clamp(end_col, 0, len(lines[end_line])) :]
                 replacement = (head + new_text + tail).split("\n")
-                self.lines[start_line : end_line + 1] = replacement if replacement else [""]
+                lines[start_line : end_line + 1] = replacement if replacement else [""]
             changed = True
-        if changed:
-            self.buffer.mark_all_dirty()
-            self._mark_modified()
-        return changed
+        return lines, changed
+
+    def _apply_text_edits(self, path: Path, edits: list[dict[str, Any]]) -> bool:
+        if not edits:
+            return False
+        resolved = path.resolve()
+        current = self.file_path.resolve() if self.file_path is not None else None
+        if current is not None and resolved == current:
+            updated, changed = self._apply_edits_to_lines(self.lines, edits)
+            if changed:
+                self.lines = updated
+                self.buffer.mark_all_dirty()
+                self._mark_modified()
+            return changed
+
+        try:
+            raw, encoding = self._decode_file_bytes(resolved.read_bytes())
+        except (OSError, UnicodeDecodeError):
+            return False
+        normalized, line_ending = self._normalize_loaded_text(raw)
+        updated, changed = self._apply_edits_to_lines(normalized.split("\n"), edits)
+        if not changed:
+            return False
+        serialized = "\n".join(updated).replace("\n", line_ending)
+        try:
+            resolved.write_text(serialized, encoding=encoding, newline="")
+        except OSError:
+            return False
+        return True
 
     def _apply_workspace_edit(self, payload: dict[str, Any]) -> bool:
         changed = False
@@ -1540,6 +1848,79 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self.row_offset = max(0, row_offset)
         self.col_offset = max(0, col_offset)
 
+    def _capture_jump_location(self) -> tuple[str, int, int, int, int]:
+        path = str(self.file_path.resolve()) if self.file_path is not None else ""
+        return (path, int(self.cy), int(self.cx), int(self.row_offset), int(self.col_offset))
+
+    def _restore_jump_location(self, location: tuple[str, int, int, int, int]) -> bool:
+        path_text, row, col, row_offset, col_offset = location
+        target_path = Path(path_text) if path_text else None
+        if target_path is not None:
+            current = self.file_path.resolve() if self.file_path is not None else None
+            if current != target_path.resolve():
+                if not self.open_file(target_path, force=False):
+                    return False
+        self.cy = clamp(row, 0, len(self.lines) - 1)
+        self.cx = clamp(col, 0, len(self._line()))
+        self.row_offset = max(0, row_offset)
+        self.col_offset = max(0, col_offset)
+        return True
+
+    def _record_jump_origin(self) -> None:
+        current = self._capture_jump_location()
+        if self._jump_back_stack and self._jump_back_stack[-1] == current:
+            return
+        self._jump_back_stack.append(current)
+        if len(self._jump_back_stack) > self._jump_history_limit:
+            self._jump_back_stack = self._jump_back_stack[-self._jump_history_limit :]
+        self._jump_forward_stack = []
+
+    def _jump_back(self) -> bool:
+        if not self._jump_back_stack:
+            self._set_message("Jump history: no previous location.")
+            return False
+        target = self._jump_back_stack.pop()
+        self._jump_forward_stack.append(self._capture_jump_location())
+        if not self._restore_jump_location(target):
+            self._jump_forward_stack.pop()
+            self._set_message("Jump history back failed.", error=True)
+            return False
+        self._set_message("Jumped back.")
+        return True
+
+    def _jump_forward(self) -> bool:
+        if not self._jump_forward_stack:
+            self._set_message("Jump history: no forward location.")
+            return False
+        target = self._jump_forward_stack.pop()
+        self._jump_back_stack.append(self._capture_jump_location())
+        if len(self._jump_back_stack) > self._jump_history_limit:
+            self._jump_back_stack = self._jump_back_stack[-self._jump_history_limit :]
+        if not self._restore_jump_location(target):
+            self._jump_back_stack.pop()
+            self._set_message("Jump history forward failed.", error=True)
+            return False
+        self._set_message("Jumped forward.")
+        return True
+
+    def _jump_list_lines(self) -> list[str]:
+        if not self._jump_back_stack:
+            return ["(empty)"]
+        lines: list[str] = []
+        for index, entry in enumerate(reversed(self._jump_back_stack[-20:]), start=1):
+            path_text, row, col, _row_offset, _col_offset = entry
+            if path_text:
+                path = Path(path_text)
+                try:
+                    relative = path.resolve().relative_to(self._workspace_root.resolve())
+                    label = str(relative)
+                except ValueError:
+                    label = str(path)
+            else:
+                label = "[No Name]"
+            lines.append(f"{index:>2}. {label}:{row + 1}:{col + 1}")
+        return lines
+
     def _capture_split_active_view(self) -> None:
         if not self._split_enabled:
             return
@@ -1684,6 +2065,66 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         if self.cy < len(self.lines) - 1:
             self.cy += 1
             self.cx = min(self.cx, len(self._line()))
+
+    def _jump_to_matching_bracket(self) -> bool:
+        pairs = {
+            "(": ")",
+            "[": "]",
+            "{": "}",
+            ")": "(",
+            "]": "[",
+            "}": "{",
+        }
+        line = self._line()
+        probe_col = self.cx
+        ch = line[probe_col] if 0 <= probe_col < len(line) else ""
+        if ch not in pairs and probe_col > 0:
+            probe_col -= 1
+            ch = line[probe_col] if 0 <= probe_col < len(line) else ""
+        if ch not in pairs:
+            self._set_message("No bracket under cursor.", error=True)
+            return False
+
+        opening = ch in {"(", "[", "{"}
+        open_ch = ch if opening else pairs[ch]
+        close_ch = pairs[ch] if opening else ch
+        depth = 0
+
+        if opening:
+            for row in range(self.cy, len(self.lines)):
+                start_col = probe_col + 1 if row == self.cy else 0
+                text = self.lines[row]
+                for col in range(start_col, len(text)):
+                    token = text[col]
+                    if token == open_ch:
+                        depth += 1
+                    elif token == close_ch:
+                        if depth == 0:
+                            self._record_jump_origin()
+                            self.cy = row
+                            self.cx = col
+                            self._set_message("Matched bracket.")
+                            return True
+                        depth -= 1
+        else:
+            for row in range(self.cy, -1, -1):
+                text = self.lines[row]
+                start_col = probe_col - 1 if row == self.cy else len(text) - 1
+                for col in range(start_col, -1, -1):
+                    token = text[col]
+                    if token == close_ch:
+                        depth += 1
+                    elif token == open_ch:
+                        if depth == 0:
+                            self._record_jump_origin()
+                            self.cy = row
+                            self.cx = col
+                            self._set_message("Matched bracket.")
+                            return True
+                        depth -= 1
+
+        self._set_message("Matching bracket not found.", error=True)
+        return False
 
     def _move_word_left(self) -> None:
         if self.cx == 0 and self.cy > 0:
@@ -2065,6 +2506,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         pattern = re.compile(rf"^\s*(def|class)\s+{re.escape(symbol)}\b")
         for index, line in enumerate(self.lines):
             if pattern.search(line):
+                self._record_jump_origin()
                 self.cy = index
                 self.cx = max(0, line.find(symbol))
                 self._set_message(f"Definition: {symbol} (current file)")
@@ -2081,6 +2523,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                 continue
             for index, line in enumerate(lines):
                 if pattern.search(line):
+                    self._record_jump_origin()
                     if self.open_file(path, force=False):
                         self.cy = clamp(index, 0, len(self.lines) - 1)
                         self.cx = max(0, self._line().find(symbol))
@@ -2208,6 +2651,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         if self._floating_list is not None:
             self.fuzzy_index = self._floating_list.selected
         target = self._workspace_root / self.fuzzy_matches[self.fuzzy_index]
+        self._record_jump_origin()
         if self.open_file(target, force=False):
             self.mode = MODE_NORMAL
             self.fuzzy_query = ""
@@ -2527,6 +2971,53 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._set_message(f"Replaced {count} occurrence(s).")
         return True
 
+    def _replace_all_project(self, old: str, new: str) -> bool:
+        if not self.config.feature_enabled("find_replace"):
+            self._set_message("Find/replace is disabled in config.", error=True)
+            return False
+        if not old:
+            self._set_message("Usage: :replaceproj <old> <new>", error=True)
+            return False
+        self.file_index.refresh(force=True)
+        total = 0
+        changed_files = 0
+        skipped = 0
+        current_path = self.file_path.resolve() if self.file_path is not None else None
+        for relative in self.file_index.list_files():
+            path = (self._workspace_root / relative).resolve()
+            if current_path is not None and path == current_path and self.modified:
+                skipped += 1
+                continue
+            try:
+                raw, encoding = self._decode_file_bytes(path.read_bytes())
+            except (OSError, UnicodeDecodeError):
+                continue
+            normalized, line_ending = self._normalize_loaded_text(raw)
+            updated, count = replace_all(normalized.split("\n"), old, new)
+            if count <= 0:
+                continue
+            serialized = "\n".join(updated).replace("\n", line_ending)
+            try:
+                path.write_text(serialized, encoding=encoding, newline="")
+            except OSError:
+                skipped += 1
+                continue
+            total += count
+            changed_files += 1
+            if current_path is not None and path == current_path and not self.modified:
+                self.lines = updated if updated else [""]
+                self.buffer.mark_all_dirty()
+                self.cy = clamp(self.cy, 0, len(self.lines) - 1)
+                self.cx = clamp(self.cx, 0, len(self._line()))
+        if total <= 0:
+            self._set_message(f"Project replace not found: {old}", error=True)
+            return False
+        detail = f"files={changed_files} replacements={total}"
+        if skipped > 0:
+            detail += f" skipped={skipped}"
+        self._set_message(f"Project replace done: {detail}")
+        return True
+
     def _regex_flags(self, text: str) -> int | None:
         flags = 0
         for ch in text.strip().lower():
@@ -2643,6 +3134,61 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self.lines = updated
         self._mark_modified()
         self._set_message(f"Regex replaced {total} occurrence(s).")
+        return True
+
+    def _replace_regex_all_project(self, pattern: str, replacement: str, flags_text: str = "") -> bool:
+        if not self.config.feature_enabled("find_replace"):
+            self._set_message("Find/replace is disabled in config.", error=True)
+            return False
+        if not pattern:
+            self._set_message("Usage: :replaceprojre <pattern> <replacement> [flags]", error=True)
+            return False
+        compiled = self._compile_regex(pattern, flags_text)
+        if compiled is None:
+            return False
+        self.file_index.refresh(force=True)
+        total = 0
+        changed_files = 0
+        skipped = 0
+        current_path = self.file_path.resolve() if self.file_path is not None else None
+        for relative in self.file_index.list_files():
+            path = (self._workspace_root / relative).resolve()
+            if current_path is not None and path == current_path and self.modified:
+                skipped += 1
+                continue
+            try:
+                raw, encoding = self._decode_file_bytes(path.read_bytes())
+            except (OSError, UnicodeDecodeError):
+                continue
+            normalized, line_ending = self._normalize_loaded_text(raw)
+            changed = 0
+            updated_lines: list[str] = []
+            for line in normalized.split("\n"):
+                replaced, count = compiled.subn(replacement, line)
+                updated_lines.append(replaced)
+                changed += count
+            if changed <= 0:
+                continue
+            serialized = "\n".join(updated_lines).replace("\n", line_ending)
+            try:
+                path.write_text(serialized, encoding=encoding, newline="")
+            except OSError:
+                skipped += 1
+                continue
+            total += changed
+            changed_files += 1
+            if current_path is not None and path == current_path and not self.modified:
+                self.lines = updated_lines if updated_lines else [""]
+                self.buffer.mark_all_dirty()
+                self.cy = clamp(self.cy, 0, len(self.lines) - 1)
+                self.cx = clamp(self.cx, 0, len(self._line()))
+        if total <= 0:
+            self._set_message(f"Project regex not found: /{pattern}/", error=True)
+            return False
+        detail = f"files={changed_files} replacements={total}"
+        if skipped > 0:
+            detail += f" skipped={skipped}"
+        self._set_message(f"Project regex replace done: {detail}")
         return True
 
     def _rename_symbol(self, old: str, new: str) -> bool:
@@ -2868,6 +3414,8 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._pending_motion = ""
         self.visual_anchor = None
         self._clear_multi_cursor()
+        self._jump_back_stack = []
+        self._jump_forward_stack = []
         self._history.clear()
         self._syntax_profile = self._syntax_manager().profile_for_file(self.file_path)
         current_view = self._capture_view_state()
@@ -3753,7 +4301,8 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._last_cursor_line = self.cy
 
     def _shortcut(self, action: str, default: str) -> str:
-        return self.config.shortcut(action, default)
+        language = self._language_id_for_file(self.file_path).lower()
+        return self.config.shortcut_for_language(action, default, language)
 
     def _handle_shortcuts(self, key: str) -> bool:
         if key == self.key_hints_trigger:
@@ -3810,6 +4359,12 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         if key == self._shortcut("fuzzy_finder", "CTRL_P"):
             if self.mode != MODE_COMMAND:
                 self._open_fuzzy()
+                return True
+            return False
+
+        if key == self._shortcut("jump_back", "CTRL_O"):
+            if self.mode in {MODE_NORMAL, MODE_INSERT, MODE_VISUAL}:
+                self._jump_back()
                 return True
             return False
 
@@ -3933,6 +4488,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._ui.enter()
         try:
             while self.running:
+                self._poll_config_reload()
                 if self._input_queue or KeyReader.has_key():
                     from_queue = bool(self._input_queue)
                     key = self._read_key()

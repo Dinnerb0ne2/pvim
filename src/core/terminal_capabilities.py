@@ -10,11 +10,14 @@ class TerminalCapabilities:
     true_color: bool
     color_level: int
     unicode_ui: bool
+    hyperlink: bool
+    sixel: bool
 
 
 def detect_terminal_capabilities() -> TerminalCapabilities:
     colorterm = os.environ.get("COLORTERM", "").lower()
     term = os.environ.get("TERM", "").lower()
+    term_program = os.environ.get("TERM_PROGRAM", "").lower()
     force_ascii = os.environ.get("PVIM_ASCII_UI", "").strip() == "1"
 
     true_color = "truecolor" in colorterm or "24bit" in colorterm
@@ -27,4 +30,16 @@ def detect_terminal_capabilities() -> TerminalCapabilities:
 
     encoding = (sys.stdout.encoding or "").lower()
     unicode_ui = not force_ascii and ("utf" in encoding)
-    return TerminalCapabilities(true_color=true_color, color_level=color_level, unicode_ui=unicode_ui)
+    hyperlink = bool(
+        os.environ.get("WT_SESSION")
+        or term_program in {"wezterm", "vscode", "iterm.app", "apple_terminal"}
+        or "kitty" in term
+    )
+    sixel = "sixel" in term or os.environ.get("XTERM_VERSION", "").lower().startswith("xterm")
+    return TerminalCapabilities(
+        true_color=true_color,
+        color_level=color_level,
+        unicode_ui=unicode_ui,
+        hyperlink=hyperlink,
+        sixel=sixel,
+    )

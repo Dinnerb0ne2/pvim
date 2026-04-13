@@ -35,6 +35,7 @@ DEFAULT_THEME_SPEC: dict[str, Any] = {
         "builtin": {"fg": "#7aa2f7"},
         "function": {"fg": "#73daca"},
         "type": {"fg": "#e0af68"},
+        "decorator": {"fg": "#7dcfff"},
         "string": {"fg": "#9ece6a"},
         "comment": {"fg": "#565f89"},
         "number": {"fg": "#ff9e64"},
@@ -152,7 +153,13 @@ class Theme:
 
 
 def load_theme(path: Path | None, capabilities: TerminalCapabilities | None = None) -> Theme:
-    caps = capabilities or TerminalCapabilities(true_color=True, color_level=24, unicode_ui=True)
+    caps = capabilities or TerminalCapabilities(
+        true_color=True,
+        color_level=24,
+        unicode_ui=True,
+        hyperlink=True,
+        sixel=False,
+    )
     merged = _deep_copy(DEFAULT_THEME_SPEC)
     if path is not None and path.exists():
         loaded = json.loads(path.read_text(encoding="utf-8"))

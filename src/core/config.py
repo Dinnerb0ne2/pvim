@@ -31,6 +31,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "syntax_highlighting": {
             "enabled": True,
             "language_map_file": "syntax\\languages.json",
+            "extra_language_map_files": [],
             "default_file": "syntax\\plaintext.json",
         },
         "auto_pairs": {
@@ -54,11 +55,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "quick_replace": "CTRL_G",
                 "open_completion": "CTRL_N",
                 "fuzzy_finder": "CTRL_P",
+                "jump_back": "CTRL_O",
                 "toggle_file_tree": "F3",
                 "toggle_sidebar": "F4",
                 "format_code": "F8",
                 "refactor_rename": "CTRL_R",
             },
+            "filetype_bindings": {},
         },
         "key_hints": {
             "enabled": True,
@@ -105,6 +108,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "session": {
             "enabled": True,
             "file": ".pvim.session.json",
+            "profiles_directory": ".pvim.sessions",
         },
         "plugins": {
             "enabled": False,
@@ -144,6 +148,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
         "code_style_normalizer": {
             "enabled": False,
+        },
+        "config_reload": {
+            "enabled": True,
+            "interval_seconds": 1.0,
         },
     },
 }
@@ -276,6 +284,23 @@ class AppConfig:
         )
         return self.resolve_path(file_name if isinstance(file_name, str) else None)
 
+    def syntax_language_map_files(self) -> list[Path]:
+        files: list[Path] = []
+        primary = self.syntax_language_map_file()
+        if primary is not None:
+            files.append(primary)
+        extra = self._lookup("features", "syntax_highlighting", "extra_language_map_files", default=[])
+        if isinstance(extra, list):
+            for item in extra:
+                if not isinstance(item, str):
+                    continue
+                resolved = self.resolve_path(item)
+                if resolved is None:
+                    continue
+                if resolved not in files:
+                    files.append(resolved)
+        return files
+
     def syntax_default_file(self) -> Path | None:
         file_name = self._lookup(
             "features",
@@ -327,6 +352,25 @@ class AppConfig:
     def shortcut(self, action: str, default: str) -> str:
         value = self._lookup("features", "vscode_shortcuts", "bindings", action, default=default)
         return value if isinstance(value, str) else default
+
+    def shortcut_for_language(self, action: str, default: str, language_id: str | None) -> str:
+        fallback = self.shortcut(action, default)
+        if not language_id:
+            return fallback
+        language = language_id.strip().lower()
+        if not language:
+            return fallback
+        value = self._lookup(
+            "features",
+            "vscode_shortcuts",
+            "filetype_bindings",
+            language,
+            action,
+            default=None,
+        )
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return fallback
 
     def key_hints_enabled(self) -> bool:
         return _as_bool(self._lookup("features", "key_hints", "enabled", default=True), default=True)
@@ -433,6 +477,13 @@ class AppConfig:
         resolved = self.resolve_path(value)
         return resolved if resolved is not None else (self.path.parent / ".pvim.session.json").resolve()
 
+    def session_profiles_directory(self) -> Path:
+        value = self._lookup("features", "session", "profiles_directory", default=".pvim.sessions")
+        if not isinstance(value, str):
+            value = ".pvim.sessions"
+        resolved = self.resolve_path(value)
+        return resolved if resolved is not None else (self.path.parent / ".pvim.sessions").resolve()
+
     def plugins_directory(self) -> Path:
         value = self._lookup("features", "plugins", "directory", default="plugins")
         if not isinstance(value, str):
@@ -451,3 +502,13 @@ class AppConfig:
 
     def profile_top_n(self) -> int:
         return _as_int(self._lookup("performance", "profile_top_n", default=25), default=25, minimum=5)
+
+    def config_reload_enabled(self) -> bool:
+        return self.feature_enabled("config_reload")
+
+    def config_reload_interval_seconds(self) -> float:
+        return _as_float(
+            self._lookup("features", "config_reload", "interval_seconds", default=1.0),
+            default=1.0,
+            minimum=0.2,
+        )

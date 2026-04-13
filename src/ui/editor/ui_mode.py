@@ -155,6 +155,9 @@ class UIModeMixin:
             if self._floating_source == "code_action":
                 self._accept_code_action_selection()
                 return
+            if self._floating_source == "lsp_nav":
+                self._accept_lsp_navigation_selection()
+                return
             selected = popup.selected_item()
             if selected is not None:
                 self._set_message(selected)
@@ -183,6 +186,7 @@ class UIModeMixin:
             selected = self._file_tree_feature.selected_path()
             if not selected:
                 return
+            self._record_jump_origin()
             if self.open_file(self._workspace_root / selected, force=False):
                 self._close_explorer()
 

@@ -23,6 +23,7 @@
     "builtin": { "fg": "#89b4fa" },
     "function": { "fg": "#94e2d5" },
     "type": { "fg": "#fab387" },
+    "decorator": { "fg": "#89b4fa" },
     "string": { "fg": "#a6e3a1" },
     "comment": { "fg": "#6c7086" },
     "number": { "fg": "#f5c2e7" }

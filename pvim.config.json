@@ -23,6 +23,7 @@
     "syntax_highlighting": {
       "enabled": true,
       "language_map_file": "syntax\\languages.json",
+      "extra_language_map_files": [],
       "default_file": "syntax\\plaintext.json"
     },
     "auto_pairs": {
@@ -46,10 +47,20 @@
         "quick_replace": "CTRL_G",
         "open_completion": "CTRL_N",
         "fuzzy_finder": "CTRL_P",
+        "jump_back": "CTRL_O",
         "toggle_file_tree": "F3",
         "toggle_sidebar": "F4",
         "format_code": "F8",
         "refactor_rename": "CTRL_R"
+      },
+      "filetype_bindings": {
+        "python": {
+          "format_code": "F8",
+          "refactor_rename": "CTRL_R"
+        },
+        "typescript": {
+          "format_code": "F8"
+        }
       }
     },
     "key_hints": {
@@ -101,7 +112,8 @@
     },
     "session": {
       "enabled": true,
-      "file": ".pvim.session.json"
+      "file": ".pvim.session.json",
+      "profiles_directory": ".pvim.sessions"
     },
     "plugin_keyhooks": {
       "enabled": false
@@ -136,6 +148,10 @@
     },
     "code_style_normalizer": {
       "enabled": false
+    },
+    "config_reload": {
+      "enabled": true,
+      "interval_seconds": 1.0
     }
   }
 }

@@ -1,0 +1,17 @@
+{
+  "name": "cpp",
+  "line_comment": "//",
+  "keywords": [
+    "alignas", "alignof", "asm", "auto", "bool", "break", "case", "catch", "char", "class",
+    "const", "constexpr", "constinit", "continue", "decltype", "default", "delete", "do",
+    "double", "else", "enum", "explicit", "extern", "false", "float", "for", "friend", "goto",
+    "if", "inline", "int", "long", "mutable", "namespace", "new", "noexcept", "nullptr",
+    "operator", "private", "protected", "public", "register", "return", "short", "signed",
+    "sizeof", "static", "struct", "switch", "template", "this", "throw", "true", "try",
+    "typedef", "typename", "union", "unsigned", "using", "virtual", "void", "volatile", "while"
+  ],
+  "builtins": [
+    "std", "string", "vector", "map", "set", "unordered_map", "unordered_set", "cout", "cin", "endl"
+  ],
+  "string_delimiters": ["\"", "'"]
+}

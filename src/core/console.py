@@ -60,6 +60,8 @@ CONTROL_KEYS = {
     "\x15": "CTRL_U",
     "\x0e": "CTRL_N",
     "\x10": "CTRL_P",
+    "\x0f": "CTRL_O",
+    "\x17": "CTRL_W",
     "\x1f": "CTRL_SLASH",
 }
 

@@ -1,0 +1,12 @@
+{
+  "name": "shell",
+  "line_comment": "#",
+  "keywords": [
+    "if", "then", "else", "elif", "fi", "case", "esac", "for", "while", "until", "do", "done",
+    "function", "in", "select", "time"
+  ],
+  "builtins": [
+    "echo", "printf", "read", "test", "cd", "pwd", "export", "unset", "alias", "trap", "exit"
+  ],
+  "string_delimiters": ["\"", "'"]
+}

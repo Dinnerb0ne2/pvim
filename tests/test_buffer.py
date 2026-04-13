@@ -93,6 +93,43 @@ class BufferEditorBehaviorTests(unittest.TestCase):
         self.assertEqual(self.editor.cy, 0)
         self.assertEqual(self.editor.cx, 0)
 
+    def test_jump_history_back_and_forward(self) -> None:
+        self.editor.lines = ["def foo():", "    pass", "", "foo()"]
+        self.editor.cy = 3
+        self.editor.cx = 1
+
+        self.editor._goto_definition()
+        self.assertEqual(self.editor.cy, 0)
+
+        self.assertTrue(self.editor._jump_back())
+        self.assertEqual(self.editor.cy, 3)
+
+        self.assertTrue(self.editor._jump_forward())
+        self.assertEqual(self.editor.cy, 0)
+
+    def test_matching_bracket_jump(self) -> None:
+        self.editor.lines = ["if (a[0] + b):"]
+        self.editor.cy = 0
+        self.editor.cx = 3
+
+        self.assertTrue(self.editor._jump_to_matching_bracket())
+        self.assertEqual((self.editor.cy, self.editor.cx), (0, 12))
+
+        self.assertTrue(self.editor._jump_to_matching_bracket())
+        self.assertEqual((self.editor.cy, self.editor.cx), (0, 3))
+
+    def test_project_replace_all_updates_workspace_files(self) -> None:
+        first = self._root / "a.py"
+        second = self._root / "b.py"
+        first.write_text("TODO\nkeep\n", encoding="utf-8")
+        second.write_text("x TODO y\n", encoding="utf-8")
+
+        self.assertTrue(self.editor.open_project(self._root, force=True))
+        self.assertTrue(self.editor._replace_all_project("TODO", "DONE"))
+
+        self.assertIn("DONE", first.read_text(encoding="utf-8"))
+        self.assertIn("DONE", second.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

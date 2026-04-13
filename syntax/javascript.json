@@ -1,0 +1,15 @@
+{
+  "name": "javascript",
+  "line_comment": "//",
+  "keywords": [
+    "break", "case", "catch", "class", "const", "continue", "debugger", "default",
+    "delete", "do", "else", "export", "extends", "finally", "for", "function", "if",
+    "import", "in", "instanceof", "let", "new", "return", "super", "switch", "this",
+    "throw", "try", "typeof", "var", "void", "while", "with", "yield", "async", "await"
+  ],
+  "builtins": [
+    "Array", "Boolean", "Date", "Error", "JSON", "Map", "Math", "Number", "Object",
+    "Promise", "RegExp", "Set", "String", "Symbol", "console", "document", "window"
+  ],
+  "string_delimiters": ["\"", "'", "`"]
+}

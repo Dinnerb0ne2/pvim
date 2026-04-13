@@ -62,6 +62,41 @@ def _extract_completion_items(payload: Any) -> list[str]:
     return out
 
 
+def _symbol_kind_name(kind: Any) -> str:
+    names = {
+        1: "File",
+        2: "Module",
+        3: "Namespace",
+        4: "Package",
+        5: "Class",
+        6: "Method",
+        7: "Property",
+        8: "Field",
+        9: "Constructor",
+        10: "Enum",
+        11: "Interface",
+        12: "Function",
+        13: "Variable",
+        14: "Constant",
+        15: "String",
+        16: "Number",
+        17: "Boolean",
+        18: "Array",
+        19: "Object",
+        20: "Key",
+        21: "Null",
+        22: "EnumMember",
+        23: "Struct",
+        24: "Event",
+        25: "Operator",
+        26: "TypeParameter",
+    }
+    try:
+        return names.get(int(kind), "Symbol")
+    except (TypeError, ValueError):
+        return "Symbol"
+
+
 class LspClient:
     def __init__(self) -> None:
         self._process: asyncio.subprocess.Process | None = None
@@ -120,10 +155,19 @@ class LspClient:
                     "textDocument": {
                         "hover": {"contentFormat": ["plaintext", "markdown"]},
                         "definition": {"linkSupport": True},
+                        "references": {},
+                        "implementation": {"linkSupport": True},
+                        "documentSymbol": {"hierarchicalDocumentSymbolSupport": True},
+                        "rename": {"prepareSupport": False},
+                        "formatting": {},
+                        "codeAction": {},
                         "completion": {"completionItem": {"snippetSupport": False}},
-                    }
+                    },
+                    "workspace": {
+                        "symbol": {},
+                    },
                 },
-                "clientInfo": {"name": "pvim", "version": "0.2"},
+                "clientInfo": {"name": "pvim", "version": "0.5"},
             },
         )
         await self._notify("initialized", {})
@@ -203,6 +247,40 @@ class LspClient:
         )
         return self._extract_locations(payload)
 
+    async def references(
+        self,
+        path: Path,
+        line: int,
+        column: int,
+        *,
+        include_declaration: bool = True,
+    ) -> list[tuple[Path, int, int]]:
+        if not self.running:
+            return []
+        uri = _path_to_uri(path)
+        payload = await self._request(
+            "textDocument/references",
+            {
+                "textDocument": {"uri": uri},
+                "position": {"line": max(0, line), "character": max(0, column)},
+                "context": {"includeDeclaration": bool(include_declaration)},
+            },
+        )
+        return self._extract_locations(payload)
+
+    async def implementation(self, path: Path, line: int, column: int) -> list[tuple[Path, int, int]]:
+        if not self.running:
+            return []
+        uri = _path_to_uri(path)
+        payload = await self._request(
+            "textDocument/implementation",
+            {
+                "textDocument": {"uri": uri},
+                "position": {"line": max(0, line), "character": max(0, column)},
+            },
+        )
+        return self._extract_locations(payload)
+
     async def hover(self, path: Path, line: int, column: int) -> str:
         if not self.running:
             return ""
@@ -245,6 +323,72 @@ class LspClient:
             if self._completion_request_id == request_id:
                 self._completion_request_id = None
         return _extract_completion_items(payload)
+
+    async def rename(self, path: Path, line: int, column: int, new_name: str) -> dict[str, Any]:
+        if not self.running:
+            return {}
+        clean = new_name.strip()
+        if not clean:
+            return {}
+        uri = _path_to_uri(path)
+        payload = await self._request(
+            "textDocument/rename",
+            {
+                "textDocument": {"uri": uri},
+                "position": {"line": max(0, line), "character": max(0, column)},
+                "newName": clean,
+            },
+        )
+        if isinstance(payload, dict):
+            return payload
+        return {}
+
+    async def formatting(self, path: Path, *, tab_size: int, insert_spaces: bool) -> list[dict[str, Any]]:
+        if not self.running:
+            return []
+        uri = _path_to_uri(path)
+        payload = await self._request(
+            "textDocument/formatting",
+            {
+                "textDocument": {"uri": uri},
+                "options": {
+                    "tabSize": max(1, int(tab_size)),
+                    "insertSpaces": bool(insert_spaces),
+                    "trimTrailingWhitespace": True,
+                    "insertFinalNewline": False,
+                    "trimFinalNewlines": False,
+                },
+            },
+        )
+        if not isinstance(payload, list):
+            return []
+        return [item for item in payload if isinstance(item, dict)]
+
+    async def document_symbols(self, path: Path) -> list[tuple[str, Path, int, int]]:
+        if not self.running:
+            return []
+        uri = _path_to_uri(path)
+        payload = await self._request(
+            "textDocument/documentSymbol",
+            {
+                "textDocument": {"uri": uri},
+            },
+        )
+        return self._extract_symbols(payload, default_path=path.resolve())
+
+    async def workspace_symbols(self, query: str) -> list[tuple[str, Path, int, int]]:
+        if not self.running:
+            return []
+        clean = query.strip()
+        if not clean:
+            return []
+        payload = await self._request(
+            "workspace/symbol",
+            {
+                "query": clean,
+            },
+        )
+        return self._extract_symbols(payload, default_path=None)
 
     async def diagnostics(self, path: Path) -> list[str]:
         uri = _path_to_uri(path)
@@ -391,10 +535,91 @@ class LspClient:
             start = range_obj.get("start")
             if not isinstance(start, dict):
                 continue
-            line = int(start.get("line", 0)) + 1
-            col = int(start.get("character", 0)) + 1
+            try:
+                line = int(start.get("line", 0)) + 1
+            except (TypeError, ValueError):
+                line = 1
+            try:
+                col = int(start.get("character", 0)) + 1
+            except (TypeError, ValueError):
+                col = 1
             resolved = _uri_to_path(uri)
             if resolved is None:
                 continue
             out.append((resolved, max(1, line), max(1, col)))
         return out
+
+    def _extract_symbols(self, payload: Any, *, default_path: Path | None) -> list[tuple[str, Path, int, int]]:
+        if not isinstance(payload, list):
+            return []
+        out: list[tuple[str, Path, int, int]] = []
+
+        def _walk_document_symbol(item: dict[str, Any], parent_name: str = "") -> None:
+            name = item.get("name")
+            if not isinstance(name, str) or not name.strip():
+                return
+            detail = item.get("detail")
+            kind_text = _symbol_kind_name(item.get("kind"))
+            cleaned_name = name.strip()
+            label_name = f"{parent_name}.{cleaned_name}" if parent_name else cleaned_name
+            if isinstance(detail, str) and detail.strip():
+                label = f"{kind_text}: {label_name}  {detail.strip()}"
+            else:
+                label = f"{kind_text}: {label_name}"
+
+            range_obj = item.get("selectionRange")
+            if not isinstance(range_obj, dict):
+                range_obj = item.get("range")
+            location = self._range_to_line_col(range_obj)
+            if location is not None and default_path is not None:
+                line, col = location
+                out.append((label, default_path, line, col))
+
+            children = item.get("children")
+            if isinstance(children, list):
+                for child in children:
+                    if isinstance(child, dict):
+                        _walk_document_symbol(child, label_name)
+
+        for entry in payload:
+            if not isinstance(entry, dict):
+                continue
+            if "location" in entry:
+                location_obj = entry.get("location")
+                if not isinstance(location_obj, dict):
+                    continue
+                uri = location_obj.get("uri")
+                range_obj = location_obj.get("range")
+                if not isinstance(uri, str) or not isinstance(range_obj, dict):
+                    continue
+                resolved = _uri_to_path(uri)
+                position = self._range_to_line_col(range_obj)
+                if resolved is None or position is None:
+                    continue
+                name = entry.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    continue
+                kind_text = _symbol_kind_name(entry.get("kind"))
+                container = entry.get("containerName")
+                prefix = f"{container.strip()}." if isinstance(container, str) and container.strip() else ""
+                label = f"{kind_text}: {prefix}{name.strip()}"
+                out.append((label, resolved, position[0], position[1]))
+                continue
+            _walk_document_symbol(entry)
+        return out
+
+    def _range_to_line_col(self, range_obj: Any) -> tuple[int, int] | None:
+        if not isinstance(range_obj, dict):
+            return None
+        start = range_obj.get("start")
+        if not isinstance(start, dict):
+            return None
+        try:
+            line = int(start.get("line", 0)) + 1
+        except (TypeError, ValueError):
+            line = 1
+        try:
+            col = int(start.get("character", 0)) + 1
+        except (TypeError, ValueError):
+            col = 1
+        return max(1, line), max(1, col)

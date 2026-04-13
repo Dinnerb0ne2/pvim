@@ -1,0 +1,13 @@
+{
+  "name": "css",
+  "line_comment": "",
+  "keywords": [
+    "color", "background", "border", "display", "position", "width", "height", "margin", "padding",
+    "font", "font-size", "font-weight", "line-height", "flex", "grid", "align-items", "justify-content",
+    "overflow", "opacity", "transform", "transition", "animation", "z-index"
+  ],
+  "builtins": [
+    "px", "em", "rem", "vh", "vw", "rgb", "rgba", "hsl", "var", "calc", "url"
+  ],
+  "string_delimiters": ["\"", "'"]
+}

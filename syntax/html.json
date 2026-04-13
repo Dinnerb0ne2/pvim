@@ -1,0 +1,13 @@
+{
+  "name": "html",
+  "line_comment": "",
+  "keywords": [
+    "html", "head", "body", "div", "span", "script", "style", "meta", "link", "title",
+    "h1", "h2", "h3", "p", "a", "img", "ul", "ol", "li", "table", "tr", "td", "th",
+    "form", "input", "button", "section", "article", "header", "footer", "main"
+  ],
+  "builtins": [
+    "class", "id", "href", "src", "alt", "type", "value", "name", "placeholder", "data"
+  ],
+  "string_delimiters": ["\"", "'"]
+}

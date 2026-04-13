@@ -9,7 +9,7 @@ from typing import Mapping
 from ..core.config import AppConfig
 from ..core.theme import Theme
 
-TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\d+(?:\.\d+)?")
+TOKEN_RE = re.compile(r"@[A-Za-z_][A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_]*|\d+(?:\.\d+)?")
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,29 +39,34 @@ class SyntaxManager:
         self._profile_cache: dict[Path, SyntaxProfile] = {}
         self._default_profile = PLAIN_PROFILE
 
+    def reload(self) -> None:
+        self._enabled = self._config.feature_enabled("syntax_highlighting")
+        self._extension_map_loaded = False
+        self._extension_map = {}
+        self._profile_cache = {}
+        self._default_profile = PLAIN_PROFILE
+
     def _load_extension_map(self) -> None:
         if self._extension_map_loaded:
             return
 
         self._extension_map_loaded = True
-        map_path = self._config.syntax_language_map_file()
-        if map_path is None or not map_path.exists():
-            return
-
-        loaded = json.loads(map_path.read_text(encoding="utf-8"))
-        if not isinstance(loaded, dict):
-            raise ValueError(f"Language map must be object: {map_path}")
-
         extension_map: dict[str, Path] = {}
-        for ext, file_name in loaded.items():
-            if not isinstance(ext, str) or not isinstance(file_name, str):
+        for map_path in self._config.syntax_language_map_files():
+            if not map_path.exists():
                 continue
-            normalized_ext = ext.lower()
-            if not normalized_ext.startswith("."):
-                normalized_ext = f".{normalized_ext}"
-            resolved = self._config.resolve_path(file_name)
-            if resolved is not None:
-                extension_map[normalized_ext] = resolved
+            loaded = json.loads(map_path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                raise ValueError(f"Language map must be object: {map_path}")
+            for ext, file_name in loaded.items():
+                if not isinstance(ext, str) or not isinstance(file_name, str):
+                    continue
+                normalized_ext = ext.lower()
+                if not normalized_ext.startswith("."):
+                    normalized_ext = f".{normalized_ext}"
+                resolved = self._config.resolve_path(file_name)
+                if resolved is not None:
+                    extension_map[normalized_ext] = resolved
 
         self._extension_map = extension_map
 
@@ -183,6 +188,8 @@ class SyntaxManager:
             style = ""
             if token[:1].isdigit():
                 style = theme.syntax_style("number")
+            elif token.startswith("@"):
+                style = theme.syntax_style("decorator")
             elif token in profile.keywords:
                 style = theme.syntax_style("keyword")
             elif token in profile.builtins:

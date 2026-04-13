@@ -40,6 +40,10 @@ class NormalModeMixin:
                 self.cx = min(self.cx, len(self._line()))
             elif key == "a":
                 self._open_code_actions()
+            elif key == "b":
+                self._jump_back()
+            elif key == "f":
+                self._jump_forward()
             else:
                 self._set_message(f"Unknown g motion: g{key}", error=True)
             return
@@ -221,6 +225,13 @@ class NormalModeMixin:
             self._pending_motion = ""
             return
 
+        if key == "CTRL_O":
+            self._jump_back()
+            self.pending_operator = ""
+            self.pending_scope = ""
+            self._pending_motion = ""
+            return
+
         if key == "q":
             if self._macro_recording_register is not None:
                 self._stop_macro_recording()
@@ -253,6 +264,13 @@ class NormalModeMixin:
 
         if key == "K":
             self._show_hover()
+            self.pending_operator = ""
+            self.pending_scope = ""
+            self._pending_motion = ""
+            return
+
+        if key == "%":
+            self._jump_to_matching_bracket()
             self.pending_operator = ""
             self.pending_scope = ""
             self._pending_motion = ""

@@ -3,6 +3,15 @@ from __future__ import annotations
 import shlex
 
 from ...core.config import AppConfig
+from ...features.git_tools import (
+    blame_line,
+    checkout_branch,
+    current_file_diff,
+    list_branches,
+    stage_file,
+    status_short,
+    unstage_file,
+)
 from ...features.modules.git_control import GitSnapshot
 from ..layout import NotificationCenter
 from .modes import MODE_EXPLORER
@@ -124,7 +133,7 @@ class CommandsMixin:
 
         if cmd in {"help", "h"}:
             self._set_message(
-                "Commands: :w :q :e :split/:vsplit/:only :wincmd :find/:findre :replace/:replacere :replaceall/:replaceallre :encoding :project :term :rename :format :fuzzy :grep :tree :feature :workspace :session :swap :keys :script :plugin :proc :virtual :ast :profile :piece :termcaps :lsp :diag :codeaction"
+                "Commands: :w :q :e :split/:vsplit/:only :wincmd :find/:findre :replace/:replacere :replaceall/:replaceallre :replaceproj/:replaceprojre :encoding :project :term :rename :format :fuzzy :grep :tree :feature :workspace :session :swap :keys :script :plugin :proc :virtual :ast :profile :piece :termcaps :syntax :git :jump :lsp :diag :codeaction"
             )
             return
 
@@ -175,6 +184,21 @@ class CommandsMixin:
             self._replace_regex_all(args[0], args[1], flags)
             return
 
+        if cmd in {"replaceproj", "replaceproject"}:
+            if len(args) < 2:
+                self._set_message("Usage: :replaceproj <old> <new>", error=True)
+                return
+            self._replace_all_project(args[0], args[1])
+            return
+
+        if cmd in {"replaceprojre", "replaceprojectre"}:
+            if len(args) < 2:
+                self._set_message("Usage: :replaceprojre <pattern> <replacement> [flags]", error=True)
+                return
+            flags = args[2] if len(args) >= 3 else ""
+            self._replace_regex_all_project(args[0], args[1], flags)
+            return
+
         if cmd == "rename":
             if len(args) < 2:
                 self._set_message("Usage: :rename <old> <new>", error=True)
@@ -210,6 +234,20 @@ class CommandsMixin:
 
         if cmd == "workspace":
             self._set_message(f"Workspace: {self._workspace_root}")
+            return
+
+        if cmd in {"jump", "jumps"}:
+            action = args[0].lower() if args else "back"
+            if action in {"back", "prev", "previous"}:
+                self._jump_back()
+                return
+            if action in {"forward", "next"}:
+                self._jump_forward()
+                return
+            if action in {"list", "ls"}:
+                self._show_alert("\n".join(self._jump_list_lines()))
+                return
+            self._set_message("Usage: :jump back|forward|list", error=True)
             return
 
         if cmd in {"project", "project!"}:
@@ -258,7 +296,7 @@ class CommandsMixin:
             return
 
         if cmd == "lsp":
-            action = args[0] if args else "status"
+            action = args[0].lower() if args else "status"
             if action == "status":
                 if not self._lsp_enabled:
                     self._set_message("LSP: disabled")
@@ -285,7 +323,31 @@ class CommandsMixin:
                 except Exception as exc:
                     self._set_message(f"LSP stop failed: {exc}", error=True)
                 return
-            self._set_message("Usage: :lsp status|start|stop  (:diag to show diagnostics)", error=True)
+            if action in {"refs", "references"}:
+                self._show_lsp_references()
+                return
+            if action in {"impl", "implementation"}:
+                self._show_lsp_implementation()
+                return
+            if action in {"symbols", "outline"}:
+                self._show_lsp_document_symbols(" ".join(args[1:]))
+                return
+            if action in {"wsymbol", "workspace-symbol", "workspace-symbols"}:
+                self._show_lsp_workspace_symbols(" ".join(args[1:]))
+                return
+            if action == "rename":
+                if len(args) < 2:
+                    self._set_message("Usage: :lsp rename <new_name>", error=True)
+                    return
+                self._lsp_rename_symbol(" ".join(args[1:]))
+                return
+            if action == "format":
+                self._lsp_format_document()
+                return
+            self._set_message(
+                "Usage: :lsp status|start|stop|refs|impl|symbols|wsymbol <q>|rename <name>|format",
+                error=True,
+            )
             return
 
         if cmd == "plugin":
@@ -387,21 +449,124 @@ class CommandsMixin:
         if cmd == "termcaps":
             caps = self._terminal_capabilities
             self._set_message(
-                f"Terminal truecolor={caps.true_color} colors={caps.color_level} unicode={caps.unicode_ui}"
+                "Terminal "
+                f"truecolor={caps.true_color} colors={caps.color_level} "
+                f"unicode={caps.unicode_ui} hyperlink={caps.hyperlink} sixel={caps.sixel}"
             )
             return
 
+        if cmd == "syntax":
+            action = args[0].lower() if args else "reload"
+            if action in {"reload", "refresh"}:
+                syntax = self._syntax_manager()
+                syntax.reload()
+                self._syntax_profile = syntax.profile_for_file(self.file_path)
+                self._set_message("Syntax profiles reloaded.")
+                return
+            self._set_message("Usage: :syntax reload", error=True)
+            return
+
+        if cmd == "git":
+            action = args[0].lower() if args else "status"
+            if action == "status":
+                ok, payload = status_short(self._workspace_root)
+                if not ok:
+                    self._set_message(f"Git status failed: {payload}", error=True)
+                    return
+                lines = payload if isinstance(payload, list) else []
+                self._show_alert("\n".join(lines) if lines else "(clean)")
+                return
+            if action == "branches":
+                ok, payload = list_branches(self._workspace_root)
+                if not ok:
+                    self._set_message(f"Git branch list failed: {payload}", error=True)
+                    return
+                lines = payload if isinstance(payload, list) else []
+                self._show_alert("\n".join(lines) if lines else "(no branches)")
+                return
+            if action == "checkout":
+                if len(args) < 2:
+                    self._set_message("Usage: :git checkout <branch>", error=True)
+                    return
+                ok, payload = checkout_branch(self._workspace_root, args[1])
+                if not ok:
+                    self._set_message(f"Git checkout failed: {payload}", error=True)
+                    return
+                self._set_message(payload or f"Checked out {args[1]}")
+                return
+            if self.file_path is None:
+                self._set_message("Git file command requires an opened file.", error=True)
+                return
+            if action == "diff":
+                staged = any(token.lower() in {"--staged", "--cached", "staged"} for token in args[1:])
+                ok, payload = current_file_diff(self._workspace_root, self.file_path, staged=staged)
+                if not ok:
+                    self._set_message(f"Git diff failed: {payload}", error=True)
+                    return
+                self._show_alert(payload[:7000] if payload else "(no diff)")
+                return
+            if action == "blame":
+                line = self.cy + 1
+                if len(args) >= 2:
+                    try:
+                        line = max(1, int(args[1]))
+                    except ValueError:
+                        self._set_message("Usage: :git blame [line]", error=True)
+                        return
+                ok, payload = blame_line(self._workspace_root, self.file_path, line)
+                if not ok:
+                    self._set_message(f"Git blame failed: {payload}", error=True)
+                    return
+                rendered = "\n".join(payload.splitlines()[:40])
+                self._show_alert(rendered[:7000] if rendered else "(no blame output)")
+                return
+            if action == "stage":
+                ok, payload = stage_file(self._workspace_root, self.file_path)
+                self._set_message("Git stage: ok" if ok else f"Git stage failed: {payload}", error=not ok)
+                return
+            if action == "unstage":
+                ok, payload = unstage_file(self._workspace_root, self.file_path)
+                self._set_message("Git unstage: ok" if ok else f"Git unstage failed: {payload}", error=not ok)
+                return
+            self._set_message("Usage: :git status|diff [--staged]|blame [line]|stage|unstage|branches|checkout <b>", error=True)
+            return
+
         if cmd == "session":
-            action = args[0] if args else "save"
+            action = args[0].lower() if args else "save"
             if action == "save":
+                if len(args) >= 2:
+                    path = self._session_profile_path(args[1])
+                    if path is None:
+                        self._set_message("Session name must contain letters, numbers, '_' or '-'.", error=True)
+                        return
+                    if self._save_session_to(path):
+                        self._set_message(f"Session saved: {path}")
+                    else:
+                        self._set_message(f"Session save failed: {path}", error=True)
+                    return
                 self._save_session()
                 self._set_message(f"Session saved: {self._session_path}")
                 return
             if action == "load":
+                if len(args) >= 2:
+                    path = self._session_profile_path(args[1])
+                    if path is None:
+                        self._set_message("Session name must contain letters, numbers, '_' or '-'.", error=True)
+                        return
+                    if self._restore_session_from(path):
+                        self._set_message(f"Session restored: {path}")
+                    else:
+                        self._set_message(f"Session not found: {path}", error=True)
+                    return
                 self._restore_session()
                 self._set_message("Session restored.")
                 return
-            self._set_message("Usage: :session save|load", error=True)
+            if action in {"list", "ls"}:
+                names = self._session_profile_names()
+                rendered = "\n".join(names) if names else "(no saved profiles)"
+                self._show_alert(rendered)
+                return
+            self._set_message("Usage: :session save [name] | :session load [name] | :session list", error=True)
             return
 
         if cmd == "swap":
