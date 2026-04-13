@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
+
+from ..rpc import JsonRpcPeer
 
 
 def _path_to_uri(path: Path) -> str:
@@ -64,13 +65,11 @@ def _extract_completion_items(payload: Any) -> list[str]:
 class LspClient:
     def __init__(self) -> None:
         self._process: asyncio.subprocess.Process | None = None
-        self._reader: asyncio.StreamReader | None = None
-        self._writer: asyncio.StreamWriter | None = None
-        self._reader_task: asyncio.Task[None] | None = None
-        self._next_id = 1
-        self._pending: dict[int, asyncio.Future[Any]] = {}
+        self._rpc: JsonRpcPeer | None = None
         self._documents: dict[str, int] = {}
         self._diagnostics: dict[str, list[str]] = {}
+        self._diagnostics_payload: dict[str, list[dict[str, Any]]] = {}
+        self._completion_request_id: int | None = None
         self._command: tuple[str, ...] = ()
         self._root: Path | None = None
 
@@ -91,6 +90,8 @@ class LspClient:
         self._root = normalized_root
         self._documents = {}
         self._diagnostics = {}
+        self._diagnostics_payload = {}
+        self._completion_request_id = None
 
         process = await asyncio.create_subprocess_exec(
             *clean,
@@ -104,9 +105,9 @@ class LspClient:
             raise RuntimeError("LSP process stdio is unavailable.")
 
         self._process = process
-        self._reader = process.stdout
-        self._writer = process.stdin
-        self._reader_task = asyncio.create_task(self._reader_loop())
+        self._rpc = JsonRpcPeer(process.stdout, process.stdin)
+        self._rpc.on_notification("textDocument/publishDiagnostics", self._on_publish_diagnostics)
+        await self._rpc.start()
 
         root_uri = _path_to_uri(normalized_root)
         await self._request(
@@ -128,14 +129,12 @@ class LspClient:
         await self._notify("initialized", {})
 
     async def stop(self) -> None:
-        for future in self._pending.values():
-            if not future.done():
-                future.cancel()
-        self._pending = {}
         self._documents = {}
         self._diagnostics = {}
+        self._diagnostics_payload = {}
+        self._completion_request_id = None
 
-        if self._writer is not None:
+        if self._rpc is not None:
             try:
                 await self._request("shutdown", {})
             except Exception:
@@ -144,16 +143,11 @@ class LspClient:
                 await self._notify("exit", {})
             except Exception:
                 pass
-
-        if self._reader_task is not None:
-            self._reader_task.cancel()
             try:
-                await self._reader_task
-            except asyncio.CancelledError:
-                pass
+                await self._rpc.close()
             except Exception:
                 pass
-            self._reader_task = None
+            self._rpc = None
 
         if self._process is not None and self._process.returncode is None:
             self._process.terminate()
@@ -164,8 +158,6 @@ class LspClient:
                 await self._process.wait()
 
         self._process = None
-        self._reader = None
-        self._writer = None
         self._command = ()
         self._root = None
 
@@ -229,8 +221,13 @@ class LspClient:
     async def completion(self, path: Path, line: int, column: int) -> list[str]:
         if not self.running:
             return []
+        rpc = self._rpc
+        if rpc is None:
+            return []
         uri = _path_to_uri(path)
-        payload = await self._request(
+        if self._completion_request_id is not None:
+            await rpc.send_notification("$/cancelRequest", {"id": self._completion_request_id})
+        request_id, future = rpc.send_request_with_id(
             "textDocument/completion",
             {
                 "textDocument": {"uri": uri},
@@ -238,114 +235,79 @@ class LspClient:
                 "context": {"triggerKind": 1},
             },
         )
+        self._completion_request_id = request_id
+        payload: Any = None
+        try:
+            payload = await future
+        except Exception:
+            payload = None
+        finally:
+            if self._completion_request_id == request_id:
+                self._completion_request_id = None
         return _extract_completion_items(payload)
 
     async def diagnostics(self, path: Path) -> list[str]:
         uri = _path_to_uri(path)
         return list(self._diagnostics.get(uri, []))
 
-    async def _reader_loop(self) -> None:
-        reader = self._reader
-        if reader is None:
-            return
-        try:
-            while True:
-                message = await self._read_message(reader)
-                if message is None:
-                    break
-                method = message.get("method")
-                if method == "textDocument/publishDiagnostics":
-                    self._consume_diagnostics(message.get("params"))
-                    continue
-                if "id" in message:
-                    request_id = message.get("id")
-                    if not isinstance(request_id, int):
-                        continue
-                    future = self._pending.pop(request_id, None)
-                    if future is None or future.done():
-                        continue
-                    if message.get("error") is not None:
-                        future.set_exception(RuntimeError(str(message["error"])))
-                    else:
-                        future.set_result(message.get("result"))
-        except Exception as exc:
-            for future in self._pending.values():
-                if not future.done():
-                    future.set_exception(RuntimeError(f"LSP reader failed: {exc}"))
-            self._pending = {}
-        finally:
-            for future in self._pending.values():
-                if not future.done():
-                    future.set_exception(RuntimeError("LSP connection closed."))
-            self._pending = {}
+    async def diagnostics_raw(self, path: Path) -> list[dict[str, Any]]:
+        uri = _path_to_uri(path)
+        return [dict(item) for item in self._diagnostics_payload.get(uri, [])]
+
+    async def code_actions(
+        self,
+        path: Path,
+        line: int,
+        column: int,
+        diagnostics: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        if not self.running:
+            return []
+        uri = _path_to_uri(path)
+        payload = await self._request(
+            "textDocument/codeAction",
+            {
+                "textDocument": {"uri": uri},
+                "range": {
+                    "start": {"line": max(0, line), "character": max(0, column)},
+                    "end": {"line": max(0, line), "character": max(0, column)},
+                },
+                "context": {"diagnostics": diagnostics if diagnostics is not None else []},
+            },
+        )
+        if not isinstance(payload, list):
+            return []
+        actions: list[dict[str, Any]] = []
+        for item in payload:
+            if isinstance(item, dict):
+                actions.append(item)
+        return actions
+
+    async def execute_command(self, command: str, arguments: list[Any] | None = None) -> Any:
+        if not self.running:
+            raise RuntimeError("LSP is not running.")
+        return await self._request(
+            "workspace/executeCommand",
+            {
+                "command": command,
+                "arguments": arguments or [],
+            },
+        )
+
+    async def _on_publish_diagnostics(self, params: Any) -> None:
+        self._consume_diagnostics(params)
 
     async def _request(self, method: str, params: dict[str, Any]) -> Any:
-        writer = self._writer
-        if writer is None:
+        rpc = self._rpc
+        if rpc is None:
             raise RuntimeError("LSP transport is closed.")
-        request_id = self._next_id
-        self._next_id += 1
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[Any] = loop.create_future()
-        self._pending[request_id] = future
-        await self._send(
-            {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": method,
-                "params": params,
-            }
-        )
-        return await future
+        return await rpc.request(method, params)
 
     async def _notify(self, method: str, params: dict[str, Any]) -> None:
-        await self._send(
-            {
-                "jsonrpc": "2.0",
-                "method": method,
-                "params": params,
-            }
-        )
-
-    async def _send(self, payload: dict[str, Any]) -> None:
-        writer = self._writer
-        if writer is None:
+        rpc = self._rpc
+        if rpc is None:
             raise RuntimeError("LSP transport is closed.")
-        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
-        writer.write(header + body)
-        await writer.drain()
-
-    async def _read_message(self, reader: asyncio.StreamReader) -> dict[str, Any] | None:
-        headers: dict[str, str] = {}
-        while True:
-            line = await reader.readline()
-            if not line:
-                return None
-            text = line.decode("ascii", errors="ignore").strip()
-            if not text:
-                break
-            if ":" not in text:
-                continue
-            key, value = text.split(":", 1)
-            headers[key.strip().lower()] = value.strip()
-
-        length_text = headers.get("content-length")
-        if length_text is None:
-            return None
-        try:
-            length = int(length_text)
-        except ValueError:
-            return None
-        if length <= 0:
-            return None
-
-        raw = await reader.readexactly(length)
-        decoded = raw.decode("utf-8", errors="ignore")
-        payload = json.loads(decoded)
-        if not isinstance(payload, dict):
-            return None
-        return payload
+        await rpc.send_notification(method, params)
 
     def _consume_diagnostics(self, params: Any) -> None:
         if not isinstance(params, dict):
@@ -356,7 +318,9 @@ class LspClient:
         payload = params.get("diagnostics", [])
         if not isinstance(payload, list):
             self._diagnostics[uri] = []
+            self._diagnostics_payload[uri] = []
             return
+        self._diagnostics_payload[uri] = [item for item in payload if isinstance(item, dict)]
 
         severity_map = {
             1: "Error",

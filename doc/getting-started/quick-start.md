@@ -31,6 +31,7 @@ python pvim.py your_file.py --config pvim.config.json
 - `:term [command]`（内置终端）
 - `:split` / `:vsplit` / `:only`（分屏管理）
 - `:encoding [name]`（查看/切换编码）
+- `:codeaction`（LSP 代码动作）
 - `:tree open|refresh|close|toggle`
 - `:session save|load`
 - `:swap write|clear`

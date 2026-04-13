@@ -38,6 +38,8 @@ class NormalModeMixin:
             elif key == "g":
                 self.cy = 0
                 self.cx = min(self.cx, len(self._line()))
+            elif key == "a":
+                self._open_code_actions()
             else:
                 self._set_message(f"Unknown g motion: g{key}", error=True)
             return

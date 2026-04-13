@@ -55,6 +55,12 @@ doc/
 
 详细文档见 [doc/README.md](./doc/README.md)，推荐先读 [详细使用手册](./doc/getting-started/user-manual.md)。
 
+## 测试
+
+```bash
+python -m tests.run_tests
+```
+
 ## License
 
 本项目以 **GNU GPL v3.0 (or later)** 开源发布。  

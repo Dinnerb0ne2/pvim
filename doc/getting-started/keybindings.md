@@ -29,6 +29,7 @@
 ## 跳转与搜索
 
 - `gd`：转到定义（当前工程内）
+- `ga`：代码动作（LSP）
 - `Ctrl+P`：fuzzy 文件搜索
 - `:grep <query>`：全局实时搜索
 - `:findre <pattern> [flags]`：正则搜索

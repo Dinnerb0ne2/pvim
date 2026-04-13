@@ -10,6 +10,13 @@ IGNORED_DIRS = {
     "venv",
     ".mypy_cache",
     ".pytest_cache",
+    "node_modules",
+    "dist",
+    "build",
+}
+
+IGNORED_SUFFIXES = {
+    ".pyc",
 }
 
 
@@ -30,6 +37,8 @@ class FileIndex:
             names.sort()
             for name in names:
                 if name.startswith("."):
+                    continue
+                if Path(name).suffix.lower() in IGNORED_SUFFIXES:
                     continue
                 full_path = Path(current_root) / name
                 if not full_path.is_file():

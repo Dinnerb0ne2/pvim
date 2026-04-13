@@ -124,7 +124,7 @@ class CommandsMixin:
 
         if cmd in {"help", "h"}:
             self._set_message(
-                "Commands: :w :q :e :split/:vsplit/:only :wincmd :find/:findre :replace/:replacere :replaceall/:replaceallre :encoding :project :term :rename :format :fuzzy :grep :tree :feature :workspace :session :swap :keys :script :plugin :proc :virtual :ast :profile :piece :termcaps :lsp :diag"
+                "Commands: :w :q :e :split/:vsplit/:only :wincmd :find/:findre :replace/:replacere :replaceall/:replaceallre :encoding :project :term :rename :format :fuzzy :grep :tree :feature :workspace :session :swap :keys :script :plugin :proc :virtual :ast :profile :piece :termcaps :lsp :diag :codeaction"
             )
             return
 
@@ -228,6 +228,10 @@ class CommandsMixin:
 
         if cmd in {"diag", "diagnostic", "diagnostics"}:
             self._show_lsp_diagnostics()
+            return
+
+        if cmd in {"codeaction", "codeactions", "ca"}:
+            self._open_code_actions()
             return
 
         if cmd in {"files-refresh", "refresh-files"}:

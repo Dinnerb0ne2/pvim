@@ -89,3 +89,5 @@ class InsertModeMixin:
 
         if len(key) == 1 and key.isprintable():
             self._insert_printable(key)
+            if key in {".", ">", ":"}:
+                self._open_tab_completion()

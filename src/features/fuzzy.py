@@ -13,25 +13,30 @@ def fuzzy_score(candidate: str, query: str) -> float | None:
     index = -1
     score = 0.0
     streak = 0.0
-    for token in query:
+    for token_index, token in enumerate(query):
         found = text.find(token, index + 1)
         if found < 0:
             return None
 
+        if token_index == 0:
+            score -= found * 1.5
+
         if index >= 0:
             gap = found - index - 1
-            score -= gap * 0.35
+            score -= gap * 0.2
             if gap == 0:
-                streak += 1.5
+                streak += 0.8
+            else:
+                streak = 0.0
 
         if found == 0 or text[found - 1] in "\\/_-. ":
-            score += 1.5
+            score += 3.0
 
-        score += 5.0
+        score += 4.0
         index = found
 
     score += streak
-    score -= len(text) * 0.02
+    score -= len(text) * 0.01
     return score
 
 

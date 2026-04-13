@@ -152,6 +152,9 @@ class UIModeMixin:
             if self._floating_source == "live_grep":
                 self._accept_live_grep_selection()
                 return
+            if self._floating_source == "code_action":
+                self._accept_code_action_selection()
+                return
             selected = popup.selected_item()
             if selected is not None:
                 self._set_message(selected)
@@ -171,6 +174,10 @@ class UIModeMixin:
         if key in {"DOWN", "CTRL_RIGHT"}:
             self._file_tree_feature.move_down(visible_rows)
             self._sync_file_tree_popup()
+            return
+        if key == "-":
+            if self._file_tree_feature.toggle_selected_directory():
+                self._sync_file_tree_popup()
             return
         if key == "ENTER":
             selected = self._file_tree_feature.selected_path()

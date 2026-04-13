@@ -5,11 +5,13 @@
 - `src/ui/editor/editor.py`：编辑器主类与事件循环渲染
 - `src/ui/editor/*.py`：按模式拆分（normal/insert/ui/commands）与文本对象纯函数
 - `src/core/async_runtime.py`：后台 asyncio 任务调度
-- `src/core/console.py`：跨平台终端控制与按键读取（Windows/POSIX）
+- `src/ui_grid.py`：UI 抽象协议（Cell / AbstractUI）
+- `src/core/console.py`：`TerminalUI` 终端实现与按键读取（Windows/POSIX）
 - `src/core/buffer.py`：文本缓冲区 + 虚拟文本 + PieceTable 同步
 - `src/core/history.py`：撤销/重做快照栈
 - `src/core/persistence.py`：swap/session 持久化
 - `src/core/display.py`：CJK 双宽字符显示宽度计算
+- `src/rpc.py`：通用 JSON-RPC 双向通信组件
 - `src/features/lsp.py`：纯标准库 LSP(JSON-RPC) 客户端
 
 ## 渲染路径

@@ -2,18 +2,47 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Any
+
+IGNORED_DIRS = {
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".mypy_cache",
+    ".pytest_cache",
+    "node_modules",
+    "dist",
+    "build",
+}
+
+IGNORED_FILE_SUFFIXES = {
+    ".pyc",
+}
 
 
 @dataclass(slots=True, frozen=True)
 class TreeEntry:
     display: str
     relative_path: str
+    node_path: str
+    is_dir: bool
 
 
 class FileTreeFeature:
-    __slots__ = ("enabled", "visible", "entries", "selected", "scroll", "title", "unicode_art")
+    __slots__ = (
+        "enabled",
+        "visible",
+        "entries",
+        "selected",
+        "scroll",
+        "title",
+        "unicode_art",
+        "_collapsed_dirs",
+        "_raw_paths",
+    )
 
     def __init__(self, *, enabled: bool = False) -> None:
         self.enabled = enabled
@@ -23,6 +52,8 @@ class FileTreeFeature:
         self.scroll = 0
         self.title = "EXPLORER"
         self.unicode_art = True
+        self._collapsed_dirs: set[str] = set()
+        self._raw_paths: list[str] = []
 
     async def collect_paths(self, root: Path) -> list[str]:
         if not self.enabled:
@@ -30,7 +61,8 @@ class FileTreeFeature:
         return await self._list_files(root)
 
     def apply_paths(self, paths: list[str]) -> None:
-        self.entries = self._flatten_as_tree(paths)
+        self._raw_paths = sorted({item for item in paths if item.strip()}, key=lambda item: item.lower())
+        self.entries = self._flatten_as_tree(self._raw_paths, self._collapsed_dirs)
         self.selected = min(self.selected, max(0, len(self.entries) - 1))
         self.scroll = min(self.scroll, max(0, len(self.entries) - 1))
 
@@ -56,7 +88,31 @@ class FileTreeFeature:
     def selected_path(self) -> str | None:
         if not self.entries:
             return None
-        return self.entries[self.selected].relative_path
+        entry = self.entries[self.selected]
+        if entry.is_dir:
+            return None
+        return entry.relative_path
+
+    def toggle_selected_directory(self) -> bool:
+        if not self.entries:
+            return False
+        entry = self.entries[self.selected]
+        if not entry.is_dir or not entry.node_path:
+            return False
+        if entry.node_path in self._collapsed_dirs:
+            self._collapsed_dirs.remove(entry.node_path)
+        else:
+            self._collapsed_dirs.add(entry.node_path)
+
+        current_node = entry.node_path
+        self.entries = self._flatten_as_tree(self._raw_paths, self._collapsed_dirs)
+        for index, candidate in enumerate(self.entries):
+            if candidate.node_path == current_node:
+                self.selected = index
+                break
+        self.selected = min(self.selected, max(0, len(self.entries) - 1))
+        self.scroll = min(self.scroll, max(0, len(self.entries) - 1))
+        return True
 
     def visible_entries(self, height: int) -> list[TreeEntry]:
         rows = max(1, height)
@@ -64,35 +120,45 @@ class FileTreeFeature:
         return self.entries[self.scroll : end]
 
     async def _list_files(self, root: Path) -> list[str]:
-        try:
-            process = await asyncio.create_subprocess_exec(
-                "fd",
-                "--color",
-                "never",
-                "--type",
-                "f",
-                ".",
-                str(root),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _stderr = await process.communicate()
-            if process.returncode == 0:
-                lines = stdout.decode("utf-8", errors="replace").splitlines()
-                return [line.strip().replace("\\", "/") for line in lines if line.strip()]
-        except OSError:
-            pass
+        return await asyncio.to_thread(self._scan_files, root.resolve())
 
+    def _scan_files(self, root: Path) -> list[str]:
         files: list[str] = []
-        for current_root, _dirs, names in root.walk():
-            for name in sorted(names):
-                relative = str((current_root / name).relative_to(root)).replace("\\", "/")
-                files.append(relative)
-        return files
+        root_path = str(root)
+        stack: list[str] = [root_path]
+        while stack:
+            current = stack.pop()
+            try:
+                with os.scandir(current) as entries_iter:
+                    files_batch: list[str] = []
+                    dirs_batch: list[str] = []
+                    for entry in entries_iter:
+                        name = entry.name
+                        if entry.is_dir(follow_symlinks=False):
+                            if name.startswith(".") or name in IGNORED_DIRS:
+                                continue
+                            dirs_batch.append(entry.path)
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        if name.startswith("."):
+                            continue
+                        suffix = Path(name).suffix.lower()
+                        if suffix in IGNORED_FILE_SUFFIXES:
+                            continue
+                        relative = os.path.relpath(entry.path, root_path).replace("\\", "/")
+                        files_batch.append(relative)
+                    files.extend(sorted(files_batch, key=lambda item: item.lower()))
+                    dirs_batch.sort(key=lambda item: str(item).lower(), reverse=True)
+                    stack.extend(dirs_batch)
+            except OSError:
+                continue
+        return sorted(files, key=lambda item: item.lower())
 
-    def _flatten_as_tree(self, paths: list[str]) -> list[TreeEntry]:
+    def _flatten_as_tree(self, paths: list[str], collapsed: set[str] | None = None) -> list[TreeEntry]:
         if not paths:
             return []
+        collapsed_dirs = collapsed or set()
 
         tree: dict[str, Any] = {}
         sorted_paths = sorted(paths, key=lambda item: item.lower())
@@ -104,7 +170,7 @@ class FileTreeFeature:
             node[parts[-1]] = rel_path
 
         output: list[TreeEntry] = []
-        self._emit_tree(output, tree, depth=0, prefix_stack=[])
+        self._emit_tree(output, tree, depth=0, prefix_stack=[], collapsed=collapsed_dirs, prefix_path=[])
         return output
 
     def _emit_tree(
@@ -114,6 +180,8 @@ class FileTreeFeature:
         *,
         depth: int,
         prefix_stack: list[bool],
+        collapsed: set[str],
+        prefix_path: list[str],
     ) -> None:
         keys = sorted(node.keys(), key=lambda item: item.lower())
         for index, key in enumerate(keys):
@@ -130,9 +198,21 @@ class FileTreeFeature:
                     prefix = "".join("    " if done else "|   " for done in prefix_stack)
             payload = node[key]
             if isinstance(payload, dict):
-                display = f"{prefix}{branch}{key}/"
-                output.append(TreeEntry(display=display, relative_path=""))
-                self._emit_tree(output, payload, depth=depth + 1, prefix_stack=[*prefix_stack, is_last])
+                node_path = "/".join([*prefix_path, key])
+                collapsed_here = node_path in collapsed
+                suffix = "/ [..]" if collapsed_here else "/"
+                display = f"{prefix}{branch}{key}{suffix}"
+                output.append(TreeEntry(display=display, relative_path="", node_path=node_path, is_dir=True))
+                if not collapsed_here:
+                    self._emit_tree(
+                        output,
+                        payload,
+                        depth=depth + 1,
+                        prefix_stack=[*prefix_stack, is_last],
+                        collapsed=collapsed,
+                        prefix_path=[*prefix_path, key],
+                    )
             else:
                 display = f"{prefix}{branch}{key}"
-                output.append(TreeEntry(display=display, relative_path=str(payload)))
+                file_path = str(payload)
+                output.append(TreeEntry(display=display, relative_path=file_path, node_path=file_path, is_dir=False))

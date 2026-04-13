@@ -9,20 +9,20 @@ import os
 from pathlib import Path
 import pstats
 import re
-import sys
 import time
 
 from ... import APP_NAME, APP_VERSION
 from ...core.async_runtime import AsyncRuntime
 from ...core.buffer import Buffer
 from ...core.config import AppConfig
-from ...core.console import CSI, ConsoleController, KeyReader
+from ...core.console import KeyReader, TerminalUI
 from ...core.display import display_width, index_from_display_col, pad_to_display, slice_by_display
 from ...core.history import ActionRecord, ActionSnapshot, HistoryStack
 from ...core.persistence import EditorPersistence, SwapPayload
 from ...core.process_pipe import AsyncProcessManager
 from ...core.terminal_capabilities import detect_terminal_capabilities
 from ...core.theme import RESET, Theme, load_theme
+from ...ui_grid import AbstractUI
 from ...features.ast_query import AstQueryService
 from ...features.file_index import FileIndex
 from ...features.formatter import normalize_code_style, organize_python_imports
@@ -64,7 +64,7 @@ def clamp(value: int, low: int, high: int) -> int:
 
 
 class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
-    def __init__(self, file_path: Path | None, config: AppConfig) -> None:
+    def __init__(self, file_path: Path | None, config: AppConfig, ui: AbstractUI | None = None) -> None:
         self.config = config
 
         self.buffer = Buffer(lines=[""])
@@ -106,6 +106,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._lsp_command: list[str] = []
         self._lsp_timeout_seconds = 1.2
         self._lsp_client: LspClient | None = None
+        self._lsp_code_actions: list[dict[str, Any]] = []
 
         self._history = HistoryStack(max_actions=400)
         self._history_enabled = True
@@ -152,7 +153,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._last_frame: list[str] = []
         self._last_view_state: tuple[object, ...] | None = None
         self._last_cursor_line = 0
-        self._console = ConsoleController()
+        self._ui = ui if ui is not None else TerminalUI()
         self._async_runtime = AsyncRuntime()
         self._process_manager = AsyncProcessManager(self._async_runtime)
         self._last_tick = time.monotonic()
@@ -641,6 +642,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             "  :findre / :replacere / :replaceallre regex search-replace",
             "  Ctrl+R rename symbol",
             "  K hover docs (when LSP enabled)",
+            "  ga code action (LSP)",
             "  F3 file tree",
             "  F4 toggle sidebar",
             "  F8 normalize code style",
@@ -675,7 +677,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             "  :encoding [name]",
             "  :session save|load",
             "  :swap write|clear",
-            "  :tree open|refresh|close|toggle",
+            "  :tree open|refresh|close|toggle  (- fold in explorer)",
             "  :feature <name> <on|off>",
             "  :lsp status|start|stop",
             "  :diag show LSP diagnostics",
@@ -1231,6 +1233,182 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         rendered = "\n".join(items[:240])
         self._show_alert(rendered[:7000])
 
+    def _lsp_uri_to_path(self, uri: str) -> Path | None:
+        from urllib.parse import unquote, urlparse
+
+        parsed = urlparse(uri)
+        if parsed.scheme != "file":
+            return None
+        raw = unquote(parsed.path)
+        if os.name == "nt" and raw.startswith("/") and len(raw) > 2 and raw[2] == ":":
+            raw = raw[1:]
+        return Path(raw)
+
+    def _apply_text_edits(self, path: Path, edits: list[dict[str, Any]]) -> bool:
+        if self.file_path is None:
+            return False
+        if path.resolve() != self.file_path.resolve():
+            self._set_message(f"Code action skipped external file: {path}", error=True)
+            return False
+        if not edits:
+            return False
+        sorted_edits = sorted(
+            edits,
+            key=lambda item: (
+                int(item.get("range", {}).get("start", {}).get("line", 0)),
+                int(item.get("range", {}).get("start", {}).get("character", 0)),
+            ),
+            reverse=True,
+        )
+        changed = False
+        for edit in sorted_edits:
+            if not isinstance(edit, dict):
+                continue
+            range_obj = edit.get("range")
+            if not isinstance(range_obj, dict):
+                continue
+            start = range_obj.get("start")
+            end = range_obj.get("end")
+            if not isinstance(start, dict) or not isinstance(end, dict):
+                continue
+            try:
+                start_line = clamp(int(start.get("line", 0)), 0, len(self.lines) - 1)
+                start_col = max(0, int(start.get("character", 0)))
+                end_line = clamp(int(end.get("line", 0)), 0, len(self.lines) - 1)
+                end_col = max(0, int(end.get("character", 0)))
+            except (TypeError, ValueError):
+                continue
+            new_text = str(edit.get("newText", ""))
+            if start_line == end_line:
+                line = self.lines[start_line]
+                start_col = clamp(start_col, 0, len(line))
+                end_col = clamp(end_col, start_col, len(line))
+                self.lines[start_line] = line[:start_col] + new_text + line[end_col:]
+            else:
+                head = self.lines[start_line][: clamp(start_col, 0, len(self.lines[start_line]))]
+                tail = self.lines[end_line][clamp(end_col, 0, len(self.lines[end_line])) :]
+                replacement = (head + new_text + tail).split("\n")
+                self.lines[start_line : end_line + 1] = replacement if replacement else [""]
+            changed = True
+        if changed:
+            self.buffer.mark_all_dirty()
+            self._mark_modified()
+        return changed
+
+    def _apply_workspace_edit(self, payload: dict[str, Any]) -> bool:
+        changed = False
+        changes = payload.get("changes")
+        if isinstance(changes, dict):
+            for uri, edits in changes.items():
+                if not isinstance(uri, str) or not isinstance(edits, list):
+                    continue
+                path = self._lsp_uri_to_path(uri)
+                if path is None:
+                    continue
+                changed = self._apply_text_edits(path, [item for item in edits if isinstance(item, dict)]) or changed
+        doc_changes = payload.get("documentChanges")
+        if isinstance(doc_changes, list):
+            for item in doc_changes:
+                if not isinstance(item, dict):
+                    continue
+                text_document = item.get("textDocument")
+                edits = item.get("edits")
+                if not isinstance(text_document, dict) or not isinstance(edits, list):
+                    continue
+                uri = text_document.get("uri")
+                if not isinstance(uri, str):
+                    continue
+                path = self._lsp_uri_to_path(uri)
+                if path is None:
+                    continue
+                changed = self._apply_text_edits(path, [entry for entry in edits if isinstance(entry, dict)]) or changed
+        return changed
+
+    def _open_code_actions(self) -> None:
+        client = self._ensure_lsp_ready(show_error=True)
+        if client is None or self.file_path is None:
+            return
+        try:
+            diagnostics = self._async_runtime.run_sync(
+                client.diagnostics_raw(self.file_path),
+                timeout=self._lsp_timeout_seconds,
+            )
+            actions = self._async_runtime.run_sync(
+                client.code_actions(self.file_path, self.cy, self.cx, diagnostics),
+                timeout=self._lsp_timeout_seconds,
+            )
+        except Exception as exc:
+            self._set_message(f"LSP code action failed: {exc}", error=True)
+            return
+        if not actions:
+            self._set_message("No code actions.")
+            return
+        labels: list[str] = []
+        filtered: list[dict[str, Any]] = []
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            title = action.get("title")
+            if not isinstance(title, str) or not title.strip():
+                continue
+            filtered.append(action)
+            labels.append(title.strip())
+        if not filtered:
+            self._set_message("No code actions.")
+            return
+        self._lsp_code_actions = filtered
+        self._floating_list = FloatingList(
+            title="Code Actions",
+            footer="<Enter> apply  <Esc> close",
+            items=labels,
+        )
+        self._floating_source = "code_action"
+        self._floating_accept_mode = MODE_NORMAL
+        self.mode = MODE_FLOAT_LIST
+
+    def _accept_code_action_selection(self) -> None:
+        popup = self._floating_list
+        if popup is None:
+            return
+        index = popup.selected
+        if not (0 <= index < len(self._lsp_code_actions)):
+            return
+        action = self._lsp_code_actions[index]
+        client = self._ensure_lsp_ready(show_error=True)
+        if client is None:
+            return
+        applied = False
+        edit = action.get("edit")
+        if isinstance(edit, dict):
+            applied = self._apply_workspace_edit(edit) or applied
+        command = action.get("command")
+        command_name: str | None = None
+        arguments: list[Any] = []
+        if isinstance(command, dict):
+            raw_name = command.get("command")
+            if isinstance(raw_name, str):
+                command_name = raw_name
+            raw_args = command.get("arguments")
+            if isinstance(raw_args, list):
+                arguments = list(raw_args)
+        elif isinstance(command, str):
+            command_name = command
+        if command_name:
+            try:
+                result = self._async_runtime.run_sync(
+                    client.execute_command(command_name, arguments),
+                    timeout=self._lsp_timeout_seconds,
+                )
+            except Exception as exc:
+                self._set_message(f"LSP executeCommand failed: {exc}", error=True)
+                return
+            if isinstance(result, dict):
+                applied = self._apply_workspace_edit(result) or applied
+        self._floating_list = None
+        self._floating_source = ""
+        self.mode = MODE_NORMAL
+        self._set_message("Code action applied." if applied else "Code action executed.")
+
     def _lsp_completion_candidates(self) -> list[str]:
         client = self._ensure_lsp_ready(show_error=False)
         if client is None or self.file_path is None:
@@ -1324,11 +1502,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         return (base / path).resolve()
 
     def _terminal_size(self) -> tuple[int, int]:
-        try:
-            size = os.get_terminal_size()
-            return max(40, size.columns), max(8, size.lines)
-        except OSError:
-            return 120, 30
+        return self._ui.get_size()
 
     def _line(self) -> str:
         return self.lines[self.cy]
@@ -2020,7 +2194,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
 
     def _update_fuzzy_matches(self) -> None:
         all_files = self.file_index.list_files()
-        self.fuzzy_matches = fuzzy_filter(all_files, self.fuzzy_query, limit=40)
+        self.fuzzy_matches = fuzzy_filter(all_files, self.fuzzy_query, limit=20)
         self.fuzzy_index = clamp(self.fuzzy_index, 0, max(0, len(self.fuzzy_matches) - 1))
         if self._floating_list is not None:
             self._floating_list.selected = self.fuzzy_index
@@ -2050,7 +2224,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         if popup is None or self._floating_source != "file_tree":
             popup = FloatingList(
                 title="EXPLORER",
-                footer="<Esc> close  <Enter> open  <Up/Down> move",
+                footer="<Esc> close  <Enter> open  <Up/Down> move  - fold",
             )
             self._floating_list = popup
             self._floating_source = "file_tree"
@@ -3565,15 +3739,15 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             if line != self._last_frame[row_index - 1]:
                 candidate_rows.add(row_index)
 
-        out: list[str] = []
+        dirty_rows: list[int] = []
         for row in sorted(candidate_rows):
             line = frame[row - 1]
             if line != self._last_frame[row - 1]:
-                out.append(f"{CSI}{row};1H{line}")
+                dirty_rows.append(row)
 
-        out.append(f"{CSI}{cursor_row};{cursor_col}H")
-        sys.stdout.write("".join(out))
-        sys.stdout.flush()
+        self._ui.update_grid(frame, dirty_rows=dirty_rows)
+        self._ui.set_cursor(cursor_row, cursor_col)
+        self._ui.flush()
         self._last_frame = frame
         self._last_view_state = view_state
         self._last_cursor_line = self.cy
@@ -3755,7 +3929,8 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._push_history_if_changed(before, label=f"key:{key}")
 
     def run(self) -> None:
-        self._console.enter()
+        if isinstance(self._ui, TerminalUI):
+            self._ui.enter()
         try:
             while self.running:
                 if self._input_queue or KeyReader.has_key():
@@ -3790,7 +3965,8 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                 except Exception:
                     pass
             self._async_runtime.close()
-            self._console.exit()
+            if isinstance(self._ui, TerminalUI):
+                self._ui.exit()
 
 
 # Backward-compat alias for older imports.

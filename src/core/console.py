@@ -4,6 +4,8 @@ import os
 import sys
 import time
 
+from ..ui_grid import AbstractUI
+
 IS_WINDOWS = os.name == "nt"
 
 if IS_WINDOWS:
@@ -62,7 +64,7 @@ CONTROL_KEYS = {
 }
 
 
-class ConsoleController:
+class TerminalUI(AbstractUI):
     if IS_WINDOWS:
         STD_OUTPUT_HANDLE = -11
         ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
@@ -76,6 +78,7 @@ class ConsoleController:
         else:
             self._input_fd = sys.stdin.fileno()
             self._original_mode: list[int] | None = None
+        self._buffer: list[str] = []
 
     def enter(self) -> None:
         if IS_WINDOWS:
@@ -93,8 +96,8 @@ class ConsoleController:
             self._original_mode = termios.tcgetattr(self._input_fd)
             tty.setraw(self._input_fd)
 
-        sys.stdout.write(f"{CSI}?1049h{CSI}2J{CSI}H")
-        sys.stdout.flush()
+        self.clear()
+        self.flush()
 
     def exit(self) -> None:
         try:
@@ -105,8 +108,36 @@ class ConsoleController:
                 if self._original_mode is not None:
                     termios.tcsetattr(self._input_fd, termios.TCSADRAIN, self._original_mode)
         finally:
-            sys.stdout.write(f"{RESET}{CSI}?1049l")
-            sys.stdout.flush()
+            self._buffer.append(f"{RESET}{CSI}?1049l")
+            self.flush()
+
+    def update_grid(self, rows: list[str], *, dirty_rows: list[int] | None = None) -> None:
+        target_rows = dirty_rows if dirty_rows is not None else list(range(1, len(rows) + 1))
+        for row in target_rows:
+            if 1 <= row <= len(rows):
+                self._buffer.append(f"{CSI}{row};1H{rows[row - 1]}")
+
+    def flush(self) -> None:
+        if not self._buffer:
+            return
+        sys.stdout.write("".join(self._buffer))
+        sys.stdout.flush()
+        self._buffer.clear()
+
+    def set_cursor(self, row: int, col: int) -> None:
+        safe_row = max(1, row)
+        safe_col = max(1, col)
+        self._buffer.append(f"{CSI}{safe_row};{safe_col}H")
+
+    def get_size(self) -> tuple[int, int]:
+        try:
+            size = os.get_terminal_size()
+            return max(40, size.columns), max(8, size.lines)
+        except OSError:
+            return 120, 30
+
+    def clear(self) -> None:
+        self._buffer.append(f"{CSI}?1049h{CSI}2J{CSI}H")
 
 
 POSIX_SPECIAL_KEYS = {
@@ -187,3 +218,7 @@ class KeyReader:
                 return "ESC"
             return POSIX_SPECIAL_KEYS.get(sequence, "UNKNOWN")
         return CONTROL_KEYS.get(key, key)
+
+
+# Backward compatibility for previous imports.
+ConsoleController = TerminalUI

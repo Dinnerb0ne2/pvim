@@ -24,6 +24,7 @@ python pvim.py --config pvim.config.json
 
 - 保存与退出：`Ctrl+S`、`Ctrl+Q`
 - 搜索与导航：`Ctrl+P`（模糊查找）、`:grep <text>`（全局搜索）、`gd`（转到定义）
+- LSP 动作：`ga` 或 `:codeaction`
 - 提示与面板：`F1`（快捷键提示）、`F3`（文件树）、`F4`（侧栏）
 - 编辑：`u`（撤销）、`Ctrl+Y`（重做）、`Tab/Shift+Tab`（缩进）
 - 文本对象：`ciw`、`da"`、`vap`、`cif`
