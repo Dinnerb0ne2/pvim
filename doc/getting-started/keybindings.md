@@ -13,6 +13,7 @@
 - `Ctrl+/` 注释切换
 - `Tab` / `Shift+Tab` 缩进/反缩进
 - `Ctrl+Left` / `Ctrl+Right` 单词跳转
+- `%`：跳到匹配括号
 
 ## 文本对象（普通模式）
 
@@ -29,16 +30,21 @@
 ## 跳转与搜索
 
 - `gd`：转到定义（当前工程内）
+- `gb` / `gf`：跳转历史后退 / 前进
+- `Ctrl+O`：快捷后退
 - `ga`：代码动作（LSP）
 - `Ctrl+P`：fuzzy 文件搜索
 - `:grep <query>`：全局实时搜索
 - `:findre <pattern> [flags]`：正则搜索
 - `:replaceallre <pattern> <replacement> [flags]`：正则全量替换
+- `:replaceproj <old> <new>`：项目级全量替换
+- `:replaceprojre <pattern> <replacement> [flags]`：项目级正则替换
 
 ## 项目与终端
 
 - `:project <dir>`：打开目录工作区
 - `:term [command]`：打开内置终端面板
+- `:git status|diff|blame|stage|unstage|branches|checkout`
 
 ## 分屏
 

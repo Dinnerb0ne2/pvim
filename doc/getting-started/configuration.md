@@ -23,12 +23,42 @@
 ```json
 {
   "features": {
+    "syntax_highlighting": {
+      "enabled": true,
+      "language_map_file": "syntax\\languages.json",
+      "extra_language_map_files": ["syntax\\custom-languages.json"]
+    },
     "text_objects": { "enabled": true },
     "undo_tree": { "enabled": true, "max_actions": 400 },
     "macros": { "enabled": true },
     "live_grep": { "enabled": true, "max_results": 200 },
     "swap": { "enabled": true, "interval_seconds": 4.0 },
-    "session": { "enabled": true, "file": ".pvim.session.json" }
+    "session": {
+      "enabled": true,
+      "file": ".pvim.session.json",
+      "profiles_directory": ".pvim.sessions"
+    },
+    "config_reload": { "enabled": true, "interval_seconds": 1.0 }
+  }
+}
+```
+
+## 快捷键映射（含按语言覆盖）
+
+```json
+{
+  "features": {
+    "vscode_shortcuts": {
+      "enabled": true,
+      "bindings": {
+        "format_code": "F8",
+        "jump_back": "CTRL_O"
+      },
+      "filetype_bindings": {
+        "python": { "format_code": "F8" },
+        "typescript": { "format_code": "F8" }
+      }
+    }
   }
 }
 ```
@@ -36,6 +66,8 @@
 ## 运行时命令
 
 - `:reload-config`
+- `:syntax reload`
 - `:feature <name> <on|off>`
+- `:session save [name] / :session load [name] / :session list`
 - `:termcaps`
 - `:piece`

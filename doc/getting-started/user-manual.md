@@ -24,6 +24,7 @@ python pvim.py --config pvim.config.json
 
 - 保存与退出：`Ctrl+S`、`Ctrl+Q`
 - 搜索与导航：`Ctrl+P`（模糊查找）、`:grep <text>`（全局搜索）、`gd`（转到定义）
+- 跳转历史：`gb` / `gf`、`Ctrl+O`、`:jump back|forward|list`
 - LSP 动作：`ga` 或 `:codeaction`
 - 提示与面板：`F1`（快捷键提示）、`F3`（文件树）、`F4`（侧栏）
 - 编辑：`u`（撤销）、`Ctrl+Y`（重做）、`Tab/Shift+Tab`（缩进）
@@ -50,6 +51,8 @@ python pvim.py --config pvim.config.json
 - `:findre <pattern> [flags]`
 - `:replacere <pattern> <replacement> [flags]`
 - `:replaceallre <pattern> <replacement> [flags]`
+- `:replaceproj <old> <new>`
+- `:replaceprojre <pattern> <replacement> [flags]`
 
 可用 flags：
 - `i` 忽略大小写
@@ -100,6 +103,7 @@ python pvim.py --config pvim.config.json
 
 - Swap 崩溃恢复：异常退出后下次打开同名文件会提示恢复。
 - 会话恢复：保留当前文件、光标、标签页、工作区。
+- 多会话档案：`:session save <name>` / `:session load <name>` / `:session list`
 - 自动保存：按 `features.auto_save.interval_seconds` 周期自动落盘（默认开启）。
 
 ## 10. LSP（可选）
@@ -108,6 +112,9 @@ python pvim.py --config pvim.config.json
 
 - `gd` 跳转定义
 - `K` 悬浮文档
+- `:lsp refs|impl|symbols|wsymbol`
+- `:lsp rename <new_name>`
+- `:lsp format`
 - `:lsp status|start|stop`
 - `:diag` 查看诊断
 
@@ -116,4 +123,5 @@ python pvim.py --config pvim.config.json
 - `:termcaps` 查看终端能力（真彩/颜色级别/Unicode）。
 - 如果边框字符异常：更换支持 UTF-8 的终端字体，或使用非 Unicode 回退字符。
 - 如果快捷键不生效：先按 `F1` 查看当前映射，再检查 `pvim.config.json` 的 `vscode_shortcuts`。
+- 修改配置后可直接保存，编辑器会按 `features.config_reload.interval_seconds` 自动热重载。
 - 如果误触模式导致输入异常：按 `Esc` 回普通模式，再继续操作。
