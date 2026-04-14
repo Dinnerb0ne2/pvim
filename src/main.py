@@ -4,6 +4,7 @@ import argparse
 import os
 from pathlib import Path
 import sys
+import traceback
 from typing import Iterable
 
 from . import APP_NAME, APP_VERSION
@@ -58,4 +59,16 @@ def main(argv: Iterable[str] | None = None) -> None:
 
     file_path = Path(args.file).expanduser() if args.file else None
     editor = PvimEditor(file_path=file_path, config=config)
-    editor.run()
+    try:
+        editor.run()
+    except KeyboardInterrupt:
+        raise SystemExit(0)
+    except Exception as exc:
+        details = traceback.TracebackException.from_exception(exc)
+        message = str(exc).strip() or exc.__class__.__name__
+        if details.stack:
+            frame = details.stack[-1]
+            print(f"PVIM fatal error: {message} ({frame.filename}:{frame.lineno})", file=sys.stderr)
+        else:
+            print(f"PVIM fatal error: {message}", file=sys.stderr)
+        raise SystemExit(1) from exc

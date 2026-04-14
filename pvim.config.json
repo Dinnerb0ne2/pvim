@@ -24,7 +24,8 @@
       "enabled": true,
       "language_map_file": "syntax\\languages.json",
       "extra_language_map_files": [],
-      "default_file": "syntax\\plaintext.json"
+      "default_file": "syntax\\plaintext.json",
+      "regex_rules_file": "syntax\\regex_rules.json"
     },
     "auto_pairs": {
       "enabled": true,
@@ -51,12 +52,12 @@
         "toggle_file_tree": "F3",
         "toggle_sidebar": "F4",
         "format_code": "F8",
-        "refactor_rename": "CTRL_R"
+        "refactor_rename": "F6"
       },
       "filetype_bindings": {
         "python": {
           "format_code": "F8",
-          "refactor_rename": "CTRL_R"
+          "refactor_rename": "F6"
         },
         "typescript": {
           "format_code": "F8"
@@ -77,7 +78,32 @@
     "lsp": {
       "enabled": false,
       "command": [],
-      "timeout_seconds": 1.2
+      "timeout_seconds": 1.2,
+      "language_id_map": {
+        ".py": "python",
+        ".pyi": "python",
+        ".js": "javascript",
+        ".jsx": "javascriptreact",
+        ".ts": "typescript",
+        ".tsx": "typescriptreact",
+        ".json": "json",
+        ".go": "go",
+        ".rs": "rust",
+        ".java": "java",
+        ".c": "c",
+        ".h": "c",
+        ".cpp": "cpp",
+        ".cs": "csharp",
+        ".kt": "kotlin",
+        ".lua": "lua",
+        ".toml": "toml",
+        ".sql": "sql",
+        ".md": "markdown",
+        ".yaml": "yaml",
+        ".yml": "yaml",
+        ".sh": "shellscript",
+        ".ps1": "powershell"
+      }
     },
     "text_objects": {
       "enabled": true
@@ -125,7 +151,10 @@
       "enabled": true
     },
     "file_tree": {
-      "enabled": true
+      "enabled": true,
+      "sort_by": "name",
+      "filter_query": "",
+      "show_hidden": false
     },
     "tab_completion": {
       "enabled": true

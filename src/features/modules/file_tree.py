@@ -22,6 +22,8 @@ IGNORED_FILE_SUFFIXES = {
     ".pyc",
 }
 
+SORT_MODES = {"name", "type", "mtime"}
+
 
 @dataclass(slots=True, frozen=True)
 class TreeEntry:
@@ -42,6 +44,10 @@ class FileTreeFeature:
         "unicode_art",
         "_collapsed_dirs",
         "_raw_paths",
+        "_sort_by",
+        "_filter_query",
+        "_show_hidden",
+        "_path_meta",
     )
 
     def __init__(self, *, enabled: bool = False) -> None:
@@ -54,6 +60,10 @@ class FileTreeFeature:
         self.unicode_art = True
         self._collapsed_dirs: set[str] = set()
         self._raw_paths: list[str] = []
+        self._sort_by = "name"
+        self._filter_query = ""
+        self._show_hidden = False
+        self._path_meta: dict[str, float] = {}
 
     async def collect_paths(self, root: Path) -> list[str]:
         if not self.enabled:
@@ -61,10 +71,31 @@ class FileTreeFeature:
         return await self._list_files(root)
 
     def apply_paths(self, paths: list[str]) -> None:
-        self._raw_paths = sorted({item for item in paths if item.strip()}, key=lambda item: item.lower())
-        self.entries = self._flatten_as_tree(self._raw_paths, self._collapsed_dirs)
+        self._raw_paths = [item for item in paths if item.strip()]
+        self._rebuild_entries()
         self.selected = min(self.selected, max(0, len(self.entries) - 1))
         self.scroll = min(self.scroll, max(0, len(self.entries) - 1))
+
+    def set_sort_mode(self, mode: str) -> bool:
+        clean = mode.strip().lower()
+        if clean not in SORT_MODES:
+            return False
+        self._sort_by = clean
+        self._rebuild_entries()
+        return True
+
+    def set_filter_query(self, query: str) -> None:
+        self._filter_query = query.strip().lower()
+        self._rebuild_entries()
+
+    def set_show_hidden(self, enabled: bool) -> None:
+        self._show_hidden = bool(enabled)
+
+    def sort_mode(self) -> str:
+        return self._sort_by
+
+    def filter_query(self) -> str:
+        return self._filter_query
 
     def open(self) -> None:
         if self.enabled:
@@ -124,6 +155,7 @@ class FileTreeFeature:
 
     def _scan_files(self, root: Path) -> list[str]:
         files: list[str] = []
+        meta: dict[str, float] = {}
         root_path = str(root)
         stack: list[str] = [root_path]
         while stack:
@@ -135,24 +167,32 @@ class FileTreeFeature:
                     for entry in entries_iter:
                         name = entry.name
                         if entry.is_dir(follow_symlinks=False):
-                            if name.startswith(".") or name in IGNORED_DIRS:
+                            if name in IGNORED_DIRS:
+                                continue
+                            if not self._show_hidden and name.startswith("."):
                                 continue
                             dirs_batch.append(entry.path)
                             continue
                         if not entry.is_file(follow_symlinks=False):
                             continue
-                        if name.startswith("."):
+                        if not self._show_hidden and name.startswith("."):
                             continue
                         suffix = Path(name).suffix.lower()
                         if suffix in IGNORED_FILE_SUFFIXES:
                             continue
                         relative = os.path.relpath(entry.path, root_path).replace("\\", "/")
                         files_batch.append(relative)
+                        try:
+                            mtime = float(entry.stat(follow_symlinks=False).st_mtime_ns)
+                        except OSError:
+                            mtime = 0.0
+                        meta[relative] = mtime
                     files.extend(sorted(files_batch, key=lambda item: item.lower()))
                     dirs_batch.sort(key=lambda item: str(item).lower(), reverse=True)
                     stack.extend(dirs_batch)
             except OSError:
                 continue
+        self._path_meta = meta
         return sorted(files, key=lambda item: item.lower())
 
     def _flatten_as_tree(self, paths: list[str], collapsed: set[str] | None = None) -> list[TreeEntry]:
@@ -173,6 +213,25 @@ class FileTreeFeature:
         self._emit_tree(output, tree, depth=0, prefix_stack=[], collapsed=collapsed_dirs, prefix_path=[])
         return output
 
+    def _rebuild_entries(self) -> None:
+        paths = [item for item in self._raw_paths if item.strip()]
+        if self._filter_query:
+            paths = [item for item in paths if self._filter_query in item.lower()]
+        deduped = {item: None for item in paths}
+        ordered = list(deduped.keys())
+        self.entries = self._flatten_as_tree(ordered, self._collapsed_dirs)
+
+    def _tree_sort_key(self, key: str, payload: Any) -> tuple[object, ...]:
+        lowered = key.lower()
+        if isinstance(payload, dict):
+            return (0, lowered)
+        relative = str(payload)
+        if self._sort_by == "type":
+            return (1, Path(relative).suffix.lower(), lowered)
+        if self._sort_by == "mtime":
+            return (1, -self._path_meta.get(relative, 0.0), lowered)
+        return (1, lowered)
+
     def _emit_tree(
         self,
         output: list[TreeEntry],
@@ -183,7 +242,7 @@ class FileTreeFeature:
         collapsed: set[str],
         prefix_path: list[str],
     ) -> None:
-        keys = sorted(node.keys(), key=lambda item: item.lower())
+        keys = sorted(node.keys(), key=lambda item: self._tree_sort_key(item, node[item]))
         for index, key in enumerate(keys):
             is_last = index == len(keys) - 1
             if self.unicode_art:

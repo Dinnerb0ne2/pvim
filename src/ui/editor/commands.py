@@ -133,7 +133,7 @@ class CommandsMixin:
 
         if cmd in {"help", "h"}:
             self._set_message(
-                "Commands: :w :q :e :split/:vsplit/:only :wincmd :find/:findre :replace/:replacere :replaceall/:replaceallre :replaceproj/:replaceprojre :encoding :project :term :rename :format :fuzzy :grep :tree :feature :workspace :session :swap :keys :script :plugin :proc :virtual :ast :profile :piece :termcaps :syntax :git :jump :lsp :diag :codeaction"
+                "Commands: :w :q :e :split/:vsplit/:only :wincmd :find/:findre :replace/:replacere :replaceall/:replaceallre :replaceproj/:replaceprojre :encoding :project :term :rename :format :fuzzy :grep :tree :theme :feature :workspace :session :swap :keys :script :plugin :proc :virtual :ast :profile :piece :termcaps :syntax :git :jump :lsp :diag :codeaction"
             )
             return
 
@@ -455,6 +455,46 @@ class CommandsMixin:
             )
             return
 
+        if cmd == "theme":
+            action = args[0].strip() if args else "status"
+            lowered = action.lower()
+            if lowered in {"status", "current"}:
+                self._set_message(f"Theme: {self.config.theme_file()}")
+                return
+            if lowered in {"list", "ls"}:
+                theme_dir = self.config.path.parent / "themes"
+                if not theme_dir.exists():
+                    self._show_alert("(no built-in themes)")
+                    return
+                names = sorted(path.name for path in theme_dir.glob("*.json") if path.is_file())
+                self._show_alert("\n".join(names) if names else "(no built-in themes)")
+                return
+            candidates = []
+            direct = self.config.resolve_path(action)
+            if direct is not None:
+                candidates.append(direct)
+            clean = action.replace("/", "\\")
+            if not clean.lower().endswith(".json"):
+                themed = self.config.resolve_path(f"themes\\{clean}.json")
+                if themed is not None:
+                    candidates.append(themed)
+                modern = self.config.resolve_path(f"themes\\pvim.theme.{clean}.json")
+                if modern is not None:
+                    candidates.append(modern)
+            target = next((item for item in candidates if item.exists() and item.is_file()), None)
+            if target is None:
+                self._set_message(f"Theme not found: {action}", error=True)
+                return
+            theme_section = self.config.data.get("theme")
+            if not isinstance(theme_section, dict):
+                theme_section = {}
+                self.config.data["theme"] = theme_section
+            theme_section["enabled"] = True
+            theme_section["config_file"] = str(target)
+            self._apply_runtime_config()
+            self._set_message(f"Theme applied: {target.name}")
+            return
+
         if cmd == "syntax":
             action = args[0].lower() if args else "reload"
             if action in {"reload", "refresh"}:
@@ -633,7 +673,47 @@ class CommandsMixin:
                 else:
                     self._open_explorer(refresh=False)
                 return
-            self._set_message("Usage: :tree open|refresh|close|toggle", error=True)
+            if action == "sort":
+                if len(args) < 2:
+                    self._set_message("Usage: :tree sort <name|type|mtime>", error=True)
+                    return
+                mode = args[1].strip().lower()
+                if not self._file_tree_feature.set_sort_mode(mode):
+                    self._set_message("Usage: :tree sort <name|type|mtime>", error=True)
+                    return
+                if self.mode == MODE_EXPLORER:
+                    self._sync_file_tree_popup()
+                self._set_message(f"Tree sort: {mode}")
+                return
+            if action == "filter":
+                query = " ".join(args[1:]).strip()
+                self._file_tree_feature.set_filter_query(query)
+                if self.mode == MODE_EXPLORER:
+                    self._sync_file_tree_popup()
+                if query:
+                    self._set_message(f"Tree filter: {query}")
+                else:
+                    self._set_message("Tree filter cleared.")
+                return
+            if action in {"filter-clear", "clear-filter"}:
+                self._file_tree_feature.set_filter_query("")
+                if self.mode == MODE_EXPLORER:
+                    self._sync_file_tree_popup()
+                self._set_message("Tree filter cleared.")
+                return
+            if action == "hidden":
+                if len(args) < 2:
+                    self._set_message("Usage: :tree hidden <on|off>", error=True)
+                    return
+                option = args[1].strip().lower()
+                if option not in {"on", "off"}:
+                    self._set_message("Usage: :tree hidden <on|off>", error=True)
+                    return
+                self._file_tree_feature.set_show_hidden(option == "on")
+                self._schedule_file_tree_refresh()
+                self._set_message(f"Tree hidden files: {option}")
+                return
+            self._set_message("Usage: :tree open|refresh|close|toggle|sort|filter|clear-filter|hidden", error=True)
             return
 
         if cmd == "feature":

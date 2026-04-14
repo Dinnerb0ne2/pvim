@@ -43,6 +43,42 @@ class FeatureBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ranked[0], good)
         self.assertGreater(fuzzy_score(str(good), "nvim") or 0, fuzzy_score(str(weak), "nvim") or 0)
 
+    def test_file_tree_sort_filter_and_fold(self) -> None:
+        feature = FileTreeFeature(enabled=True)
+        feature._path_meta = {  # type: ignore[attr-defined]
+            "z.py": 10.0,
+            "a.txt": 30.0,
+            "b.md": 20.0,
+        }
+        feature.apply_paths(["z.py", "a.txt", "b.md"])
+
+        feature.set_sort_mode("type")
+        by_type = [entry.relative_path for entry in feature.entries if not entry.is_dir]
+        self.assertEqual(by_type, ["b.md", "z.py", "a.txt"])
+
+        feature.set_sort_mode("mtime")
+        by_mtime = [entry.relative_path for entry in feature.entries if not entry.is_dir]
+        self.assertEqual(by_mtime[0], "a.txt")
+        self.assertEqual(by_mtime[-1], "z.py")
+
+        feature.set_filter_query("b.")
+        filtered = [entry.relative_path for entry in feature.entries if not entry.is_dir]
+        self.assertEqual(filtered, ["b.md"])
+
+        feature.set_filter_query("")
+        feature._path_meta.update(  # type: ignore[attr-defined]
+            {
+                "pkg/main.py": 40.0,
+                "pkg/sub/readme.md": 50.0,
+            }
+        )
+        feature.apply_paths(["pkg/main.py", "pkg/sub/readme.md"])
+        dir_index = next(index for index, item in enumerate(feature.entries) if item.is_dir and item.node_path == "pkg")
+        feature.selected = dir_index
+        self.assertTrue(feature.toggle_selected_directory())
+        collapsed_dir = next(item for item in feature.entries if item.is_dir and item.node_path == "pkg")
+        self.assertIn("[..]", collapsed_dir.display)
+
 
 if __name__ == "__main__":
     unittest.main()

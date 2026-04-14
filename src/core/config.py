@@ -33,6 +33,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "language_map_file": "syntax\\languages.json",
             "extra_language_map_files": [],
             "default_file": "syntax\\plaintext.json",
+            "regex_rules_file": "syntax\\regex_rules.json",
         },
         "auto_pairs": {
             "enabled": True,
@@ -59,7 +60,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "toggle_file_tree": "F3",
                 "toggle_sidebar": "F4",
                 "format_code": "F8",
-                "refactor_rename": "CTRL_R",
+                "refactor_rename": "F6",
             },
             "filetype_bindings": {},
         },
@@ -78,6 +79,43 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "enabled": False,
             "command": [],
             "timeout_seconds": 1.2,
+            "language_id_map": {
+                ".py": "python",
+                ".pyi": "python",
+                ".pyw": "python",
+                ".js": "javascript",
+                ".jsx": "javascriptreact",
+                ".ts": "typescript",
+                ".tsx": "typescriptreact",
+                ".json": "json",
+                ".jsonc": "jsonc",
+                ".go": "go",
+                ".rs": "rust",
+                ".java": "java",
+                ".c": "c",
+                ".h": "c",
+                ".cc": "cpp",
+                ".cpp": "cpp",
+                ".cxx": "cpp",
+                ".hpp": "cpp",
+                ".cs": "csharp",
+                ".kt": "kotlin",
+                ".kts": "kotlin",
+                ".lua": "lua",
+                ".toml": "toml",
+                ".sql": "sql",
+                ".md": "markdown",
+                ".html": "html",
+                ".css": "css",
+                ".scss": "scss",
+                ".less": "less",
+                ".yaml": "yaml",
+                ".yml": "yaml",
+                ".sh": "shellscript",
+                ".bash": "shellscript",
+                ".zsh": "shellscript",
+                ".ps1": "powershell"
+            },
         },
         "text_objects": {
             "enabled": True,
@@ -126,6 +164,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
         "file_tree": {
             "enabled": True,
+            "sort_by": "name",
+            "filter_query": "",
+            "show_hidden": False,
         },
         "tab_completion": {
             "enabled": True,
@@ -310,6 +351,15 @@ class AppConfig:
         )
         return self.resolve_path(file_name if isinstance(file_name, str) else None)
 
+    def syntax_regex_rules_file(self) -> Path | None:
+        file_name = self._lookup(
+            "features",
+            "syntax_highlighting",
+            "regex_rules_file",
+            default="syntax\\regex_rules.json",
+        )
+        return self.resolve_path(file_name if isinstance(file_name, str) else None)
+
     def auto_pairs_file(self) -> Path | None:
         file_name = self._lookup(
             "features",
@@ -431,6 +481,23 @@ class AppConfig:
             minimum=0.2,
         )
 
+    def lsp_language_id_map(self) -> dict[str, str]:
+        value = self._lookup("features", "lsp", "language_id_map", default={})
+        if not isinstance(value, Mapping):
+            return {}
+        mapping: dict[str, str] = {}
+        for ext, language_id in value.items():
+            if not isinstance(ext, str) or not isinstance(language_id, str):
+                continue
+            clean_ext = ext.strip().lower()
+            clean_language = language_id.strip()
+            if not clean_ext or not clean_language:
+                continue
+            if not clean_ext.startswith("."):
+                clean_ext = f".{clean_ext}"
+            mapping[clean_ext] = clean_language
+        return mapping
+
     def text_objects_enabled(self) -> bool:
         return self.feature_enabled("text_objects")
 
@@ -446,6 +513,24 @@ class AppConfig:
 
     def macros_enabled(self) -> bool:
         return self.feature_enabled("macros")
+
+    def file_tree_sort_by(self) -> str:
+        value = self._lookup("features", "file_tree", "sort_by", default="name")
+        if not isinstance(value, str):
+            return "name"
+        clean = value.strip().lower()
+        if clean in {"name", "type", "mtime"}:
+            return clean
+        return "name"
+
+    def file_tree_filter_query(self) -> str:
+        value = self._lookup("features", "file_tree", "filter_query", default="")
+        if not isinstance(value, str):
+            return ""
+        return value.strip()
+
+    def file_tree_show_hidden(self) -> bool:
+        return _as_bool(self._lookup("features", "file_tree", "show_hidden", default=False), default=False)
 
     def swap_enabled(self) -> bool:
         return self.feature_enabled("swap")

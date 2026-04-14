@@ -40,6 +40,10 @@ class NormalModeMixin:
                 self.cx = min(self.cx, len(self._line()))
             elif key == "a":
                 self._open_code_actions()
+            elif key == "-":
+                self._undo_branch_prev()
+            elif key == "+":
+                self._undo_branch_next()
             elif key == "b":
                 self._jump_back()
             elif key == "f":
@@ -225,6 +229,13 @@ class NormalModeMixin:
             self._pending_motion = ""
             return
 
+        if key == "CTRL_R":
+            self._redo()
+            self.pending_operator = ""
+            self.pending_scope = ""
+            self._pending_motion = ""
+            return
+
         if key == "CTRL_O":
             self._jump_back()
             self.pending_operator = ""
@@ -282,6 +293,16 @@ class NormalModeMixin:
 
         if key == "/":
             self._enter_command("find ", prompt="/")
+            return
+
+        if key == "n":
+            if self._last_search_query:
+                self._find(self._last_search_query)
+            else:
+                self._set_message("No previous search pattern.")
+            self.pending_operator = ""
+            self.pending_scope = ""
+            self._pending_motion = ""
             return
 
         if key == "V":

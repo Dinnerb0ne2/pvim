@@ -1,0 +1,11 @@
+{
+  "name": "markdown",
+  "line_comment": "",
+  "keywords": [
+    "#", "##", "###", "####", "#####", "######", "-", "*", ">", "`", "```"
+  ],
+  "builtins": [
+    "TODO", "NOTE", "TIP", "WARNING", "INFO", "http", "https"
+  ],
+  "string_delimiters": ["\"", "'", "`"]
+}

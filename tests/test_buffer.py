@@ -68,6 +68,39 @@ class BufferEditorBehaviorTests(unittest.TestCase):
         self.editor.handle_key("CTRL_Y")
         self.assertIn("Nothing to redo", self.editor.message)
 
+    def test_ctrl_r_redo_alias(self) -> None:
+        self.editor.lines = ["abc"]
+        self.editor.cx = 3
+        self.editor.cy = 0
+        self.editor.mode = MODE_INSERT
+        self.editor.handle_key("x")
+        self.editor.mode = MODE_NORMAL
+        self.editor.handle_key("u")
+        self.assertEqual(self.editor.lines, ["abc"])
+        self.editor.handle_key("CTRL_R")
+        self.assertEqual(self.editor.lines, ["abcx"])
+
+    def test_undo_tree_branch_switch_with_g_minus_and_g_plus(self) -> None:
+        self.editor.lines = ["abc"]
+        self.editor.cx = 3
+        self.editor.cy = 0
+        self.editor.mode = MODE_INSERT
+        self.editor.handle_key("x")
+        self.editor.mode = MODE_NORMAL
+        self.editor.handle_key("u")
+        self.editor.mode = MODE_INSERT
+        self.editor.handle_key("y")
+        self.editor.mode = MODE_NORMAL
+        self.assertEqual(self.editor.lines, ["abcy"])
+
+        self.editor.handle_key("g")
+        self.editor.handle_key("-")
+        self.assertEqual(self.editor.lines, ["abcx"])
+
+        self.editor.handle_key("g")
+        self.editor.handle_key("+")
+        self.assertEqual(self.editor.lines, ["abcy"])
+
     def test_cursor_out_of_bounds_protection(self) -> None:
         self.editor.lines = ["a"]
         self.editor.cx = 999
@@ -129,6 +162,37 @@ class BufferEditorBehaviorTests(unittest.TestCase):
 
         self.assertIn("DONE", first.read_text(encoding="utf-8"))
         self.assertIn("DONE", second.read_text(encoding="utf-8"))
+
+    def test_incremental_search_preview_history_and_cancel_restore(self) -> None:
+        self.editor.lines = ["alpha beta", "beta alpha", "omega"]
+        self.editor.cy = 0
+        self.editor.cx = 0
+        self.editor.mode = MODE_NORMAL
+
+        self.editor.handle_key("/")
+        self.editor.handle_key("b")
+        self.editor.handle_key("e")
+        self.editor.handle_key("t")
+        self.editor.handle_key("a")
+        self.assertEqual((self.editor.cy, self.editor.cx), (0, 6))
+        self.editor.handle_key("ENTER")
+        self.assertIn("Found: beta", self.editor.message)
+        self.assertIn("beta", list(self.editor._search_history))
+        self.editor.handle_key("n")
+        self.assertEqual((self.editor.cy, self.editor.cx), (1, 0))
+
+        self.editor.handle_key("/")
+        self.editor.handle_key("UP")
+        self.assertEqual(self.editor.command_text, "find beta")
+        self.editor.handle_key("ESC")
+
+        self.editor.cy = 1
+        self.editor.cx = 0
+        self.editor.handle_key("/")
+        self.editor.handle_key("a")
+        self.assertEqual((self.editor.cy, self.editor.cx), (1, 3))
+        self.editor.handle_key("ESC")
+        self.assertEqual((self.editor.cy, self.editor.cx), (1, 0))
 
 
 if __name__ == "__main__":

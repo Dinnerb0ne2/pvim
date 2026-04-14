@@ -27,11 +27,13 @@ python pvim.py your_file.py --config pvim.config.json
 - `:findre <pattern> [flags]` / `:replacere <pattern> <replacement> [flags]`
 - `:fuzzy [query]`
 - `:grep <query>`（全局搜索）
+- `/`（增量搜索，输入即预览）
 - `:project <dir>`（打开项目目录）
 - `:term [command]`（内置终端）
 - `:split` / `:vsplit` / `:only`（分屏管理）
 - `:encoding [name]`（查看/切换编码）
 - `:codeaction`（LSP 代码动作）
-- `:tree open|refresh|close|toggle`
+- `:tree open|refresh|close|toggle|sort|filter|hidden`
+- `:theme list` / `:theme <name>`
 - `:session save|load`
 - `:swap write|clear`

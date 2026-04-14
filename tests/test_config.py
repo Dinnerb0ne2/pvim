@@ -46,6 +46,15 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(self.config.session_profiles_directory().name, ".sessions")
         self.assertAlmostEqual(self.config.config_reload_interval_seconds(), 2.5)
 
+    def test_lsp_language_map_normalizes_extension(self) -> None:
+        payload = copy.deepcopy(DEFAULT_CONFIG)
+        payload["features"]["lsp"]["language_id_map"] = {"py": "python"}
+        config_path = self._root / "custom-lsp.config.json"
+        config_path.write_text(json.dumps(payload), encoding="utf-8")
+        custom = AppConfig.load(config_path)
+        mapping = custom.lsp_language_id_map()
+        self.assertEqual(mapping.get(".py"), "python")
+
 
 if __name__ == "__main__":
     unittest.main()

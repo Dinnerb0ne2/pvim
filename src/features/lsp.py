@@ -102,11 +102,15 @@ class LspClient:
         self._process: asyncio.subprocess.Process | None = None
         self._rpc: JsonRpcPeer | None = None
         self._documents: dict[str, int] = {}
+        self._document_states: dict[str, tuple[Path, str, str]] = {}
         self._diagnostics: dict[str, list[str]] = {}
         self._diagnostics_payload: dict[str, list[dict[str, Any]]] = {}
         self._completion_request_id: int | None = None
         self._command: tuple[str, ...] = ()
         self._root: Path | None = None
+        self._request_queue: asyncio.Queue[tuple[str, dict[str, Any], asyncio.Future[Any]]] | None = None
+        self._request_worker: asyncio.Task[None] | None = None
+        self._restart_lock = asyncio.Lock()
 
     @property
     def running(self) -> bool:
@@ -120,13 +124,17 @@ class LspClient:
         if self.running and self._command == clean and self._root == normalized_root:
             return
 
-        await self.stop()
+        same_target = self._command == clean and self._root == normalized_root
+        saved_states = dict(self._document_states) if same_target else {}
+        await self.stop(clear_documents=not same_target)
         self._command = clean
         self._root = normalized_root
         self._documents = {}
         self._diagnostics = {}
         self._diagnostics_payload = {}
         self._completion_request_id = None
+        if not same_target:
+            self._document_states = {}
 
         process = await asyncio.create_subprocess_exec(
             *clean,
@@ -143,6 +151,8 @@ class LspClient:
         self._rpc = JsonRpcPeer(process.stdout, process.stdin)
         self._rpc.on_notification("textDocument/publishDiagnostics", self._on_publish_diagnostics)
         await self._rpc.start()
+        self._request_queue = asyncio.Queue()
+        self._request_worker = asyncio.create_task(self._request_loop())
 
         root_uri = _path_to_uri(normalized_root)
         await self._request(
@@ -167,28 +177,54 @@ class LspClient:
                         "symbol": {},
                     },
                 },
-                "clientInfo": {"name": "pvim", "version": "0.5"},
+                "clientInfo": {"name": "pvim", "version": "0.6"},
             },
         )
         await self._notify("initialized", {})
+        if saved_states:
+            await self._restore_document_states(saved_states)
 
-    async def stop(self) -> None:
+    async def stop(self, *, clear_documents: bool = True) -> None:
         self._documents = {}
         self._diagnostics = {}
         self._diagnostics_payload = {}
         self._completion_request_id = None
+        if clear_documents:
+            self._document_states = {}
+
+        queue = self._request_queue
+        self._request_queue = None
+        if queue is not None:
+            while not queue.empty():
+                try:
+                    _method, _params, future = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if not future.done():
+                    future.set_exception(RuntimeError("LSP request queue closed."))
+                queue.task_done()
+        if self._request_worker is not None:
+            self._request_worker.cancel()
+            try:
+                await self._request_worker
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            self._request_worker = None
 
         if self._rpc is not None:
+            rpc = self._rpc
             try:
-                await self._request("shutdown", {})
+                await rpc.request("shutdown", {})
             except Exception:
                 pass
             try:
-                await self._notify("exit", {})
+                await rpc.send_notification("exit", {})
             except Exception:
                 pass
             try:
-                await self._rpc.close()
+                await rpc.close()
             except Exception:
                 pass
             self._rpc = None
@@ -204,6 +240,78 @@ class LspClient:
         self._process = None
         self._command = ()
         self._root = None
+
+    async def _ensure_transport(self) -> JsonRpcPeer:
+        if self.running and self._rpc is not None:
+            return self._rpc
+        if not self._command or self._root is None:
+            raise RuntimeError("LSP transport is closed.")
+        await self.ensure_started(list(self._command), self._root)
+        if self._rpc is None:
+            raise RuntimeError("LSP transport is unavailable.")
+        return self._rpc
+
+    async def _request_loop(self) -> None:
+        queue = self._request_queue
+        if queue is None:
+            return
+        while True:
+            method, params, future = await queue.get()
+            try:
+                if future.cancelled():
+                    continue
+                result = await self._request_direct(method, params)
+                if not future.done():
+                    future.set_result(result)
+            except asyncio.CancelledError:
+                if not future.done():
+                    future.set_exception(RuntimeError("LSP request cancelled."))
+                raise
+            except Exception as exc:
+                if not future.done():
+                    future.set_exception(exc)
+            finally:
+                queue.task_done()
+
+    async def _request_direct(self, method: str, params: dict[str, Any]) -> Any:
+        last_error: Exception | None = None
+        for attempt in range(2):
+            rpc = await self._ensure_transport()
+            try:
+                return await rpc.request(method, params)
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0 and self._command and self._root is not None:
+                    await self._restart_transport()
+                    continue
+                break
+        if last_error is None:
+            raise RuntimeError("LSP request failed.")
+        raise last_error
+
+    async def _restart_transport(self) -> None:
+        async with self._restart_lock:
+            if not self._command or self._root is None:
+                raise RuntimeError("LSP restart target is missing.")
+            saved_states = dict(self._document_states)
+            command = list(self._command)
+            root = self._root
+            await self.stop(clear_documents=False)
+            self._command = ()
+            self._root = None
+            await self.ensure_started(command, root)
+            if saved_states:
+                await self._restore_document_states(saved_states)
+
+    async def _restore_document_states(self, states: dict[str, tuple[Path, str, str]]) -> None:
+        for uri, payload in states.items():
+            path, language_id, text = payload
+            if not isinstance(uri, str) or not uri:
+                continue
+            try:
+                await self.sync_document(path, text.split("\n"), language_id)
+            except Exception:
+                continue
 
     async def sync_document(self, path: Path, lines: list[str], language_id: str) -> None:
         if not self.running:
@@ -233,6 +341,7 @@ class LspClient:
                 },
             )
         self._documents[uri] = version
+        self._document_states[uri] = (path.resolve(), language_id, text)
 
     async def definition(self, path: Path, line: int, column: int) -> list[tuple[Path, int, int]]:
         if not self.running:
@@ -299,8 +408,9 @@ class LspClient:
     async def completion(self, path: Path, line: int, column: int) -> list[str]:
         if not self.running:
             return []
-        rpc = self._rpc
-        if rpc is None:
+        try:
+            rpc = await self._ensure_transport()
+        except Exception:
             return []
         uri = _path_to_uri(path)
         if self._completion_request_id is not None:
@@ -442,16 +552,30 @@ class LspClient:
         self._consume_diagnostics(params)
 
     async def _request(self, method: str, params: dict[str, Any]) -> Any:
-        rpc = self._rpc
-        if rpc is None:
-            raise RuntimeError("LSP transport is closed.")
-        return await rpc.request(method, params)
+        queue = self._request_queue
+        if queue is None:
+            return await self._request_direct(method, params)
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Any] = loop.create_future()
+        await queue.put((method, params, future))
+        return await future
 
     async def _notify(self, method: str, params: dict[str, Any]) -> None:
-        rpc = self._rpc
-        if rpc is None:
-            raise RuntimeError("LSP transport is closed.")
-        await rpc.send_notification(method, params)
+        last_error: Exception | None = None
+        for attempt in range(2):
+            rpc = await self._ensure_transport()
+            try:
+                await rpc.send_notification(method, params)
+                return
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0 and self._command and self._root is not None:
+                    await self._restart_transport()
+                    continue
+                break
+        if last_error is None:
+            raise RuntimeError("LSP notify failed.")
+        raise last_error
 
     def _consume_diagnostics(self, params: Any) -> None:
         if not isinstance(params, dict):

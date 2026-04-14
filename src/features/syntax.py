@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+import builtins
+from collections import defaultdict
+import io
 import json
+import keyword
 import re
+import token as token_types
+import tokenize
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 from ..core.config import AppConfig
 from ..core.theme import Theme
 
-TOKEN_RE = re.compile(r"@[A-Za-z_][A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_]*|\d+(?:\.\d+)?")
+TOKEN_RE = re.compile(
+    r"@[A-Za-z_][A-Za-z0-9_]*|\$[A-Za-z_][A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_:-]*!?|\d+(?:\.\d+)?"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +27,12 @@ class SyntaxProfile:
     builtins: frozenset[str]
     line_comment: str
     string_delimiters: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RegexTokenRule:
+    pattern: re.Pattern[str]
+    style: str
 
 
 PLAIN_PROFILE = SyntaxProfile(
@@ -38,6 +52,10 @@ class SyntaxManager:
         self._extension_map: dict[str, Path] = {}
         self._profile_cache: dict[Path, SyntaxProfile] = {}
         self._default_profile = PLAIN_PROFILE
+        self._line_cache: defaultdict[str, dict[str, str]] = defaultdict(dict)
+        self._regex_rules_loaded = False
+        self._regex_rules: dict[str, tuple[RegexTokenRule, ...]] = {}
+        self._python_builtins = frozenset(name for name in dir(builtins) if isinstance(name, str))
 
     def reload(self) -> None:
         self._enabled = self._config.feature_enabled("syntax_highlighting")
@@ -45,6 +63,9 @@ class SyntaxManager:
         self._extension_map = {}
         self._profile_cache = {}
         self._default_profile = PLAIN_PROFILE
+        self._line_cache = defaultdict(dict)
+        self._regex_rules_loaded = False
+        self._regex_rules = {}
 
     def _load_extension_map(self) -> None:
         if self._extension_map_loaded:
@@ -73,6 +94,49 @@ class SyntaxManager:
         default_path = self._config.syntax_default_file()
         if default_path is not None and default_path.exists():
             self._default_profile = self._load_profile(default_path)
+
+    def _load_regex_rules(self) -> None:
+        if self._regex_rules_loaded:
+            return
+        self._regex_rules_loaded = True
+        loaded_rules: dict[str, tuple[RegexTokenRule, ...]] = {}
+        path = self._config.syntax_regex_rules_file()
+        if path is None or not path.exists():
+            self._regex_rules = loaded_rules
+            return
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            self._regex_rules = loaded_rules
+            return
+        for language, rules in payload.items():
+            if not isinstance(language, str) or not isinstance(rules, list):
+                continue
+            compiled: list[RegexTokenRule] = []
+            for item in rules:
+                if not isinstance(item, dict):
+                    continue
+                pattern = item.get("pattern")
+                style = item.get("style")
+                if not isinstance(pattern, str) or not isinstance(style, str):
+                    continue
+                try:
+                    regex = re.compile(pattern)
+                except re.error:
+                    continue
+                compiled.append(RegexTokenRule(pattern=regex, style=style.strip()))
+            if compiled:
+                loaded_rules[language.strip().lower()] = tuple(compiled)
+        self._regex_rules = loaded_rules
+
+    def _token_style_from_regex_rules(self, profile: SyntaxProfile, token: str) -> str:
+        if not token:
+            return ""
+        self._load_regex_rules()
+        rules = self._regex_rules.get(profile.name.strip().lower(), ())
+        for rule in rules:
+            if rule.pattern.fullmatch(token):
+                return rule.style
+        return ""
 
     def _load_profile(self, path: Path) -> SyntaxProfile:
         path = path.resolve()
@@ -125,25 +189,102 @@ class SyntaxManager:
         return profile.line_comment or "#"
 
     def highlight_line(self, text: str, profile: SyntaxProfile, theme: Theme, base_style: str) -> str:
+        cache_key = f"{base_style}\x00{text}"
+        bucket = self._line_cache[profile.name]
+        cached = bucket.get(cache_key)
+        if cached is not None:
+            return cached
+
         if not text:
-            return base_style
-
-        comment_index = self._find_comment_index(text, profile)
-        if comment_index < 0:
-            code_part = text
-            comment_part = ""
+            rendered = base_style
+        elif profile.name.strip().lower() == "python":
+            rendered = self._highlight_python_line(text, profile, theme, base_style)
         else:
-            code_part = text[:comment_index]
-            comment_part = text[comment_index:]
+            comment_index = self._find_comment_index(text, profile)
+            if comment_index < 0:
+                code_part = text
+                comment_part = ""
+            else:
+                code_part = text[:comment_index]
+                comment_part = text[comment_index:]
 
-        code = self._highlight_code(code_part, profile, theme, base_style)
-        if not comment_part:
-            return f"{base_style}{code}"
+            code = self._highlight_code(code_part, profile, theme, base_style)
+            if not comment_part:
+                rendered = f"{base_style}{code}"
+            else:
+                comment_style = theme.syntax_style("comment")
+                if not comment_style:
+                    rendered = f"{base_style}{code}{comment_part}"
+                else:
+                    rendered = f"{base_style}{code}{comment_style}{comment_part}{base_style}"
+        if len(bucket) > 6000:
+            bucket.clear()
+        bucket[cache_key] = rendered
+        return rendered
 
-        comment_style = theme.syntax_style("comment")
-        if not comment_style:
-            return f"{base_style}{code}{comment_part}"
-        return f"{base_style}{code}{comment_style}{comment_part}{base_style}"
+    def _highlight_python_line(self, text: str, profile: SyntaxProfile, theme: Theme, base_style: str) -> str:
+        out: list[str] = [base_style]
+        cursor = 0
+        previous_keyword = ""
+        decorator_next = False
+        try:
+            tokens = tokenize.generate_tokens(io.StringIO(text).readline)
+            for token_info in tokens:
+                token_type = token_info.type
+                token_text = token_info.string
+                start_col = max(0, token_info.start[1])
+                end_col = max(start_col, token_info.end[1])
+                if start_col > cursor:
+                    out.append(text[cursor:start_col])
+                segment = text[start_col:end_col]
+                if not segment:
+                    cursor = end_col
+                    continue
+
+                style = ""
+                if token_type == token_types.COMMENT:
+                    style = theme.syntax_style("comment")
+                elif token_type == token_types.STRING:
+                    style = theme.syntax_style("string")
+                elif token_type == token_types.NUMBER:
+                    style = theme.syntax_style("number")
+                elif token_type == token_types.NAME:
+                    if decorator_next:
+                        style = theme.syntax_style("decorator")
+                        decorator_next = False
+                    elif keyword.iskeyword(token_text):
+                        style = theme.syntax_style("keyword")
+                    elif token_text in profile.builtins or token_text in self._python_builtins:
+                        style = theme.syntax_style("builtin")
+                    elif previous_keyword == "def":
+                        style = theme.syntax_style("function")
+                    elif previous_keyword == "class":
+                        style = theme.syntax_style("type")
+                elif token_type == token_types.OP and token_text == "@":
+                    style = theme.syntax_style("decorator")
+                    decorator_next = True
+
+                if style:
+                    out.append(f"{style}{segment}{base_style}")
+                else:
+                    out.append(segment)
+                cursor = end_col
+
+                if token_type == token_types.NAME and token_text in {"def", "class"}:
+                    previous_keyword = token_text
+                elif token_type not in {
+                    token_types.INDENT,
+                    token_types.DEDENT,
+                    token_types.NEWLINE,
+                    tokenize.NL,
+                }:
+                    previous_keyword = ""
+        except (tokenize.TokenError, IndentationError):
+            return f"{base_style}{self._highlight_code(text, profile, theme, base_style)}"
+
+        if cursor < len(text):
+            out.append(text[cursor:])
+        return "".join(out)
 
     def _highlight_code(self, code: str, profile: SyntaxProfile, theme: Theme, base_style: str) -> str:
         if not code:
@@ -194,11 +335,15 @@ class SyntaxManager:
                 style = theme.syntax_style("keyword")
             elif token in profile.builtins:
                 style = theme.syntax_style("builtin")
-            elif previous_token == "def":
-                style = theme.syntax_style("function")
-            elif previous_token == "class":
-                style = theme.syntax_style("type")
             else:
+                regex_style = self._token_style_from_regex_rules(profile, token)
+                if regex_style:
+                    style = theme.syntax_style(regex_style)
+            if not style and previous_token == "def":
+                style = theme.syntax_style("function")
+            elif not style and previous_token == "class":
+                style = theme.syntax_style("type")
+            elif not style:
                 probe = end
                 while probe < len(segment) and segment[probe].isspace():
                     probe += 1

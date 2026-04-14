@@ -6,6 +6,8 @@ from .modes import MODE_INSERT, MODE_NORMAL, MODE_TERMINAL
 class UIModeMixin:
     def _handle_command_key(self, key: str) -> None:
         if key == "ESC":
+            if self._command_prompt == "/":
+                self._cancel_search_prompt()
             self.mode = MODE_NORMAL
             self.command_text = ""
             self._command_prompt = ":"
@@ -14,18 +16,34 @@ class UIModeMixin:
 
         if key == "BACKSPACE":
             self.command_text = self.command_text[:-1]
+            self._on_command_text_changed()
+            return
+
+        if key == "UP":
+            if self._command_prompt == "/":
+                self._browse_search_history(-1)
+            return
+
+        if key == "DOWN":
+            if self._command_prompt == "/":
+                self._browse_search_history(1)
             return
 
         if key == "ENTER":
             command = self.command_text
-            self.command_text = ""
+            is_search_prompt = self._command_prompt == "/" and command.startswith("find ")
             self.mode = MODE_NORMAL
             self._command_prompt = ":"
-            self.execute_command(command)
+            if is_search_prompt:
+                self._submit_search_prompt(command)
+            else:
+                self.execute_command(command)
+            self.command_text = ""
             return
 
         if len(key) == 1 and key.isprintable():
             self.command_text += key
+            self._on_command_text_changed()
 
     def _handle_fuzzy_key(self, key: str) -> None:
         if key == "ESC":
@@ -178,7 +196,7 @@ class UIModeMixin:
             self._file_tree_feature.move_down(visible_rows)
             self._sync_file_tree_popup()
             return
-        if key == "-":
+        if key in {"-", "TAB"}:
             if self._file_tree_feature.toggle_selected_directory():
                 self._sync_file_tree_popup()
             return

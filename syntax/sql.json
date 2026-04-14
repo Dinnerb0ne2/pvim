@@ -1,0 +1,13 @@
+{
+  "name": "sql",
+  "line_comment": "--",
+  "keywords": [
+    "select", "from", "where", "join", "left", "right", "inner", "outer", "on", "group", "by",
+    "order", "having", "insert", "into", "values", "update", "set", "delete", "create", "table",
+    "alter", "drop", "index", "view", "distinct", "limit", "offset", "union", "all", "as"
+  ],
+  "builtins": [
+    "count", "sum", "avg", "min", "max", "coalesce", "now", "current_date", "current_timestamp"
+  ],
+  "string_delimiters": ["\"", "'"]
+}

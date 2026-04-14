@@ -1,0 +1,13 @@
+{
+  "name": "kotlin",
+  "line_comment": "//",
+  "keywords": [
+    "as", "break", "class", "continue", "do", "else", "false", "for", "fun", "if", "in",
+    "interface", "is", "null", "object", "package", "return", "super", "this", "throw", "true",
+    "try", "typealias", "val", "var", "when", "while"
+  ],
+  "builtins": [
+    "Int", "Long", "Double", "Float", "Boolean", "String", "List", "Map", "Set", "println"
+  ],
+  "string_delimiters": ["\"", "'"]
+}

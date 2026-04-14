@@ -24,10 +24,11 @@ python pvim.py --config pvim.config.json
 
 - 保存与退出：`Ctrl+S`、`Ctrl+Q`
 - 搜索与导航：`Ctrl+P`（模糊查找）、`:grep <text>`（全局搜索）、`gd`（转到定义）
+- 增量搜索：`/`（输入即预览，`Up/Down` 搜索历史，`n` 重复上次搜索）
 - 跳转历史：`gb` / `gf`、`Ctrl+O`、`:jump back|forward|list`
 - LSP 动作：`ga` 或 `:codeaction`
 - 提示与面板：`F1`（快捷键提示）、`F3`（文件树）、`F4`（侧栏）
-- 编辑：`u`（撤销）、`Ctrl+Y`（重做）、`Tab/Shift+Tab`（缩进）
+- 编辑：`u`（撤销）、`Ctrl+R/Ctrl+Y`（重做）、`g-/g+`（撤销分支切换）、`Ctrl+D`（下一个同词多光标）
 - 文本对象：`ciw`、`da"`、`vap`、`cif`
 - 宏：`qa ... q` 录制，`@a` 回放
 
@@ -36,7 +37,8 @@ python pvim.py --config pvim.config.json
 - `:e <path>`：打开文件（也支持目录，等价项目打开）
 - `:project <dir>`：打开项目目录
 - `:workspace`：查看当前工作区根目录
-- `:tree open|refresh|close|toggle`：文件树控制
+- `:tree open|refresh|close|toggle|sort|filter|clear-filter|hidden`：文件树控制
+- `:theme list` / `:theme <name>`：切换内置主题
 
 ## 5. 搜索与替换
 

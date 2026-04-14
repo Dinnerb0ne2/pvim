@@ -26,7 +26,19 @@
     "syntax_highlighting": {
       "enabled": true,
       "language_map_file": "syntax\\languages.json",
-      "extra_language_map_files": ["syntax\\custom-languages.json"]
+      "extra_language_map_files": ["syntax\\custom-languages.json"],
+      "regex_rules_file": "syntax\\regex_rules.json"
+    },
+    "file_tree": {
+      "enabled": true,
+      "sort_by": "name",
+      "filter_query": "",
+      "show_hidden": false
+    },
+    "lsp": {
+      "enabled": false,
+      "command": [],
+      "language_id_map": { ".py": "python", ".ts": "typescript", ".lua": "lua" }
     },
     "text_objects": { "enabled": true },
     "undo_tree": { "enabled": true, "max_actions": 400 },

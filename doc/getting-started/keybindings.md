@@ -9,8 +9,10 @@
 ## 编辑
 
 - `u` 撤销
-- `Ctrl+Y` 重做
+- `Ctrl+R` / `Ctrl+Y` 重做
+- `g-` / `g+` 切换撤销分支
 - `Ctrl+/` 注释切换
+- `Ctrl+D` 选中下一个同词（基础多光标）
 - `Tab` / `Shift+Tab` 缩进/反缩进
 - `Ctrl+Left` / `Ctrl+Right` 单词跳转
 - `%`：跳到匹配括号
@@ -33,6 +35,8 @@
 - `gb` / `gf`：跳转历史后退 / 前进
 - `Ctrl+O`：快捷后退
 - `ga`：代码动作（LSP）
+- `/`：增量搜索（输入即预览，Up/Down 历史）
+- `n`：重复上一次搜索
 - `Ctrl+P`：fuzzy 文件搜索
 - `:grep <query>`：全局实时搜索
 - `:findre <pattern> [flags]`：正则搜索
@@ -43,6 +47,8 @@
 ## 项目与终端
 
 - `:project <dir>`：打开目录工作区
+- `:tree sort <name|type|mtime>` / `:tree filter <text>` / `:tree hidden <on|off>`
+- `:theme list` / `:theme <name>`
 - `:term [command]`：打开内置终端面板
 - `:git status|diff|blame|stage|unstage|branches|checkout`
 

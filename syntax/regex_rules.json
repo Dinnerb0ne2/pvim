@@ -1,0 +1,37 @@
+{
+  "javascript": [
+    { "pattern": "^[A-Z][A-Za-z0-9_]*$", "style": "type" },
+    { "pattern": "^[A-Z0-9_]{2,}$", "style": "builtin" }
+  ],
+  "typescript": [
+    { "pattern": "^[A-Z][A-Za-z0-9_]*$", "style": "type" },
+    { "pattern": "^[A-Z0-9_]{2,}$", "style": "builtin" }
+  ],
+  "go": [
+    { "pattern": "^[A-Z][A-Za-z0-9_]*$", "style": "type" },
+    { "pattern": "^[A-Z0-9_]{2,}$", "style": "builtin" }
+  ],
+  "rust": [
+    { "pattern": "^[A-Z][A-Za-z0-9_]*$", "style": "type" },
+    { "pattern": "^[A-Z0-9_]{2,}$", "style": "builtin" }
+  ],
+  "java": [
+    { "pattern": "^[A-Z][A-Za-z0-9_]*$", "style": "type" },
+    { "pattern": "^[A-Z0-9_]{2,}$", "style": "builtin" }
+  ],
+  "cpp": [
+    { "pattern": "^[A-Z][A-Za-z0-9_]*$", "style": "type" },
+    { "pattern": "^[A-Z0-9_]{2,}$", "style": "builtin" }
+  ],
+  "shell": [
+    { "pattern": "^\\$[A-Za-z_][A-Za-z0-9_]*$", "style": "builtin" }
+  ],
+  "json": [
+    { "pattern": "^(true|false|null)$", "style": "keyword" },
+    { "pattern": "^[0-9]+$", "style": "number" }
+  ],
+  "css": [
+    { "pattern": "^[a-z-]+:$", "style": "keyword" },
+    { "pattern": "^[a-z-]+$", "style": "builtin" }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "ui": {
+    "editor": { "fg": "#ebdbb2", "bg": "#282828" },
+    "cursor_line": { "fg": "#ebdbb2", "bg": "#3c3836" },
+    "line_number": { "fg": "#7c6f64", "bg": "#282828" },
+    "line_number_current": { "fg": "#fabd2f", "bg": "#3c3836", "bold": true },
+    "tilde": { "fg": "#504945", "bg": "#282828" },
+    "status": { "fg": "#282828", "bg": "#fabd2f", "bold": true },
+    "mode_normal": { "fg": "#282828", "bg": "#83a598", "bold": true },
+    "mode_insert": { "fg": "#282828", "bg": "#b8bb26", "bold": true },
+    "mode_command": { "fg": "#282828", "bg": "#d3869b", "bold": true },
+    "message_info": { "fg": "#b8bb26", "bg": "#1d2021" },
+    "message_error": { "fg": "#fb4934", "bg": "#1d2021", "bold": true },
+    "command_line": { "fg": "#ebdbb2", "bg": "#3c3836" },
+    "sidebar": { "fg": "#d5c4a1", "bg": "#1d2021" },
+    "sidebar_header": { "fg": "#282828", "bg": "#8ec07c", "bold": true },
+    "sidebar_current": { "fg": "#282828", "bg": "#fe8019", "bold": true },
+    "selection": { "fg": "#ebdbb2", "bg": "#504945" },
+    "fuzzy_selected": { "fg": "#282828", "bg": "#b8bb26", "bold": true }
+  },
+  "syntax": {
+    "keyword": { "fg": "#d3869b" },
+    "builtin": { "fg": "#83a598" },
+    "function": { "fg": "#8ec07c" },
+    "type": { "fg": "#fe8019" },
+    "decorator": { "fg": "#fabd2f" },
+    "string": { "fg": "#b8bb26" },
+    "comment": { "fg": "#7c6f64" },
+    "number": { "fg": "#d79921" }
+  }
+}

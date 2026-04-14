@@ -1,4 +1,4 @@
-# PVIM - v0.5
+# PVIM - v0.6
 
 PVIM 是一个基于 **Python 3.14.3**、纯标准库实现的终端编辑器。
 
@@ -12,6 +12,7 @@ PVIM 是一个基于 **Python 3.14.3**、纯标准库实现的终端编辑器。
 - 可选 LSP 客户端（定义/引用/实现/符号/重命名/格式化/代码动作）
 - 工作区根目录自动检测（.git / pyproject.toml / package.json）
 - 全局与项目级搜索替换（findre/replacere/replaceallre/replaceproj/replaceprojre）
+- `/` 增量搜索预览 + 搜索历史（Up/Down）+ `n` 快速重复
 - 分屏窗口管理（split/vsplit/wincmd）
 - 内置终端面板（:term）
 - 多编码读取与按编码保存（状态栏显示编码）
@@ -21,9 +22,11 @@ PVIM 是一个基于 **Python 3.14.3**、纯标准库实现的终端编辑器。
 - PieceTable 底层结构（大文件编辑基础）
 - 自定义脚本语言 + 插件系统（单插件独立环境）
 - 可扩展语法高亮（内置多语言 + 自定义 language map + :syntax reload）
+- Python `tokenize` 高亮 + 可配置 regex 规则（`syntax\\regex_rules.json`）
 - Git 命令增强（status/diff/blame/stage/unstage/branches/checkout）
 - 跳转历史（:jump back/forward/list，gb/gf，Ctrl+O）
 - 配置热重载与按文件类型快捷键覆盖（无需重启）
+- 撤销树分支切换（`g-` / `g+`）与主题快速切换（`:theme`）
 - 终端能力探测与降级（True Color / Unicode 自动回退）
 
 ## 启动

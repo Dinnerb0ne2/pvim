@@ -10,6 +10,7 @@ from pathlib import Path
 import pstats
 import re
 import time
+import traceback
 
 from ... import APP_NAME, APP_VERSION
 from ...core.async_runtime import AsyncRuntime
@@ -121,6 +122,12 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._encoding_candidates: list[str] = ["utf-8"]
 
         self._input_queue: deque[str] = deque()
+        self._search_history: deque[str] = deque(maxlen=120)
+        self._search_history_index = 0
+        self._search_history_draft = ""
+        self._search_preview_origin: tuple[int, int, int, int] | None = None
+        self._incremental_search_query = ""
+        self._last_search_query = ""
         self._macro_registers: dict[str, list[str]] = {}
         self._macro_recording_register: str | None = None
         self._macro_recording_keys: list[str] = []
@@ -350,6 +357,9 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._feature_registry.set_enabled("git_control", self.config.feature_enabled("git_control"))
         self._feature_registry.set_enabled("notifications", self.config.feature_enabled("notifications"))
         self._file_tree_feature.enabled = self.config.feature_enabled("file_tree")
+        self._file_tree_feature.set_show_hidden(self.config.file_tree_show_hidden())
+        self._file_tree_feature.set_sort_mode(self.config.file_tree_sort_by())
+        self._file_tree_feature.set_filter_query(self.config.file_tree_filter_query())
         self._completion_feature.enabled = self.config.feature_enabled("tab_completion")
         self._git_control_feature.enabled = self.config.feature_enabled("git_control")
         self._lsp_enabled = self.config.lsp_enabled()
@@ -696,26 +706,29 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             "",
             "Editing",
             "  Ctrl+/ toggle comment",
-            "  Ctrl+D add cursor down",
+            "  Ctrl+D select next same word (fallback: cursor down)",
             "  Ctrl+U clear multi-cursor",
             "  Ctrl+Left / Ctrl+Right move by word",
             "  Tab / Shift+Tab indent / outdent",
             "  % jump to matching bracket",
-            "  u undo / Ctrl+Y redo",
+            "  u undo / Ctrl+R redo (Ctrl+Y also works)",
+            "  g- / g+ switch undo-tree branches",
             "  Ctrl+O / gb jump back, gf jump forward",
             "  gd goto definition (LSP/fallback)",
+            "  n repeat last search",
             "  q a ... q record macro / @a replay",
             "  ciw da\" vap cif text objects",
             "",
             "Tools",
             "  Ctrl+F quick find",
             "  Ctrl+G quick replace",
+            "  / incremental search preview (Up/Down history)",
             "  Ctrl+N tab completion",
             "  Ctrl+P fuzzy finder",
             "  :grep <text> project search",
             "  :findre / :replacere / :replaceallre regex search-replace",
             "  :replaceproj / :replaceprojre project-wide replace",
-            "  Ctrl+R rename symbol",
+            "  F6 rename symbol",
             "  K hover docs (when LSP enabled)",
             "  ga code action (LSP)",
             "  F3 file tree",
@@ -745,6 +758,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             "  :profile script <path>",
             "  :piece",
             "  :termcaps",
+            "  :theme list | :theme <name>",
             "  :workspace",
             "  :project <dir> open folder workspace",
             "  :split / :vsplit / :only / :wincmd w|h|l|q",
@@ -753,7 +767,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             "  :encoding [name]",
             "  :session save|load|list  (optional profile name)",
             "  :swap write|clear",
-            "  :tree open|refresh|close|toggle  (- fold in explorer)",
+            "  :tree open|refresh|close|toggle|sort|filter|clear-filter|hidden  (Tab/- fold)",
             "  :feature <name> <on|off>",
             "  :syntax reload",
             "  :jump back|forward|list",
@@ -768,6 +782,17 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         if self.config.feature_enabled("notifications") and message:
             ttl = 3.0 if error else 2.0
             self._notifications.push(message, ttl_seconds=ttl)
+
+    def _friendly_error_message(self, exc: Exception) -> str:
+        details = traceback.TracebackException.from_exception(exc)
+        location = ""
+        if details.stack:
+            frame = details.stack[-1]
+            location = f"{Path(frame.filename).name}:{frame.lineno}"
+        core = str(exc).strip() or exc.__class__.__name__
+        if location:
+            return f"Operation failed ({location}): {core}"
+        return f"Operation failed: {core}"
 
     def _capture_snapshot(self) -> ActionSnapshot:
         return ActionSnapshot(
@@ -826,6 +851,28 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self.pending_operator = ""
         self.pending_scope = ""
         self._set_message(f"Redo: {record.label}")
+
+    def _undo_branch_prev(self) -> None:
+        record = self._history.branch_prev()
+        if record is None:
+            self._set_message("Undo tree: no previous branch.")
+            return
+        self._skip_history_once = True
+        self._apply_snapshot(record.after)
+        self.pending_operator = ""
+        self.pending_scope = ""
+        self._set_message(f"Undo branch: {record.label}")
+
+    def _undo_branch_next(self) -> None:
+        record = self._history.branch_next()
+        if record is None:
+            self._set_message("Undo tree: no next branch.")
+            return
+        self._skip_history_once = True
+        self._apply_snapshot(record.after)
+        self.pending_operator = ""
+        self.pending_scope = ""
+        self._set_message(f"Undo branch: {record.label}")
 
     def _start_macro_recording(self, register: str) -> None:
         self._macro_recording_register = register
@@ -1226,25 +1273,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         if path is None:
             return "plaintext"
         extension = path.suffix.lower()
-        mapping = {
-            ".py": "python",
-            ".js": "javascript",
-            ".ts": "typescript",
-            ".tsx": "typescriptreact",
-            ".jsx": "javascriptreact",
-            ".json": "json",
-            ".go": "go",
-            ".rs": "rust",
-            ".java": "java",
-            ".c": "c",
-            ".h": "c",
-            ".cpp": "cpp",
-            ".hpp": "cpp",
-            ".md": "markdown",
-            ".html": "html",
-            ".css": "css",
-            ".sh": "shellscript",
-        }
+        mapping = self.config.lsp_language_id_map()
         return mapping.get(extension, "plaintext")
 
     def _ensure_lsp_ready(self, *, show_error: bool) -> LspClient | None:
@@ -2620,6 +2649,47 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self.extra_cursor_lines.sort()
         self._set_message(f"Multi-cursor lines: {1 + len(self.extra_cursor_lines)}")
 
+    def _add_cursor_next_match(self) -> bool:
+        symbol = word_at_cursor(self._line(), self.cx)
+        if not symbol:
+            return False
+        pattern = re.compile(rf"\b{re.escape(symbol)}\b")
+        selected_rows = {self.cy, *self.extra_cursor_lines}
+        total = len(self.lines)
+        start_row = self.cy
+        start_col = self.cx + 1
+        target: tuple[int, int] | None = None
+        for current in range(start_row, total):
+            line = self.lines[current]
+            search_from = start_col if current == start_row else 0
+            for match in pattern.finditer(line, search_from):
+                if current in selected_rows:
+                    continue
+                target = (current, match.start())
+                break
+            if target is not None:
+                break
+        if target is None:
+            for current in range(0, start_row):
+                line = self.lines[current]
+                for match in pattern.finditer(line):
+                    if current in selected_rows:
+                        continue
+                    target = (current, match.start())
+                    break
+                if target is not None:
+                    break
+        if target is None:
+            self._set_message(f"No more matches for '{symbol}'.")
+            return True
+        origin = self.cy
+        if origin not in self.extra_cursor_lines:
+            self.extra_cursor_lines.append(origin)
+        self.cy, self.cx = target
+        self.extra_cursor_lines = sorted({row for row in self.extra_cursor_lines if row != self.cy})
+        self._set_message(f"Multi-cursor word '{symbol}': {1 + len(self.extra_cursor_lines)}")
+        return True
+
     def _open_fuzzy(self, query: str = "") -> None:
         if not self.config.feature_enabled("fuzzy_finder"):
             self._set_message("Fuzzy finder is disabled in config.", error=True)
@@ -2668,7 +2738,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         if popup is None or self._floating_source != "file_tree":
             popup = FloatingList(
                 title="EXPLORER",
-                footer="<Esc> close  <Enter> open  <Up/Down> move  - fold",
+                footer="<Esc> close  <Enter> open  <Up/Down> move  Tab/- fold",
             )
             self._floating_list = popup
             self._floating_source = "file_tree"
@@ -2917,7 +2987,106 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._terminal_scroll = 0
         self.mode = MODE_NORMAL
 
-    def _find(self, query: str) -> bool:
+    def _search_query_from_command_text(self) -> str:
+        if self._command_prompt != "/":
+            return ""
+        if not self.command_text.startswith("find "):
+            return ""
+        return self.command_text[5:]
+
+    def _push_search_history(self, query: str) -> None:
+        clean = query.strip()
+        if not clean:
+            return
+        try:
+            self._search_history.remove(clean)
+        except ValueError:
+            pass
+        self._search_history.append(clean)
+        self._last_search_query = clean
+        self._search_history_index = len(self._search_history)
+        self._search_history_draft = ""
+
+    def _count_search_matches(self, query: str) -> int:
+        if not query:
+            return 0
+        total = 0
+        for line in self.lines:
+            total += line.count(query)
+        return total
+
+    def _on_command_text_changed(self) -> None:
+        if self._command_prompt != "/":
+            return
+        query = self._search_query_from_command_text()
+        self._incremental_search_query = query
+        if self._search_preview_origin is None:
+            self._search_preview_origin = self._capture_view_state()
+        if not query:
+            if self._search_preview_origin is not None:
+                self._apply_view_state(self._search_preview_origin)
+            self._set_message("Search: type query")
+            return
+        if not self.lines:
+            self._set_message("Search failed: empty buffer.", error=True)
+            return
+        origin = self._search_preview_origin
+        start_row = self.cy
+        start_col = self.cx
+        if origin is not None:
+            start_col, start_row, _row_offset, _col_offset = origin
+        start_row = clamp(start_row, 0, len(self.lines) - 1)
+        start_col = max(0, start_col)
+        location = find_next(self.lines, query, start_row, start_col)
+        if location is None:
+            self._set_message(f"Not found: {query}", error=True)
+            return
+        self.cy, self.cx = location
+        self._set_message(f"Search preview: {self._count_search_matches(query)} match(es)")
+
+    def _cancel_search_prompt(self) -> None:
+        if self._search_preview_origin is not None:
+            self._apply_view_state(self._search_preview_origin)
+        self._search_preview_origin = None
+        self._incremental_search_query = ""
+        self._search_history_index = len(self._search_history)
+        self._search_history_draft = ""
+
+    def _submit_search_prompt(self, command_text: str | None = None) -> None:
+        raw = command_text if isinstance(command_text, str) else self.command_text
+        query = raw[5:].strip() if raw.startswith("find ") else raw.strip()
+        self._search_preview_origin = None
+        self._incremental_search_query = ""
+        self._search_history_index = len(self._search_history)
+        self._search_history_draft = ""
+        if not query:
+            self._set_message("Usage: /<text>", error=True)
+            return
+        self._find(query, include_current=True)
+
+    def _browse_search_history(self, step: int) -> None:
+        if self._command_prompt != "/":
+            return
+        if not self._search_history:
+            return
+        if step == 0:
+            return
+        history = list(self._search_history)
+        max_index = len(history)
+        if self._search_history_index == max_index:
+            self._search_history_draft = self._search_query_from_command_text()
+        if step < 0:
+            self._search_history_index = max(0, self._search_history_index - 1)
+        else:
+            self._search_history_index = min(max_index, self._search_history_index + 1)
+        if self._search_history_index >= max_index:
+            query = self._search_history_draft
+        else:
+            query = history[self._search_history_index]
+        self.command_text = f"find {query}"
+        self._on_command_text_changed()
+
+    def _find(self, query: str, *, include_current: bool = False) -> bool:
         if not self.config.feature_enabled("find_replace"):
             self._set_message("Find/replace is disabled in config.", error=True)
             return False
@@ -2925,12 +3094,14 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._set_message("Usage: :find <text>", error=True)
             return False
 
-        location = find_next(self.lines, query, self.cy, self.cx + 1)
+        start_col = self.cx if include_current else self.cx + 1
+        location = find_next(self.lines, query, self.cy, start_col)
         if location is None:
             self._set_message(f"Not found: {query}", error=True)
             return False
 
         self.cy, self.cx = location
+        self._push_search_history(query)
         self._set_message(f"Found: {query}")
         return True
 
@@ -3247,6 +3418,15 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._command_prompt = prompt
         self.pending_operator = ""
         self.visual_anchor = None
+        if prompt == "/":
+            self._search_preview_origin = self._capture_view_state()
+            self._search_history_index = len(self._search_history)
+            self._search_history_draft = ""
+            self._incremental_search_query = ""
+            self._on_command_text_changed()
+        else:
+            self._search_preview_origin = None
+            self._incremental_search_query = ""
 
     def _open_rename_prompt(self) -> None:
         symbol = word_at_cursor(self._line(), self.cx)
@@ -3688,6 +3868,28 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         row += cursor_display // max(1, text_cols)
         return row
 
+    def _highlight_code_with_search(self, text: str, base_style: str, query: str) -> str:
+        if not text:
+            return base_style
+        syntax = self._syntax_manager()
+        if not query:
+            return syntax.highlight_line(text, self._syntax_profile, self.theme, base_style)
+        matches = list(re.finditer(re.escape(query), text))
+        if not matches:
+            return syntax.highlight_line(text, self._syntax_profile, self.theme, base_style)
+        match_style = self.theme.ui_style("selection") or base_style
+        out: list[str] = []
+        cursor = 0
+        for match in matches:
+            start, end = match.span()
+            if start > cursor:
+                out.append(syntax.highlight_line(text[cursor:start], self._syntax_profile, self.theme, base_style))
+            out.append(f"{match_style}{text[start:end]}{base_style}")
+            cursor = end
+        if cursor < len(text):
+            out.append(syntax.highlight_line(text[cursor:], self._syntax_profile, self.theme, base_style))
+        return "".join(out)
+
     def _render_editor_row(
         self,
         screen_row: int,
@@ -3738,12 +3940,8 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             else:
                 base_style = self.theme.ui_style("editor")
 
-            colored_code = self._syntax_manager().highlight_line(
-                visible_code,
-                self._syntax_profile,
-                self.theme,
-                base_style,
-            )
+            search_query = self._incremental_search_query if self.mode == MODE_COMMAND and self._command_prompt == "/" else ""
+            colored_code = self._highlight_code_with_search(visible_code, base_style, search_query)
             if ghost_visible:
                 ghost_style = self.theme.ui_style("message_info") or base_style
                 colored = f"{colored_code}{ghost_style}{ghost_visible}{base_style}"
@@ -3823,48 +4021,32 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
 
     def _render_dashboard_row(self, screen_row: int, text_rows: int, gutter: int, text_cols: int) -> str:
         base_style = self.theme.ui_style("editor")
-        accent_style = self.theme.ui_style("fuzzy_selected")
-        border_style = self.theme.ui_style("command_line")
-        top_left, top_right, bottom_left, bottom_right, vertical, horizontal = self._box_chars()
+        title_style = self.theme.ui_style("mode_normal")
+        accent_style = self.theme.ui_style("message_info")
         hints = [
-            APP_NAME,
-            f"v{APP_VERSION}",
+            f"{APP_NAME} {APP_VERSION}",
             "",
-            "i        insert mode",
-            ":e FILE  open file",
-            ":project DIR open folder",
-            ":help    command help",
-            "F1       key hints",
+            "~",
+            ":e FILE        open file",
+            ":project DIR   open folder",
+            "i              insert mode",
+            ":help          command help",
+            "F1             key hints",
         ]
-
-        content_width = max(display_width(item) for item in hints) + 4
-        box_width = clamp(content_width + 2, 28, max(28, text_cols - 2))
-        box_height = len(hints) + 2
-        start_row = max(0, (text_rows - box_height) // 2)
-        left_pad = max(0, (text_cols - box_width) // 2)
+        block_height = len(hints)
+        start_row = max(0, (text_rows - block_height) // 2)
 
         line = " " * text_cols
         style = base_style
-        if start_row <= screen_row < start_row + box_height:
+        if start_row <= screen_row < start_row + block_height:
             local = screen_row - start_row
+            text = hints[local]
+            left_pad = max(0, (text_cols - display_width(text)) // 2)
+            line = pad_to_display((" " * left_pad) + text, text_cols)
             if local == 0:
-                title = " Welcome "
-                inner = pad_to_display(slice_by_display(title, 0, box_width - 2), box_width - 2)
-                body = top_left + inner + top_right
-                line = pad_to_display((" " * left_pad) + body, text_cols)
-                style = border_style
-            elif local == box_height - 1:
-                body = bottom_left + (horizontal * max(0, box_width - 2)) + bottom_right
-                line = pad_to_display((" " * left_pad) + body, text_cols)
-                style = border_style
-            else:
-                hint = hints[local - 1]
-                shown = slice_by_display(hint, 0, max(0, box_width - 4))
-                hint_pad = max(0, (box_width - 2 - display_width(shown)) // 2)
-                content = pad_to_display((" " * hint_pad) + shown, box_width - 2)
-                body = vertical + content + vertical
-                line = pad_to_display((" " * left_pad) + body, text_cols)
-                style = accent_style if local in {1, 2} else base_style
+                style = title_style
+            elif local == 2:
+                style = accent_style
         if gutter > 0:
             return f"{self.theme.ui_style('line_number')}{' ' * gutter}{style}{line}{RESET}"
         return f"{style}{line}{RESET}"
@@ -4323,7 +4505,8 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
 
         if key == self._shortcut("add_cursor_down", "CTRL_D"):
             if self.mode in {MODE_NORMAL, MODE_INSERT, MODE_VISUAL}:
-                self._add_cursor_down()
+                if not self._add_cursor_next_match():
+                    self._add_cursor_down()
                 return True
             return False
 
@@ -4388,7 +4571,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._format_code()
             return True
 
-        if key == self._shortcut("refactor_rename", "CTRL_R"):
+        if key == self._shortcut("refactor_rename", "F6"):
             if self.mode != MODE_COMMAND:
                 self._open_rename_prompt()
                 return True
@@ -4479,6 +4662,11 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
 
             self._handle_normal_key(key)
             self._dispatch_plugin_key(key)
+        except Exception as exc:
+            self.pending_operator = ""
+            self.pending_scope = ""
+            self._pending_motion = ""
+            self._set_message(self._friendly_error_message(exc), error=True)
         finally:
             self._capture_split_active_view()
             self._push_history_if_changed(before, label=f"key:{key}")

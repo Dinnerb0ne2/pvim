@@ -1,0 +1,7 @@
+{
+  "name": "toml",
+  "line_comment": "#",
+  "keywords": ["true", "false"],
+  "builtins": ["datetime", "array", "table", "inline-table", "float", "integer"],
+  "string_delimiters": ["\"", "'"]
+}

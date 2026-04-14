@@ -1,0 +1,14 @@
+{
+  "name": "lua",
+  "line_comment": "--",
+  "keywords": [
+    "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto",
+    "if", "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while"
+  ],
+  "builtins": [
+    "assert", "collectgarbage", "dofile", "error", "getmetatable", "ipairs", "next", "pairs",
+    "pcall", "print", "rawequal", "rawget", "rawlen", "rawset", "require", "select", "setmetatable",
+    "tonumber", "tostring", "type", "xpcall"
+  ],
+  "string_delimiters": ["\"", "'"]
+}
