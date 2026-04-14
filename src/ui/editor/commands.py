@@ -132,9 +132,8 @@ class CommandsMixin:
             return
 
         if cmd in {"help", "h"}:
-            self._set_message(
-                "Commands: :w :q :e :split/:vsplit/:only :wincmd :find/:findre :replace/:replacere :replaceall/:replaceallre :replaceproj/:replaceprojre :encoding :project :term :rename :format :fuzzy :grep :tree :theme :feature :workspace :runtime :session :swap :keys :script :plugin :proc :virtual :ast :profile :piece :termcaps :syntax :git :jump :lsp :diag :codeaction"
-            )
+            topic = " ".join(args)
+            self._show_alert(self._help_text(topic))
             return
 
         if cmd in {"keys", "keyhint", "keymap"}:
@@ -142,6 +141,22 @@ class CommandsMixin:
                 self._open_key_hints()
             else:
                 self._handle_keys_command(args)
+            return
+
+        if cmd in {"quickfix", "qf"}:
+            self._handle_quickfix_command(args)
+            return
+
+        if cmd == "autocmd":
+            self._handle_autocmd_command(args)
+            return
+
+        if cmd in {"var", "vars"}:
+            self._handle_var_command(args)
+            return
+
+        if cmd in {"clip", "clipboard"}:
+            self._handle_clipboard_command(args)
             return
 
         if cmd in {"find", "search"}:
@@ -366,6 +381,10 @@ class CommandsMixin:
                 "Usage: :lsp status|start|stop|refs|impl|symbols|wsymbol <q>|rename <name>|format",
                 error=True,
             )
+            return
+
+        if cmd == "dap":
+            self._handle_dap_command(args)
             return
 
         if cmd == "plugin":

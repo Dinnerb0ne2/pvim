@@ -120,7 +120,31 @@ python pvim.py --config pvim.config.json
 - `:lsp status|start|stop`
 - `:diag` 查看诊断
 
-## 11. 终端兼容与排障
+## 11. Quickfix / Autocmd / 变量 / 剪贴板
+
+- Quickfix：
+  - `:quickfix fromgrep <query>` 生成快速定位列表
+  - `:quickfix fromdiag` 从当前文件诊断生成列表
+  - `:quickfix next|prev|list|clear` 导航与管理
+- Autocmd：
+  - 在 `features.autocmds.events` 中配置事件命令
+  - 支持事件：`bufreadpre` / `bufreadpost` / `bufwritepre` / `bufwritepost`
+  - `:autocmd list|reload|run <event>`
+- 作用域变量：
+  - `:var set g:name value`（全局）
+  - `:var set w:name value`（窗口）
+  - `:var set b:name value`（缓冲区）
+  - `:var get/list/unset ...`
+- 剪贴板：
+  - `:clip copy [text]`
+  - `:clip paste`
+  - `:clip show`
+- 轻量 DAP（pdb）：
+  - `:dap start [file]`（默认当前文件）
+  - `:dap break add|remove|list|clear [line]`
+  - `:dap continue|next|step|where|stop`
+
+## 12. 终端兼容与排障
 
 - `:termcaps` 查看终端能力（真彩/颜色级别/Unicode）。
 - 如果边框字符异常：更换支持 UTF-8 的终端字体，或使用非 Unicode 回退字符。

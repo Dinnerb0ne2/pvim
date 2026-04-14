@@ -235,6 +235,70 @@ class BufferEditorBehaviorTests(unittest.TestCase):
         self.editor.handle_key("ESC")
         self.assertEqual((self.editor.cy, self.editor.cx), (1, 0))
 
+    def test_autocmd_bufreadpost_and_bufwritepre(self) -> None:
+        cfg = self.editor.config.data
+        autocmd = cfg.setdefault("features", {}).setdefault("autocmds", {})
+        if isinstance(autocmd, dict):
+            autocmd["events"] = {
+                "bufreadpost": ["set nonumber"],
+                "bufwritepre": ["set number"],
+            }
+        self.editor._apply_runtime_config()
+
+        target = self._root / "auto.py"
+        target.write_text("x = 1\n", encoding="utf-8")
+
+        self.assertTrue(self.editor.open_file(target, force=True))
+        self.assertFalse(self.editor.show_line_numbers)
+        self.assertTrue(self.editor.save_file())
+        self.assertTrue(self.editor.show_line_numbers)
+
+    def test_scoped_var_commands(self) -> None:
+        self.editor.execute_command("var set g:theme nvim-tokyonight")
+        self.editor.execute_command("var get g:theme")
+        self.assertIn("g:theme=nvim-tokyonight", self.editor.message)
+
+        self.editor.execute_command("var set b:marker active")
+        self.editor.execute_command("var get b:marker")
+        self.assertIn("b:marker=active", self.editor.message)
+
+    def test_clipboard_copy_and_paste_uses_runtime_cache(self) -> None:
+        cfg = self.editor.config.data
+        clipboard = cfg.setdefault("features", {}).setdefault("clipboard", {})
+        if isinstance(clipboard, dict):
+            clipboard["enabled"] = False
+        self.editor.lines = ["abc"]
+        self.editor.cy = 0
+        self.editor.cx = 3
+
+        self.editor.execute_command("clip copy XYZ")
+        self.editor.execute_command("clip paste")
+        self.assertEqual(self.editor.lines[0], "abcXYZ")
+
+    def test_quickfix_from_grep_and_next(self) -> None:
+        first = self._root / "qa.py"
+        second = self._root / "qb.py"
+        first.write_text("TODO one\n", encoding="utf-8")
+        second.write_text("TODO two\n", encoding="utf-8")
+        self.assertTrue(self.editor.open_project(self._root, force=True))
+
+        self.editor.execute_command("quickfix fromgrep TODO")
+        self.assertGreaterEqual(len(self.editor._quickfix_items), 1)
+        self.editor.execute_command("quickfix next")
+        self.assertIsNotNone(self.editor.file_path)
+
+    def test_dap_breakpoint_commands(self) -> None:
+        target = self._root / "debug_target.py"
+        target.write_text("print('x')\n", encoding="utf-8")
+        self.assertTrue(self.editor.open_file(target, force=True))
+
+        self.editor.execute_command("dap break add 1")
+        key = str(target.resolve())
+        self.assertIn(1, self.editor._dap_breakpoints.get(key, set()))
+
+        self.editor.execute_command("dap break remove 1")
+        self.assertNotIn(1, self.editor._dap_breakpoints.get(key, set()))
+
 
 if __name__ == "__main__":
     unittest.main()

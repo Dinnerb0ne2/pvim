@@ -33,6 +33,10 @@ PVIM 是一个基于 **Python 3.14.3**、纯标准库实现的终端编辑器。
 - 配置热重载与按文件类型快捷键覆盖（无需重启）
 - 撤销树分支切换（`g-` / `g+`）与主题快速切换（`:theme`）
 - 终端能力探测与降级（True Color / Unicode 自动回退）
+- Quickfix 列表导航（`:quickfix fromgrep|fromdiag|next|prev|list`）
+- Autocmd 事件触发（`bufreadpre/post`、`bufwritepre/post`）
+- 多作用域变量与剪贴板命令（`:var`、`:clip`）
+- 轻量 DAP（pdb）调试管理（`:dap start/stop/continue/next/step/break`）
 
 ## 启动
 

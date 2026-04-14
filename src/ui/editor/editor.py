@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import cProfile
 from collections import deque
+from dataclasses import dataclass
 import io
 import json
 import os
 from pathlib import Path
 import pstats
 import re
+import subprocess
 import time
 import traceback
 
@@ -65,6 +67,14 @@ def clamp(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
 
 
+@dataclass(slots=True, frozen=True)
+class QuickfixItem:
+    path: Path
+    line: int
+    col: int
+    text: str
+
+
 class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
     def __init__(self, file_path: Path | None, config: AppConfig, ui: AbstractUI | None = None) -> None:
         self.config = config
@@ -113,6 +123,8 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._jump_back_stack: list[tuple[str, int, int, int, int]] = []
         self._jump_forward_stack: list[tuple[str, int, int, int, int]] = []
         self._jump_history_limit = 240
+        self._quickfix_items: list[QuickfixItem] = []
+        self._quickfix_index = -1
 
         self._history = HistoryStack(max_actions=400)
         self._history_enabled = True
@@ -149,7 +161,14 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._runtime_root = Path.cwd().resolve()
         self._session_path = self._runtime_root / "session" / "current.json"
         self._session_profiles_dir = self._runtime_root / "session" / "profiles"
+        self._autocmd_events: dict[str, list[str]] = {}
+        self._autocmd_depth = 0
         self._soft_wrap_enabled = True
+        self._global_vars: dict[str, str] = {}
+        self._window_vars: dict[str, str] = {}
+        self._buffer_vars: dict[str, dict[str, str]] = {}
+        self._clipboard_cache = ""
+        self._dap_breakpoints: dict[str, set[int]] = {}
 
         self.key_hints_enabled = True
         self.key_hints_trigger = "F1"
@@ -368,6 +387,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         )
         self._config_watch_enabled = self.config.config_reload_enabled()
         self._config_watch_interval = self.config.config_reload_interval_seconds()
+        self._autocmd_events = self.config.autocmd_events()
         self._history_enabled = self.config.undo_tree_enabled()
         self._history.set_limit(self.config.undo_tree_max_actions())
         self._feature_registry.set_enabled("tabline", self.config.feature_enabled("tabline"))
@@ -813,12 +833,17 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             "  :session save|load|list  (optional profile name)",
             "  :swap write|clear",
             "  :keys list|set|unset|conflicts|reset",
+            "  :quickfix list|next|prev|clear|fromgrep|fromdiag",
+            "  :autocmd list|reload|run <event>",
+            "  :var set|get|list|unset ...",
+            "  :clip copy|paste|show",
             "  :theme install|uninstall|list|<name>",
             "  :tree open|refresh|close|toggle|sort|filter|clear-filter|hidden  (Tab/- fold)",
             "  :feature <name> <on|off>",
             "  :syntax reload",
             "  :jump back|forward|list",
             "  :lsp status|start|stop|refs|impl|symbols|wsymbol|rename|format",
+            "  :dap status|start|stop|continue|next|step|where|break ...",
             "  :diag show LSP diagnostics",
         ]
         return lines
@@ -967,6 +992,571 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._set_message("Shortcut overrides reset.")
             return True
         self._set_message("Usage: :keys list|set|unset|conflicts|reset", error=True)
+        return False
+
+    def _help_text(self, topic: str = "") -> str:
+        clean = topic.strip().lower()
+        if clean in {"quickfix", "qf"}:
+            return (
+                "Quickfix\n\n"
+                ":quickfix list|next|prev|clear\n"
+                ":quickfix fromgrep [query]\n"
+                ":quickfix fromdiag"
+            )
+        if clean in {"autocmd", "ac"}:
+            return (
+                "Autocmds\n\n"
+                "Configure in pvim.config.json -> features.autocmds.events\n"
+                "Supported events: bufreadpre, bufreadpost, bufwritepre, bufwritepost\n"
+                ":autocmd list|reload|run <event>"
+            )
+        if clean in {"var", "vars"}:
+            return (
+                "Scoped Vars\n\n"
+                ":var set <g:name|w:name|b:name> <value>\n"
+                ":var get <g:name|w:name|b:name>\n"
+                ":var list [g|w|b]\n"
+                ":var unset <g:name|w:name|b:name>"
+            )
+        if clean in {"clip", "clipboard"}:
+            return (
+                "Clipboard\n\n"
+                ":clip copy [text]\n"
+                ":clip paste\n"
+                ":clip show"
+            )
+        if clean in {"dap", "debug"}:
+            return (
+                "DAP (pdb backend)\n\n"
+                ":dap status\n"
+                ":dap start [python_file]\n"
+                ":dap break add|remove|list|clear [line]\n"
+                ":dap continue|next|step|where|stop"
+            )
+        return (
+            "PVIM Help\n\n"
+            "Commands: :w :q :e :split/:vsplit/:only :wincmd :find/:findre :replace/:replacere "
+            ":replaceall/:replaceallre :replaceproj/:replaceprojre :encoding :project :term "
+            ":rename :format :fuzzy :grep :tree :theme :feature :workspace :runtime :session :swap "
+            ":keys :script :plugin :proc :virtual :ast :profile :piece :termcaps :syntax :git :jump "
+            ":lsp :diag :codeaction :dap :quickfix :autocmd :var :clip"
+        )
+
+    def _run_autocmds(self, event_name: str) -> None:
+        event = event_name.strip().lower()
+        if not event:
+            return
+        commands = self._autocmd_events.get(event, [])
+        if not commands:
+            return
+        if self._autocmd_depth >= 4:
+            self._set_message(f"Autocmd depth limit reached: {event}", error=True)
+            return
+        self._autocmd_depth += 1
+        try:
+            for raw in commands:
+                command = raw.strip()
+                if not command:
+                    continue
+                self.execute_command(command)
+        finally:
+            self._autocmd_depth = max(0, self._autocmd_depth - 1)
+
+    def _handle_autocmd_command(self, args: list[str]) -> bool:
+        action = args[0].strip().lower() if args else "list"
+        if action in {"list", "ls"}:
+            if not self._autocmd_events:
+                self._show_alert("(no autocmds configured)")
+                return True
+            lines: list[str] = []
+            for event, commands in sorted(self._autocmd_events.items()):
+                lines.append(f"[{event}]")
+                for command in commands:
+                    lines.append(f"  {command}")
+            self._show_alert("\n".join(lines))
+            return True
+        if action in {"reload", "refresh"}:
+            self._autocmd_events = self.config.autocmd_events()
+            self._set_message("Autocmds reloaded.")
+            return True
+        if action == "run":
+            if len(args) < 2:
+                self._set_message("Usage: :autocmd run <event>", error=True)
+                return False
+            event = args[1].strip().lower()
+            if not event:
+                self._set_message("Usage: :autocmd run <event>", error=True)
+                return False
+            self._run_autocmds(event)
+            self._set_message(f"Autocmd executed: {event}")
+            return True
+        self._set_message("Usage: :autocmd list|reload|run <event>", error=True)
+        return False
+
+    def _current_buffer_scope_key(self) -> str:
+        if self.file_path is None:
+            return "__no_name__"
+        return str(self.file_path.resolve())
+
+    def _scope_bucket(self, scope: str) -> dict[str, str] | None:
+        if scope == "g":
+            return self._global_vars
+        if scope == "w":
+            return self._window_vars
+        if scope == "b":
+            key = self._current_buffer_scope_key()
+            return self._buffer_vars.setdefault(key, {})
+        return None
+
+    def _parse_scoped_key(self, value: str) -> tuple[str, str] | None:
+        text = value.strip()
+        if not text:
+            return None
+        if ":" in text:
+            scope, key = text.split(":", 1)
+            scope = scope.strip().lower()
+            key = key.strip()
+        else:
+            scope = "g"
+            key = text
+        if scope not in {"g", "w", "b"}:
+            return None
+        if not key:
+            return None
+        return scope, key
+
+    def _handle_var_command(self, args: list[str]) -> bool:
+        if not self.config.scoped_variables_enabled():
+            self._set_message("Scoped vars are disabled in config.", error=True)
+            return False
+        if not args:
+            self._set_message("Usage: :var set|get|list|unset ...", error=True)
+            return False
+        action = args[0].strip().lower()
+        if action == "set":
+            if len(args) < 3:
+                self._set_message("Usage: :var set <g:name|w:name|b:name> <value>", error=True)
+                return False
+            parsed = self._parse_scoped_key(args[1])
+            if parsed is None:
+                self._set_message("Invalid scoped key. Use g:name/w:name/b:name", error=True)
+                return False
+            scope, key = parsed
+            bucket = self._scope_bucket(scope)
+            if bucket is None:
+                self._set_message("Invalid variable scope.", error=True)
+                return False
+            bucket[key] = " ".join(args[2:])
+            self._set_message(f"Var set: {scope}:{key}")
+            return True
+        if action == "get":
+            if len(args) < 2:
+                self._set_message("Usage: :var get <g:name|w:name|b:name>", error=True)
+                return False
+            parsed = self._parse_scoped_key(args[1])
+            if parsed is None:
+                self._set_message("Invalid scoped key. Use g:name/w:name/b:name", error=True)
+                return False
+            scope, key = parsed
+            bucket = self._scope_bucket(scope)
+            if bucket is None:
+                self._set_message("Invalid variable scope.", error=True)
+                return False
+            if key not in bucket:
+                self._set_message(f"Var not found: {scope}:{key}", error=True)
+                return False
+            self._set_message(f"{scope}:{key}={bucket[key]}")
+            return True
+        if action in {"list", "ls"}:
+            requested = args[1].strip().lower() if len(args) >= 2 else ""
+            scopes = [requested] if requested in {"g", "w", "b"} else ["g", "w", "b"]
+            lines: list[str] = []
+            for scope in scopes:
+                bucket = self._scope_bucket(scope)
+                if bucket is None:
+                    continue
+                lines.append(f"[{scope}]")
+                if not bucket:
+                    lines.append("  (empty)")
+                    continue
+                for key, value in sorted(bucket.items()):
+                    lines.append(f"  {key}={value}")
+            self._show_alert("\n".join(lines) if lines else "(no vars)")
+            return True
+        if action in {"unset", "rm", "remove"}:
+            if len(args) < 2:
+                self._set_message("Usage: :var unset <g:name|w:name|b:name>", error=True)
+                return False
+            parsed = self._parse_scoped_key(args[1])
+            if parsed is None:
+                self._set_message("Invalid scoped key. Use g:name/w:name/b:name", error=True)
+                return False
+            scope, key = parsed
+            bucket = self._scope_bucket(scope)
+            if bucket is None or key not in bucket:
+                self._set_message(f"Var not found: {scope}:{key}", error=True)
+                return False
+            bucket.pop(key, None)
+            self._set_message(f"Var unset: {scope}:{key}")
+            return True
+        self._set_message("Usage: :var set|get|list|unset ...", error=True)
+        return False
+
+    def _write_system_clipboard(self, text: str) -> bool:
+        if not self.config.clipboard_enabled():
+            return False
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["clip"],
+                    input=text,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=0.8,
+                    check=True,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return False
+            return True
+        return False
+
+    def _read_system_clipboard(self) -> str | None:
+        if not self.config.clipboard_enabled():
+            return None
+        if os.name == "nt":
+            try:
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", "Get-Clipboard"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=0.8,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return None
+            if result.returncode != 0:
+                return None
+            return result.stdout.replace("\r\n", "\n")
+        return None
+
+    def _insert_clipboard_text(self, text: str) -> bool:
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        if not normalized:
+            return False
+        line = self._line()
+        left = line[: self.cx]
+        right = line[self.cx :]
+        parts = normalized.split("\n")
+        if len(parts) == 1:
+            self._set_line(left + parts[0] + right)
+            self.cx += len(parts[0])
+            self._mark_modified()
+            return True
+        updated = [left + parts[0], *parts[1:-1], parts[-1] + right]
+        self.lines[self.cy : self.cy + 1] = updated
+        self.buffer.mark_all_dirty()
+        self.cy += len(updated) - 1
+        self.cx = len(parts[-1])
+        self._mark_modified()
+        return True
+
+    def _handle_clipboard_command(self, args: list[str]) -> bool:
+        if not args:
+            self._set_message("Usage: :clip copy|paste|show [text]", error=True)
+            return False
+        action = args[0].strip().lower()
+        if action in {"copy", "yank"}:
+            text = " ".join(args[1:]) if len(args) >= 2 else self._line()
+            self._clipboard_cache = text
+            self._write_system_clipboard(text)
+            self._set_message(f"Clipboard copied ({len(text)} chars).")
+            return True
+        if action == "paste":
+            text = self._read_system_clipboard()
+            if text is None:
+                text = self._clipboard_cache
+            if not text:
+                self._set_message("Clipboard is empty.", error=True)
+                return False
+            if not self._insert_clipboard_text(text):
+                self._set_message("Clipboard paste failed.", error=True)
+                return False
+            self._set_message("Clipboard pasted.")
+            return True
+        if action in {"show", "peek"}:
+            text = self._read_system_clipboard()
+            if text is None:
+                text = self._clipboard_cache
+            if not text:
+                self._show_alert("(clipboard is empty)")
+                return True
+            self._show_alert(text[:7000])
+            return True
+        self._set_message("Usage: :clip copy|paste|show [text]", error=True)
+        return False
+
+    def _quickfix_label(self, item: QuickfixItem) -> str:
+        try:
+            relative = item.path.resolve().relative_to(self._workspace_root.resolve())
+            path_label = str(relative)
+        except ValueError:
+            path_label = str(item.path)
+        text = item.text.strip()
+        return f"{path_label}:{item.line}:{item.col} {text}".rstrip()
+
+    def _set_quickfix_items(self, items: list[QuickfixItem], *, source: str) -> None:
+        limit = self.config.quickfix_max_items()
+        trimmed = items[:limit]
+        self._quickfix_items = trimmed
+        self._quickfix_index = 0 if trimmed else -1
+        self._set_message(f"Quickfix ({source}): {len(trimmed)} item(s)")
+
+    def _quickfix_jump(self, index: int) -> bool:
+        if not self._quickfix_items:
+            self._set_message("Quickfix list is empty.", error=True)
+            return False
+        if index < 0 or index >= len(self._quickfix_items):
+            self._set_message("Quickfix index out of range.", error=True)
+            return False
+        item = self._quickfix_items[index]
+        self._record_jump_origin()
+        if not self.open_file(item.path, force=False):
+            self._set_message(f"Quickfix open failed: {item.path}", error=True)
+            return False
+        self.cy = clamp(item.line - 1, 0, len(self.lines) - 1)
+        self.cx = clamp(item.col - 1, 0, len(self._line()))
+        self._quickfix_index = index
+        self._set_message(f"Quickfix {index + 1}/{len(self._quickfix_items)}: {self._quickfix_label(item)}")
+        return True
+
+    def _quickfix_shift(self, delta: int) -> bool:
+        if not self._quickfix_items:
+            self._set_message("Quickfix list is empty.", error=True)
+            return False
+        if self._quickfix_index < 0:
+            self._quickfix_index = 0
+        target = (self._quickfix_index + delta) % len(self._quickfix_items)
+        return self._quickfix_jump(target)
+
+    def _quickfix_from_live_grep(self, query: str) -> bool:
+        clean = query.strip()
+        if clean:
+            try:
+                matches = self._async_runtime.run_sync(
+                    self._live_grep.search(self._workspace_root, clean, limit=self.config.quickfix_max_items()),
+                    timeout=3.0,
+                )
+            except Exception as exc:
+                self._set_message(f"Quickfix grep failed: {exc}", error=True)
+                return False
+        else:
+            matches = list(self._live_grep_matches)
+        if not matches:
+            self._set_message("Quickfix grep has no results.", error=True)
+            return False
+        items = [
+            QuickfixItem(
+                path=match.file_path.resolve(),
+                line=max(1, int(match.line)),
+                col=max(1, int(match.column)),
+                text=match.text,
+            )
+            for match in matches
+        ]
+        self._set_quickfix_items(items, source="grep")
+        return True
+
+    def _quickfix_from_diagnostics(self) -> bool:
+        client = self._ensure_lsp_ready(show_error=True)
+        if client is None or self.file_path is None:
+            return False
+        try:
+            payload = self._async_runtime.run_sync(
+                client.diagnostics_raw(self.file_path),
+                timeout=self._lsp_timeout_seconds,
+            )
+        except Exception as exc:
+            self._set_message(f"Quickfix diagnostics failed: {exc}", error=True)
+            return False
+        if not payload:
+            self._set_message("Quickfix diagnostics has no results.", error=True)
+            return False
+        items: list[QuickfixItem] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            message = str(item.get("message", "")).strip()
+            line = 1
+            col = 1
+            range_obj = item.get("range")
+            if isinstance(range_obj, dict):
+                start = range_obj.get("start")
+                if isinstance(start, dict):
+                    try:
+                        line = int(start.get("line", 0)) + 1
+                    except (TypeError, ValueError):
+                        line = 1
+                    try:
+                        col = int(start.get("character", 0)) + 1
+                    except (TypeError, ValueError):
+                        col = 1
+            items.append(
+                QuickfixItem(
+                    path=self.file_path.resolve(),
+                    line=max(1, line),
+                    col=max(1, col),
+                    text=message or "diagnostic",
+                )
+            )
+        if not items:
+            self._set_message("Quickfix diagnostics has no results.", error=True)
+            return False
+        self._set_quickfix_items(items, source="diagnostics")
+        return True
+
+    def _handle_quickfix_command(self, args: list[str]) -> bool:
+        if not self.config.feature_enabled("quickfix"):
+            self._set_message("Quickfix is disabled in config.", error=True)
+            return False
+        action = args[0].strip().lower() if args else "list"
+        if action in {"list", "ls", "open"}:
+            if not self._quickfix_items:
+                self._show_alert("(quickfix is empty)")
+                return True
+            lines = [
+                (f"{index + 1:>3}. {self._quickfix_label(item)}")
+                for index, item in enumerate(self._quickfix_items)
+            ]
+            self._show_alert("\n".join(lines))
+            return True
+        if action in {"next", "n"}:
+            return self._quickfix_shift(1)
+        if action in {"prev", "previous", "p"}:
+            return self._quickfix_shift(-1)
+        if action == "clear":
+            self._quickfix_items = []
+            self._quickfix_index = -1
+            self._set_message("Quickfix cleared.")
+            return True
+        if action in {"fromgrep", "grep"}:
+            return self._quickfix_from_live_grep(" ".join(args[1:]) if len(args) >= 2 else "")
+        if action in {"fromdiag", "diag", "diagnostics"}:
+            return self._quickfix_from_diagnostics()
+        self._set_message(
+            "Usage: :quickfix list|next|prev|clear|fromgrep [query]|fromdiag",
+            error=True,
+        )
+        return False
+
+    def _dap_path_key(self, path: Path) -> str:
+        return str(path.resolve())
+
+    def _dap_breakpoint_set(self, path: Path) -> set[int]:
+        key = self._dap_path_key(path)
+        return self._dap_breakpoints.setdefault(key, set())
+
+    def _handle_dap_command(self, args: list[str]) -> bool:
+        if not self.config.dap_enabled():
+            self._set_message("DAP is disabled in config.", error=True)
+            return False
+        action = args[0].strip().lower() if args else "status"
+        if action == "status":
+            running = self._terminal_process_id is not None and self._process_manager.status(self._terminal_process_id) == "running"
+            total_breakpoints = sum(len(lines) for lines in self._dap_breakpoints.values())
+            self._set_message(
+                f"DAP(pdb): {'running' if running else 'idle'} | breakpoints={total_breakpoints}"
+            )
+            return True
+        if action in {"start", "run"}:
+            target_text = " ".join(args[1:]).strip() if len(args) >= 2 else ""
+            if target_text:
+                target = self._resolve_path(target_text)
+            elif self.file_path is not None:
+                target = self.file_path
+            else:
+                self._set_message("Usage: :dap start <python_file>", error=True)
+                return False
+            if not target.exists() or target.is_dir():
+                self._set_message(f"DAP target not found: {target}", error=True)
+                return False
+            python_cmd = self.config.dap_python_command()
+            command = f'{python_cmd} -m pdb "{target}"'
+            if not self._open_terminal(command):
+                return False
+            for line in sorted(self._dap_breakpoint_set(target)):
+                self._send_terminal_input(f"b {target}:{line}")
+            self._set_message(f"DAP started: {target.name}")
+            return True
+        if action in {"stop", "close"}:
+            self._close_terminal(kill=True)
+            self._set_message("DAP stopped.")
+            return True
+        if action in {"continue", "c"}:
+            self._send_terminal_input("c")
+            self._set_message("DAP continue.")
+            return True
+        if action in {"next", "n"}:
+            self._send_terminal_input("n")
+            self._set_message("DAP next.")
+            return True
+        if action in {"step", "s"}:
+            self._send_terminal_input("s")
+            self._set_message("DAP step.")
+            return True
+        if action in {"where", "bt", "stack"}:
+            self._send_terminal_input("w")
+            self._set_message("DAP stack trace requested.")
+            return True
+        if action == "break":
+            sub = args[1].strip().lower() if len(args) >= 2 else "list"
+            if self.file_path is None:
+                self._set_message("Open a file before managing breakpoints.", error=True)
+                return False
+            target = self.file_path.resolve()
+            breaks = self._dap_breakpoint_set(target)
+            if sub == "add":
+                line = self.cy + 1
+                if len(args) >= 3:
+                    try:
+                        line = max(1, int(args[2]))
+                    except ValueError:
+                        self._set_message("Usage: :dap break add [line]", error=True)
+                        return False
+                breaks.add(line)
+                self._set_message(f"DAP breakpoint added: {target.name}:{line}")
+                return True
+            if sub in {"remove", "rm", "del"}:
+                line = self.cy + 1
+                if len(args) >= 3:
+                    try:
+                        line = max(1, int(args[2]))
+                    except ValueError:
+                        self._set_message("Usage: :dap break remove [line]", error=True)
+                        return False
+                if line in breaks:
+                    breaks.remove(line)
+                    self._set_message(f"DAP breakpoint removed: {target.name}:{line}")
+                    return True
+                self._set_message(f"DAP breakpoint not found: {target.name}:{line}", error=True)
+                return False
+            if sub in {"clear", "all"}:
+                breaks.clear()
+                self._set_message(f"DAP breakpoints cleared: {target.name}")
+                return True
+            if sub in {"list", "ls"}:
+                if not breaks:
+                    self._show_alert("(no breakpoints)")
+                    return True
+                lines = [f"{target.name}:{line}" for line in sorted(breaks)]
+                self._show_alert("\n".join(lines))
+                return True
+            self._set_message("Usage: :dap break add|remove|list|clear [line]", error=True)
+            return False
+        self._set_message(
+            "Usage: :dap status|start [file]|stop|continue|next|step|where|break add|remove|list|clear [line]",
+            error=True,
+        )
         return False
 
     def _set_message(self, message: str, *, error: bool = False) -> None:
@@ -1412,6 +2002,16 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                         continue
                     self._live_grep_query = query
                     self._live_grep_matches = matches
+                    self._quickfix_items = [
+                        QuickfixItem(
+                            path=match.file_path.resolve(),
+                            line=max(1, int(match.line)),
+                            col=max(1, int(match.column)),
+                            text=match.text,
+                        )
+                        for match in matches[: self.config.quickfix_max_items()]
+                    ]
+                    self._quickfix_index = 0 if self._quickfix_items else -1
                     if self._floating_source == "live_grep" and self._floating_list is not None:
                         labels = [match.label(self._workspace_root) for match in matches]
                         if not labels:
@@ -3985,6 +4585,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             return False
 
         path = self._resolve_path(target)
+        self._run_autocmds("bufreadpre")
         if path.exists() and path.is_dir():
             return self.open_project(path, force=force, startup=startup)
         text = ""
@@ -4048,6 +4649,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._maybe_prompt_swap_recovery(path)
         if not self._sidebar_manual_override:
             self.show_sidebar = False
+        self._run_autocmds("bufreadpost")
         return True
 
     def save_file(self, target: Path | str | None = None, *, quiet: bool = False) -> bool:
@@ -4065,6 +4667,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._set_message("No file name. Use :w <path>.", error=True)
             return False
 
+        self._run_autocmds("bufwritepre")
         try:
             self.file_path.parent.mkdir(parents=True, exist_ok=True)
             current = self.buffer.text()
@@ -4087,6 +4690,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._persistence.remove_swap(self.file_path)
         if not quiet:
             self._set_message(f"Wrote {self.file_path}")
+        self._run_autocmds("bufwritepost")
         return True
 
     def request_quit(self, *, force: bool) -> bool:
