@@ -23,6 +23,7 @@ from ...core.persistence import EditorPersistence, SwapPayload
 from ...core.process_pipe import AsyncProcessManager
 from ...core.terminal_capabilities import detect_terminal_capabilities
 from ...core.theme import RESET, Theme, load_theme
+from ...core.theme_manager import ThemeManager
 from ...ui_grid import AbstractUI
 from ...features.ast_query import AstQueryService
 from ...features.file_index import FileIndex
@@ -144,8 +145,10 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._swap_prompt_path: Path | None = None
         self._swap_prompt_payload: SwapPayload | None = None
         self._session_enabled = True
-        self._session_path = Path.cwd() / ".pvim.session.json"
-        self._session_profiles_dir = Path.cwd() / ".pvim.sessions"
+        self._session_restore_on_startup = False
+        self._runtime_root = Path.cwd().resolve()
+        self._session_path = self._runtime_root / "session" / "current.json"
+        self._session_profiles_dir = self._runtime_root / "session" / "profiles"
         self._soft_wrap_enabled = True
 
         self.key_hints_enabled = True
@@ -209,6 +212,10 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._terminal_output: list[str] = []
         self._terminal_input = ""
         self._terminal_scroll = 0
+        self._theme_manager = ThemeManager(
+            builtin_dirs=[Path.cwd(), Path.cwd() / "themes"],
+            user_dir=Path.cwd() / "themes",
+        )
         self._split_enabled = False
         self._split_orientation = "vertical"
         self._split_ratio = 0.5
@@ -221,10 +228,15 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             step_limit=100_000,
             auto_load=False,
             host_api=self._plugin_api_dispatch,
+            sandbox_enabled=self.config.plugin_sandbox_enabled(),
+            allowed_actions=self.config.plugin_sandbox_allowed_actions(),
         )
         self._plugins_loaded = False
         self._auto_pairs: dict[str, str] = {}
         self._auto_pair_closers: set[str] = set()
+        self._bracket_styles: tuple[str, ...] = ()
+        self._bracket_active_style = ""
+        self._active_bracket_pair: tuple[int, int, int, int] | None = None
         self._register_feature_descriptors()
 
         self._apply_runtime_config()
@@ -235,7 +247,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                 self.open_project(target, force=True, startup=True)
             else:
                 self.open_file(target, force=True, startup=True)
-        elif self._session_enabled:
+        elif self._session_enabled and self._session_restore_on_startup:
             self._restore_session()
 
     @property
@@ -330,7 +342,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self.show_line_numbers = self.config.show_line_numbers()
         self.tab_size = self.config.tab_size()
         self._soft_wrap_enabled = self.config.soft_wrap_enabled()
-        self.show_sidebar = self.config.sidebar_enabled()
+        self.show_sidebar = self.config.sidebar_enabled() if self._project_mode else False
         self._sidebar_manual_override = False
         self.sidebar_width = self.config.sidebar_width()
         self.key_hints_enabled = self.config.key_hints_enabled()
@@ -338,14 +350,22 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._lazy_load_enabled = self.config.lazy_load_enabled()
         self._swap_enabled = self.config.swap_enabled()
         self._swap_interval = self.config.swap_interval_seconds()
+        self._persistence.set_swap_directory(self.config.swap_directory())
         self._auto_save_enabled = self.config.auto_save_enabled()
         self._auto_save_interval = self.config.auto_save_interval_seconds()
         self._encoding_candidates = self.config.preferred_encodings()
         if self._current_encoding not in self._encoding_candidates:
             self._current_encoding = self._encoding_candidates[0]
+        self._runtime_root = self.config.runtime_directory()
+        self._load_shortcut_overrides()
         self._session_enabled = self.config.session_enabled()
+        self._session_restore_on_startup = self.config.session_restore_on_startup()
         self._session_path = self.config.session_file()
         self._session_profiles_dir = self.config.session_profiles_directory()
+        self._theme_manager = ThemeManager(
+            builtin_dirs=[self.config.path.parent, self.config.path.parent / "themes"],
+            user_dir=self._runtime_root / "themes",
+        )
         self._config_watch_enabled = self.config.config_reload_enabled()
         self._config_watch_interval = self.config.config_reload_interval_seconds()
         self._history_enabled = self.config.undo_tree_enabled()
@@ -402,6 +422,8 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             step_limit=self.config.script_step_limit(),
             auto_load=self.config.plugins_auto_load() and not self._lazy_load_enabled,
             host_api=self._plugin_api_dispatch,
+            sandbox_enabled=self.config.plugin_sandbox_enabled(),
+            allowed_actions=self.config.plugin_sandbox_allowed_actions(),
         )
         self._plugins_loaded = not self._lazy_load_enabled
         if self._plugins_loaded:
@@ -415,6 +437,31 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self.buffer.configure_piece_table(use_piece_table)
         self._auto_pairs = self._load_auto_pairs()
         self._auto_pair_closers = set(self._auto_pairs.values())
+        bracket_styles = [
+            self.theme.ui_style("bracket_level_1"),
+            self.theme.ui_style("bracket_level_2"),
+            self.theme.ui_style("bracket_level_3"),
+            self.theme.ui_style("bracket_level_4"),
+            self.theme.ui_style("bracket_level_5"),
+            self.theme.ui_style("bracket_level_6"),
+        ]
+        fallback_bracket_styles = [
+            self.theme.syntax_style("decorator"),
+            self.theme.syntax_style("type"),
+            self.theme.syntax_style("function"),
+            self.theme.syntax_style("keyword"),
+            self.theme.syntax_style("builtin"),
+            self.theme.syntax_style("number"),
+        ]
+        self._bracket_styles = tuple(style for style in bracket_styles if style) or tuple(
+            style for style in fallback_bracket_styles if style
+        )
+        self._bracket_active_style = (
+            self.theme.ui_style("bracket_active")
+            or self.theme.ui_style("selection")
+            or self.theme.ui_style("cursor_line")
+            or self.theme.ui_style("mode_insert")
+        )
         self._file_tree_feature.unicode_art = self._unicode_ui
         self._config_watch_mtimes = self._snapshot_config_mtimes()
 
@@ -737,10 +784,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             "  Ctrl+W v/s split, Ctrl+W w switch pane, Ctrl+W q close",
             "",
             "Plugin commands",
-            "  :plugin list",
-            "  :plugin load",
-            "  :plugin install <path>",
-            "  :plugin run <name> <function> [args ...]",
+            "  :plugin list|load|install|uninstall|run ...",
             "",
             "Script commands",
             "  :script run <file>",
@@ -760,6 +804,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             "  :termcaps",
             "  :theme list | :theme <name>",
             "  :workspace",
+            "  :runtime show runtime-managed storage paths",
             "  :project <dir> open folder workspace",
             "  :split / :vsplit / :only / :wincmd w|h|l|q",
             "  :term [cmd] built-in terminal panel",
@@ -767,6 +812,8 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             "  :encoding [name]",
             "  :session save|load|list  (optional profile name)",
             "  :swap write|clear",
+            "  :keys list|set|unset|conflicts|reset",
+            "  :theme install|uninstall|list|<name>",
             "  :tree open|refresh|close|toggle|sort|filter|clear-filter|hidden  (Tab/- fold)",
             "  :feature <name> <on|off>",
             "  :syntax reload",
@@ -775,6 +822,152 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             "  :diag show LSP diagnostics",
         ]
         return lines
+
+    def _shortcut_overrides_file(self) -> Path:
+        return (self._runtime_root / "keymaps.json").resolve()
+
+    def _bindings_section(self) -> dict[str, str]:
+        features = self.config.data.setdefault("features", {})
+        if not isinstance(features, dict):
+            features = {}
+            self.config.data["features"] = features
+        shortcuts = features.setdefault("vscode_shortcuts", {})
+        if not isinstance(shortcuts, dict):
+            shortcuts = {}
+            features["vscode_shortcuts"] = shortcuts
+        bindings = shortcuts.setdefault("bindings", {})
+        if not isinstance(bindings, dict):
+            bindings = {}
+            shortcuts["bindings"] = bindings
+        return {str(key): str(value) for key, value in bindings.items() if isinstance(key, str) and isinstance(value, str)}
+
+    def _set_bindings_section(self, bindings: dict[str, str]) -> None:
+        features = self.config.data.setdefault("features", {})
+        if not isinstance(features, dict):
+            features = {}
+            self.config.data["features"] = features
+        shortcuts = features.setdefault("vscode_shortcuts", {})
+        if not isinstance(shortcuts, dict):
+            shortcuts = {}
+            features["vscode_shortcuts"] = shortcuts
+        shortcuts["bindings"] = dict(bindings)
+
+    def _load_shortcut_overrides(self) -> None:
+        path = self._shortcut_overrides_file()
+        if not path.exists():
+            return
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(loaded, dict):
+            return
+        payload = loaded.get("bindings", {})
+        if not isinstance(payload, dict):
+            return
+        bindings = self._bindings_section()
+        for action, key in payload.items():
+            if not isinstance(action, str) or not isinstance(key, str):
+                continue
+            clean_action = action.strip()
+            clean_key = key.strip().upper()
+            if not clean_action or not clean_key:
+                continue
+            bindings[clean_action] = clean_key
+        self._set_bindings_section(bindings)
+
+    def _save_shortcut_overrides(self, bindings: dict[str, str]) -> None:
+        path = self._shortcut_overrides_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"bindings": dict(bindings)}
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _shortcut_conflicts(self, bindings: dict[str, str]) -> dict[str, list[str]]:
+        reverse: dict[str, list[str]] = {}
+        for action, key in bindings.items():
+            clean_key = key.strip().upper()
+            if not clean_key:
+                continue
+            reverse.setdefault(clean_key, []).append(action)
+        return {key: sorted(actions) for key, actions in reverse.items() if len(actions) > 1}
+
+    def _shortcut_lines(self, bindings: dict[str, str]) -> list[str]:
+        conflicts = self._shortcut_conflicts(bindings)
+        lines: list[str] = []
+        for action in sorted(bindings.keys(), key=str.lower):
+            key = bindings[action].strip().upper()
+            labels = [item for item in conflicts.get(key, []) if item != action]
+            hint = f"  [conflict: {', '.join(labels)}]" if labels else ""
+            lines.append(f"{action:<22} -> {key}{hint}")
+        if not lines:
+            return ["(no shortcuts configured)"]
+        return lines
+
+    def _handle_keys_command(self, args: list[str]) -> bool:
+        if not args:
+            self._open_key_hints()
+            return True
+        action = args[0].strip().lower()
+        bindings = self._bindings_section()
+        if action in {"list", "ls"}:
+            self._show_alert("\n".join(self._shortcut_lines(bindings)))
+            return True
+        if action in {"conflicts", "check"}:
+            conflicts = self._shortcut_conflicts(bindings)
+            if not conflicts:
+                self._show_alert("No shortcut conflicts.")
+                return True
+            lines = [f"{key}: {', '.join(actions)}" for key, actions in sorted(conflicts.items())]
+            self._show_alert("\n".join(lines))
+            return True
+        if action == "set":
+            if len(args) < 3:
+                self._set_message("Usage: :keys set <action> <key>", error=True)
+                return False
+            target_action = args[1].strip()
+            target_key = args[2].strip().upper()
+            if not target_action or not target_key:
+                self._set_message("Usage: :keys set <action> <key>", error=True)
+                return False
+            bindings[target_action] = target_key
+            self._set_bindings_section(bindings)
+            try:
+                self._save_shortcut_overrides(bindings)
+            except OSError as exc:
+                self._set_message(f"Shortcut save failed: {exc}", error=True)
+                return False
+            self._set_message(f"Shortcut set: {target_action} -> {target_key}")
+            return True
+        if action in {"unset", "remove", "rm"}:
+            if len(args) < 2:
+                self._set_message("Usage: :keys unset <action>", error=True)
+                return False
+            target_action = args[1].strip()
+            if not target_action:
+                self._set_message("Usage: :keys unset <action>", error=True)
+                return False
+            if target_action in bindings:
+                bindings.pop(target_action, None)
+                self._set_bindings_section(bindings)
+                try:
+                    self._save_shortcut_overrides(bindings)
+                except OSError as exc:
+                    self._set_message(f"Shortcut save failed: {exc}", error=True)
+                    return False
+                self._set_message(f"Shortcut unset: {target_action}")
+            else:
+                self._set_message(f"Shortcut action not found: {target_action}", error=True)
+                return False
+            return True
+        if action == "reset":
+            path = self._shortcut_overrides_file()
+            path.unlink(missing_ok=True)
+            self.config = AppConfig.load(self.config.path)
+            self._apply_runtime_config()
+            self._set_message("Shortcut overrides reset.")
+            return True
+        self._set_message("Usage: :keys list|set|unset|conflicts|reset", error=True)
+        return False
 
     def _set_message(self, message: str, *, error: bool = False) -> None:
         self.message = message
@@ -1824,7 +2017,17 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         base = anchor if anchor is not None else self._workspace_root
         start = base if base.is_dir() else base.parent
         start = start.resolve()
-        markers = (".git", ".pvim.project.json", "pyproject.toml", "package.json")
+        markers = (
+            ".git",
+            ".pvim.project.json",
+            "pyproject.toml",
+            "package.json",
+            "requirements.txt",
+            "setup.py",
+            "Cargo.toml",
+            "go.mod",
+            ".hg",
+        )
         for candidate in (start, *start.parents):
             if any((candidate / marker).exists() for marker in markers):
                 return candidate
@@ -2095,7 +2298,29 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self.cy += 1
             self.cx = min(self.cx, len(self._line()))
 
-    def _jump_to_matching_bracket(self) -> bool:
+    def _bracket_probe(self, row: int, col: int) -> tuple[int, int, str] | None:
+        if not (0 <= row < len(self.lines)):
+            return None
+        line = self.lines[row]
+        pairs = {"(", ")", "[", "]", "{", "}"}
+        probe_col = col
+        token = line[probe_col] if 0 <= probe_col < len(line) else ""
+        if token not in pairs and probe_col > 0:
+            probe_col -= 1
+            token = line[probe_col] if 0 <= probe_col < len(line) else ""
+        if token not in pairs:
+            return None
+        return row, probe_col, token
+
+    def _find_matching_bracket(
+        self,
+        row: int,
+        col: int,
+    ) -> tuple[int, int, int, int, bool] | None:
+        probe = self._bracket_probe(row, col)
+        if probe is None:
+            return None
+        probe_row, probe_col, token = probe
         pairs = {
             "(": ")",
             "[": "]",
@@ -2104,56 +2329,170 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             "]": "[",
             "}": "{",
         }
-        line = self._line()
-        probe_col = self.cx
-        ch = line[probe_col] if 0 <= probe_col < len(line) else ""
-        if ch not in pairs and probe_col > 0:
-            probe_col -= 1
-            ch = line[probe_col] if 0 <= probe_col < len(line) else ""
-        if ch not in pairs:
-            self._set_message("No bracket under cursor.", error=True)
-            return False
-
-        opening = ch in {"(", "[", "{"}
-        open_ch = ch if opening else pairs[ch]
-        close_ch = pairs[ch] if opening else ch
+        opening = token in {"(", "[", "{"}
+        open_ch = token if opening else pairs[token]
+        close_ch = pairs[token] if opening else token
         depth = 0
 
         if opening:
-            for row in range(self.cy, len(self.lines)):
-                start_col = probe_col + 1 if row == self.cy else 0
-                text = self.lines[row]
-                for col in range(start_col, len(text)):
-                    token = text[col]
-                    if token == open_ch:
+            for scan_row in range(probe_row, len(self.lines)):
+                start_col = probe_col + 1 if scan_row == probe_row else 0
+                text = self.lines[scan_row]
+                for scan_col in range(start_col, len(text)):
+                    current = text[scan_col]
+                    if current == open_ch:
                         depth += 1
-                    elif token == close_ch:
+                    elif current == close_ch:
                         if depth == 0:
-                            self._record_jump_origin()
-                            self.cy = row
-                            self.cx = col
-                            self._set_message("Matched bracket.")
-                            return True
+                            return probe_row, probe_col, scan_row, scan_col, True
                         depth -= 1
-        else:
-            for row in range(self.cy, -1, -1):
-                text = self.lines[row]
-                start_col = probe_col - 1 if row == self.cy else len(text) - 1
-                for col in range(start_col, -1, -1):
-                    token = text[col]
-                    if token == close_ch:
-                        depth += 1
-                    elif token == open_ch:
-                        if depth == 0:
-                            self._record_jump_origin()
-                            self.cy = row
-                            self.cx = col
-                            self._set_message("Matched bracket.")
-                            return True
-                        depth -= 1
+            return None
 
-        self._set_message("Matching bracket not found.", error=True)
-        return False
+        for scan_row in range(probe_row, -1, -1):
+            text = self.lines[scan_row]
+            start_col = probe_col - 1 if scan_row == probe_row else len(text) - 1
+            for scan_col in range(start_col, -1, -1):
+                current = text[scan_col]
+                if current == close_ch:
+                    depth += 1
+                elif current == open_ch:
+                    if depth == 0:
+                        return probe_row, probe_col, scan_row, scan_col, False
+                    depth -= 1
+        return None
+
+    def _active_bracket_pair_under_cursor(self) -> tuple[int, int, int, int] | None:
+        match = self._find_matching_bracket(self.cy, self.cx)
+        if match is None:
+            return None
+        probe_row, probe_col, target_row, target_col, opening = match
+        if opening:
+            return probe_row, probe_col, target_row, target_col
+        return target_row, target_col, probe_row, probe_col
+
+    def _jump_to_matching_bracket(self) -> bool:
+        if self._bracket_probe(self.cy, self.cx) is None:
+            self._set_message("No bracket under cursor.", error=True)
+            return False
+        match = self._find_matching_bracket(self.cy, self.cx)
+        if match is None:
+            self._set_message("Matching bracket not found.", error=True)
+            return False
+        _probe_row, _probe_col, target_row, target_col, _opening = match
+        self._record_jump_origin()
+        self.cy = target_row
+        self.cx = target_col
+        self._set_message("Matched bracket.")
+        return True
+
+    def _line_bracket_style_map(self, line_index: int, text: str) -> dict[int, str]:
+        if not text:
+            return {}
+        style_map: dict[int, str] = {}
+        open_to_close = {"(": ")", "[": "]", "{": "}"}
+        close_to_open = {")": "(", "]": "[", "}": "{"}
+        stack: list[tuple[str, int]] = []
+        levels = max(1, len(self._bracket_styles))
+        for index, token in enumerate(text):
+            if token in open_to_close:
+                style_index = len(stack) % levels
+                if self._bracket_styles:
+                    style_map[index] = self._bracket_styles[style_index]
+                stack.append((open_to_close[token], style_index))
+                continue
+            if token in close_to_open:
+                if stack and stack[-1][0] == token:
+                    _expected, style_index = stack.pop()
+                else:
+                    style_index = len(stack) % levels
+                if self._bracket_styles:
+                    style_map[index] = self._bracket_styles[style_index]
+
+        active = self._active_bracket_pair
+        if active is not None and self._bracket_active_style:
+            open_row, open_col, close_row, close_col = active
+            if line_index == open_row and 0 <= open_col < len(text):
+                style_map[open_col] = self._bracket_active_style
+            if line_index == close_row and 0 <= close_col < len(text):
+                style_map[close_col] = self._bracket_active_style
+        return style_map
+
+    def _visible_bracket_style_map(
+        self,
+        line_index: int,
+        line_text: str,
+        start_display: int,
+        visible_text: str,
+    ) -> dict[int, str]:
+        if not visible_text:
+            return {}
+        full_map = self._line_bracket_style_map(line_index, line_text)
+        if not full_map:
+            return {}
+        start_index = index_from_display_col(line_text, start_display)
+        visible_map: dict[int, str] = {}
+        for local_index in range(len(visible_text)):
+            style = full_map.get(start_index + local_index)
+            if style:
+                visible_map[local_index] = style
+        return visible_map
+
+    def _active_pair_line_markers(self) -> set[int]:
+        active = self._active_bracket_pair
+        if active is None:
+            return set()
+        open_row, _open_col, close_row, _close_col = active
+        if open_row == close_row:
+            return {open_row}
+        return {open_row, close_row}
+
+    def _highlight_code_with_search(
+        self,
+        text: str,
+        base_style: str,
+        query: str,
+        *,
+        line_index: int | None = None,
+        line_text: str = "",
+        start_display: int = 0,
+    ) -> str:
+        if not text:
+            return base_style
+        syntax = self._syntax_manager()
+        overlays: list[str | None] = [None] * len(text)
+        if query:
+            match_style = self.theme.ui_style("selection") or base_style
+            for match in re.finditer(re.escape(query), text):
+                start, end = match.span()
+                for index in range(start, end):
+                    overlays[index] = match_style
+        if line_index is not None:
+            bracket_styles = self._visible_bracket_style_map(
+                line_index,
+                line_text,
+                start_display,
+                text,
+            )
+            for index, style in bracket_styles.items():
+                if 0 <= index < len(overlays):
+                    overlays[index] = style
+        if all(item is None for item in overlays):
+            return syntax.highlight_line(text, self._syntax_profile, self.theme, base_style)
+        out: list[str] = []
+        cursor = 0
+        length = len(text)
+        while cursor < length:
+            style = overlays[cursor]
+            end = cursor + 1
+            while end < length and overlays[end] == style:
+                end += 1
+            segment = text[cursor:end]
+            if style is None:
+                out.append(syntax.highlight_line(segment, self._syntax_profile, self.theme, base_style))
+            else:
+                out.append(f"{style}{segment}{base_style}")
+            cursor = end
+        return "".join(out)
 
     def _move_word_left(self) -> None:
         if self.cx == 0 and self.cy > 0:
@@ -2731,14 +3070,23 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._floating_source = ""
 
     def _sync_file_tree_popup(self) -> None:
-        entries = [entry.display for entry in self._file_tree_feature.entries]
+        entries: list[str] = []
+        for entry in self._file_tree_feature.entries:
+            if entry.is_dir:
+                entries.append(f"  {entry.display}")
+                continue
+            marker = " "
+            if self.config.feature_enabled("git_status"):
+                marker = self.git.status_for_relative(Path(entry.relative_path)) or " "
+                marker = marker if marker.strip() else " "
+            entries.append(f"{marker} {entry.display}")
         if not entries:
             entries = ["(loading...)" if self._file_tree_task_active else "(empty)"]
         popup = self._floating_list
         if popup is None or self._floating_source != "file_tree":
             popup = FloatingList(
                 title="EXPLORER",
-                footer="<Esc> close  <Enter> open  <Up/Down> move  Tab/- fold",
+                footer="<Esc> close  <Enter> open  <Up/Down> move  Tab/- fold  :tree status",
             )
             self._floating_list = popup
             self._floating_source = "file_tree"
@@ -2919,7 +3267,12 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._set_message("No plugins found.")
             return
         labels = [
-            f"{item['name']} | loaded={item['loaded']} | {item['error'] or 'ok'}"
+            (
+                f"{item['name']} v{item.get('version', '-')}"
+                f" | loaded={item['loaded']}"
+                f" | {item.get('description', '') or 'no description'}"
+                f" | {item['error'] or 'ok'}"
+            )
             for item in entries
         ]
         self._floating_list = FloatingList(
@@ -3484,7 +3837,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             return False
         self._ensure_plugins_loaded()
         if not args:
-            self._set_message("Usage: :plugin list|load|install|run ...", error=True)
+            self._set_message("Usage: :plugin list|load|install|uninstall|run ...", error=True)
             return False
 
         action = args[0]
@@ -3524,6 +3877,21 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._set_message(message)
             return True
 
+        if action in {"uninstall", "remove", "rm"}:
+            if len(args) < 2:
+                self._set_message("Usage: :plugin uninstall <name>", error=True)
+                return False
+            try:
+                message = self.plugins.uninstall(args[1])
+            except ScriptError as exc:
+                self._show_alert(f"Plugin uninstall error: {exc}")
+                return False
+            except Exception as exc:
+                self._show_alert(f"Plugin uninstall error: {exc}")
+                return False
+            self._set_message(message)
+            return True
+
         if action == "run":
             if len(args) < 3:
                 self._set_message("Usage: :plugin run <plugin> <function> [args ...]", error=True)
@@ -3542,7 +3910,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._set_message(f"Plugin result: {result}")
             return True
 
-        self._set_message("Usage: :plugin list|load|install|run ...", error=True)
+        self._set_message("Usage: :plugin list|load|install|uninstall|run ...", error=True)
         return False
 
     def _coerce_script_arg(self, value: str) -> object:
@@ -3868,28 +4236,6 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         row += cursor_display // max(1, text_cols)
         return row
 
-    def _highlight_code_with_search(self, text: str, base_style: str, query: str) -> str:
-        if not text:
-            return base_style
-        syntax = self._syntax_manager()
-        if not query:
-            return syntax.highlight_line(text, self._syntax_profile, self.theme, base_style)
-        matches = list(re.finditer(re.escape(query), text))
-        if not matches:
-            return syntax.highlight_line(text, self._syntax_profile, self.theme, base_style)
-        match_style = self.theme.ui_style("selection") or base_style
-        out: list[str] = []
-        cursor = 0
-        for match in matches:
-            start, end = match.span()
-            if start > cursor:
-                out.append(syntax.highlight_line(text[cursor:start], self._syntax_profile, self.theme, base_style))
-            out.append(f"{match_style}{text[start:end]}{base_style}")
-            cursor = end
-        if cursor < len(text):
-            out.append(syntax.highlight_line(text[cursor:], self._syntax_profile, self.theme, base_style))
-        return "".join(out)
-
     def _render_editor_row(
         self,
         screen_row: int,
@@ -3941,7 +4287,14 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                 base_style = self.theme.ui_style("editor")
 
             search_query = self._incremental_search_query if self.mode == MODE_COMMAND and self._command_prompt == "/" else ""
-            colored_code = self._highlight_code_with_search(visible_code, base_style, search_query)
+            colored_code = self._highlight_code_with_search(
+                visible_code,
+                base_style,
+                search_query,
+                line_index=line_index,
+                line_text=raw,
+                start_display=start_display,
+            )
             if ghost_visible:
                 ghost_style = self.theme.ui_style("message_info") or base_style
                 colored = f"{colored_code}{ghost_style}{ghost_visible}{base_style}"
@@ -3949,7 +4302,9 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                 colored = colored_code
             if gutter > 0:
                 marker = " "
-                if self._git_control_feature.enabled:
+                if line_index in self._active_pair_line_markers():
+                    marker = "•"
+                elif self._git_control_feature.enabled:
                     marker = self._git_control_feature.line_markers.get(line_index + 1, " ")
                     marker = marker if marker.strip() else " "
                 number_width = max(1, gutter - 2)
@@ -4181,7 +4536,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             return f"{self.theme.ui_style('command_line')}{footer[:width].ljust(width)}{RESET}", 1
 
         if self.mode == MODE_EXPLORER:
-            text = "Explorer: Enter open, Esc close, :tree refresh"
+            text = "Explorer: Enter open, Esc close, :tree refresh, :tree status"
             return f"{self.theme.ui_style('command_line')}{text[:width].ljust(width)}{RESET}", 1
 
         if self.mode == MODE_COMPLETION:
@@ -4203,6 +4558,10 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
     def _build_frame(self) -> tuple[list[str], int, int]:
         width, height = self._terminal_size()
         self._ensure_cursor_bounds()
+        if self.mode in {MODE_NORMAL, MODE_INSERT, MODE_VISUAL}:
+            self._active_bracket_pair = self._active_bracket_pair_under_cursor()
+        else:
+            self._active_bracket_pair = None
 
         plan = self._layout_manager.plan(width, height)
         sidebar_width = self._active_sidebar_width(width)

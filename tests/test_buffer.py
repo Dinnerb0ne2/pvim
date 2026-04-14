@@ -163,6 +163,47 @@ class BufferEditorBehaviorTests(unittest.TestCase):
         self.assertIn("DONE", first.read_text(encoding="utf-8"))
         self.assertIn("DONE", second.read_text(encoding="utf-8"))
 
+    def test_sidebar_defaults_to_off_for_file_and_on_for_project(self) -> None:
+        target = self._root / "demo.py"
+        target.write_text("print('ok')\n", encoding="utf-8")
+
+        self.assertFalse(self.editor.show_sidebar)
+        self.assertTrue(self.editor.open_file(target, force=True))
+        self.assertFalse(self.editor.show_sidebar)
+        self.assertTrue(self.editor.open_project(self._root, force=True))
+        self.assertTrue(self.editor.show_sidebar)
+
+    def test_session_restore_is_disabled_by_default_on_startup(self) -> None:
+        runtime_root = self._root / "runtime"
+        restored_file = self._root / "restored.py"
+        restored_file.write_text("x = 1\n", encoding="utf-8")
+
+        config_path = self._root / "session-default.config.json"
+        config_data = copy.deepcopy(DEFAULT_CONFIG)
+        config_data["runtime"]["directory"] = str(runtime_root)
+        config_data["features"]["swap"]["enabled"] = False
+        config_data["features"]["notifications"]["enabled"] = False
+        config_path.write_text(json.dumps(config_data), encoding="utf-8")
+        config = AppConfig.load(config_path)
+
+        session_payload = {
+            "current_file": str(restored_file),
+            "cursor_x": 0,
+            "cursor_y": 0,
+            "tabs": ["restored.py"],
+            "tab_index": 0,
+            "workspace_root": str(self._root),
+        }
+        config.session_file().parent.mkdir(parents=True, exist_ok=True)
+        config.session_file().write_text(json.dumps(session_payload), encoding="utf-8")
+
+        startup_editor = PvimEditor(None, config)
+        try:
+            self.assertIsNone(startup_editor.file_path)
+            self.assertEqual(startup_editor.lines, [""])
+        finally:
+            startup_editor._async_runtime.close()
+
     def test_incremental_search_preview_history_and_cancel_restore(self) -> None:
         self.editor.lines = ["alpha beta", "beta alpha", "omega"]
         self.editor.cy = 0

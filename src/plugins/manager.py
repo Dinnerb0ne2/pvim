@@ -15,6 +15,9 @@ PLUGIN_EXTENSIONS = {".pvi", ".pvs"}
 class PluginSpec:
     name: str
     entry_path: Path
+    package_path: Path
+    version: str
+    description: str
 
 
 @dataclass(slots=True)
@@ -34,12 +37,20 @@ class PluginManager:
         step_limit: int,
         auto_load: bool,
         host_api: Callable[[int, str, list[Any]], Any] | None,
+        sandbox_enabled: bool = False,
+        allowed_actions: set[str] | None = None,
     ) -> None:
         self.enabled = enabled
         self.plugins_root = plugins_root.resolve()
         self.step_limit = max(1000, int(step_limit))
         self.auto_load = auto_load
         self._host_api = host_api
+        self._sandbox_enabled = bool(sandbox_enabled)
+        self._allowed_actions = (
+            {item.strip() for item in allowed_actions if isinstance(item, str) and item.strip()}
+            if allowed_actions is not None
+            else set()
+        )
 
         self._next_object_id = 1
         self._objects: dict[int, Any] = {}
@@ -66,7 +77,13 @@ class PluginManager:
                 continue
 
             if entry.is_file() and entry.suffix.lower() in PLUGIN_EXTENSIONS:
-                spec = PluginSpec(name=entry.stem, entry_path=entry.resolve())
+                spec = PluginSpec(
+                    name=entry.stem,
+                    entry_path=entry.resolve(),
+                    package_path=entry.resolve(),
+                    version="0.0.0",
+                    description="",
+                )
                 self._specs[spec.name] = spec
                 continue
 
@@ -91,18 +108,32 @@ class PluginManager:
                 return None
             name = loaded.get("name", directory.name)
             main = loaded.get("main", "main.pvi")
+            version = loaded.get("version", "0.0.0")
+            description = loaded.get("description", "")
             if not isinstance(name, str) or not isinstance(main, str):
                 return None
             entry_path = (directory / main).resolve()
             if not entry_path.exists() or entry_path.suffix.lower() not in PLUGIN_EXTENSIONS:
                 return None
-            return PluginSpec(name=name, entry_path=entry_path)
+            return PluginSpec(
+                name=name.strip() or directory.name,
+                entry_path=entry_path,
+                package_path=directory.resolve(),
+                version=str(version).strip() or "0.0.0",
+                description=str(description).strip(),
+            )
 
         default_main = directory / "main.pvi"
         if not default_main.exists():
             default_main = directory / "main.pvs"
         if default_main.exists():
-            return PluginSpec(name=directory.name, entry_path=default_main.resolve())
+            return PluginSpec(
+                name=directory.name,
+                entry_path=default_main.resolve(),
+                package_path=directory.resolve(),
+                version="0.0.0",
+                description="",
+            )
         return None
 
     def install(self, source_path: Path | str) -> str:
@@ -130,6 +161,27 @@ class PluginManager:
             return f"Installed plugin directory: {target.name}"
 
         raise ScriptRuntimeError("Unsupported plugin source type.", line=1)
+
+    def uninstall(self, name: str) -> str:
+        if not self.enabled:
+            raise ScriptRuntimeError("Plugin system is disabled.", line=1)
+        self.discover()
+        spec = self._specs.get(name)
+        if spec is None:
+            raise ScriptRuntimeError(f"Plugin not found: {name}", line=1)
+        target = spec.package_path.resolve()
+        try:
+            target.relative_to(self.plugins_root)
+        except ValueError as exc:
+            raise ScriptRuntimeError(f"Unsafe plugin path: {target}", line=1) from exc
+        if target.is_dir():
+            shutil.rmtree(target)
+        elif target.exists():
+            target.unlink(missing_ok=True)
+        self._runtimes.pop(name, None)
+        self._errors.pop(name, None)
+        self.discover()
+        return f"Uninstalled plugin: {name}"
 
     def load_all(self) -> list[str]:
         messages: list[str] = []
@@ -225,6 +277,8 @@ class PluginManager:
                 {
                     "name": name,
                     "path": str(spec.entry_path) if spec else "-",
+                    "version": spec.version if spec else "-",
+                    "description": spec.description if spec else "",
                     "loaded": "yes" if name in self._runtimes else "no",
                     "error": self._errors.get(name, ""),
                 }
@@ -288,17 +342,20 @@ class PluginManager:
             raise ScriptRuntimeError(f"Unknown object id: {object_id}", line=line)
         if not isinstance(action, str):
             raise ScriptRuntimeError("api() second argument must be action string.", line=line)
+        clean_action = action.strip()
+        if self._sandbox_enabled and clean_action not in self._allowed_actions:
+            raise ScriptRuntimeError(f"Plugin sandbox blocked action: {clean_action}", line=line)
 
         for item in payload:
             if not self._is_primitive(item):
                 raise ScriptRuntimeError("api() only accepts primitive payload values.", line=line)
 
         try:
-            result = self._host_api(object_id, action, payload)
+            result = self._host_api(object_id, clean_action, payload)
         except ScriptError:
             raise
         except Exception as exc:
-            raise ScriptRuntimeError(f"Host API '{action}' failed: {exc}", line=line) from exc
+            raise ScriptRuntimeError(f"Host API '{clean_action}' failed: {exc}", line=line) from exc
         if self._is_primitive(result):
             return result
         return self._register_object(result)

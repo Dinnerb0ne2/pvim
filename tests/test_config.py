@@ -55,6 +55,18 @@ class ConfigTests(unittest.TestCase):
         mapping = custom.lsp_language_id_map()
         self.assertEqual(mapping.get(".py"), "python")
 
+    def test_legacy_runtime_artifact_paths_resolve_to_runtime_directory(self) -> None:
+        payload = copy.deepcopy(DEFAULT_CONFIG)
+        payload["features"]["session"]["file"] = ".pvim.session.json"
+        payload["features"]["session"]["profiles_directory"] = ".pvim.sessions"
+        payload["features"]["swap"]["directory"] = ""
+        config_path = self._root / "legacy-runtime.config.json"
+        config_path.write_text(json.dumps(payload), encoding="utf-8")
+        custom = AppConfig.load(config_path)
+        self.assertEqual(custom.session_file().name, "current.json")
+        self.assertEqual(custom.session_profiles_directory().name, "profiles")
+        self.assertEqual(custom.swap_directory().name, "swap")
+
 
 if __name__ == "__main__":
     unittest.main()

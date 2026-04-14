@@ -177,7 +177,7 @@ class LspClient:
                         "symbol": {},
                     },
                 },
-                "clientInfo": {"name": "pvim", "version": "0.6"},
+                "clientInfo": {"name": "pvim", "version": "0.7"},
             },
         )
         await self._notify("initialized", {})

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -16,9 +18,30 @@ class SwapPayload:
 
 
 class EditorPersistence:
-    __slots__ = ()
+    __slots__ = ("_swap_root",)
+
+    def __init__(self, *, swap_root: Path | None = None) -> None:
+        self._swap_root = swap_root.resolve() if swap_root is not None else None
+
+    def set_swap_directory(self, swap_root: Path | None) -> None:
+        self._swap_root = swap_root.resolve() if swap_root is not None else None
+
+    @staticmethod
+    def _swap_file_name(file_path: Path) -> str:
+        resolved = file_path.expanduser().resolve()
+        normalized = str(resolved)
+        if os.name == "nt":
+            normalized = normalized.lower()
+        digest = hashlib.sha1(normalized.encode("utf-8", errors="replace")).hexdigest()[:16]
+        base = "".join(ch if (ch.isalnum() or ch in {"-", "_", "."}) else "_" for ch in resolved.name)
+        if not base:
+            base = "buffer"
+        return f"{base}.{digest}.pvim.swap.json"
 
     def swap_path(self, file_path: Path) -> Path:
+        if self._swap_root is not None:
+            self._swap_root.mkdir(parents=True, exist_ok=True)
+            return self._swap_root / self._swap_file_name(file_path)
         suffix = file_path.suffix or ".txt"
         return file_path.with_suffix(f"{suffix}.pvim.swap")
 

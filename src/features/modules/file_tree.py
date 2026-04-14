@@ -97,6 +97,9 @@ class FileTreeFeature:
     def filter_query(self) -> str:
         return self._filter_query
 
+    def show_hidden(self) -> bool:
+        return self._show_hidden
+
     def open(self) -> None:
         if self.enabled:
             self.visible = True

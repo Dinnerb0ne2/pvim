@@ -29,6 +29,13 @@ DEFAULT_THEME_SPEC: dict[str, Any] = {
         "sidebar_current": {"fg": "#1a1b26", "bg": "#e0af68", "bold": True},
         "selection": {"fg": "#c0caf5", "bg": "#33467c"},
         "fuzzy_selected": {"fg": "#1a1b26", "bg": "#9ece6a", "bold": True},
+        "bracket_level_1": {"fg": "#ff6b6b", "bold": True},
+        "bracket_level_2": {"fg": "#ffd166", "bold": True},
+        "bracket_level_3": {"fg": "#06d6a0", "bold": True},
+        "bracket_level_4": {"fg": "#4cc9f0", "bold": True},
+        "bracket_level_5": {"fg": "#a78bfa", "bold": True},
+        "bracket_level_6": {"fg": "#f472b6", "bold": True},
+        "bracket_active": {"fg": "#ffffff", "bg": "#3b82f6", "bold": True},
     },
     "syntax": {
         "keyword": {"fg": "#bb9af7"},
@@ -111,13 +118,14 @@ def _rgb_to_ansi_16(r: int, g: int, b: int, *, background: bool) -> int:
 
 def _style_from_spec(spec: Mapping[str, Any], capabilities: TerminalCapabilities) -> str:
     parts: list[str] = []
+    color_enabled = capabilities.true_color or capabilities.color_level > 0
     if bool(spec.get("bold")):
         parts.append(f"{CSI}1m")
     if bool(spec.get("underline")):
         parts.append(f"{CSI}4m")
 
     fg = spec.get("fg")
-    if isinstance(fg, str):
+    if color_enabled and isinstance(fg, str):
         r, g, b = _hex_to_rgb(fg)
         if capabilities.true_color:
             parts.append(f"{CSI}38;2;{r};{g};{b}m")
@@ -127,7 +135,7 @@ def _style_from_spec(spec: Mapping[str, Any], capabilities: TerminalCapabilities
             parts.append(f"{CSI}{_rgb_to_ansi_16(r, g, b, background=False)}m")
 
     bg = spec.get("bg")
-    if isinstance(bg, str):
+    if color_enabled and isinstance(bg, str):
         r, g, b = _hex_to_rgb(bg)
         if capabilities.true_color:
             parts.append(f"{CSI}48;2;{r};{g};{b}m")

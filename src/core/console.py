@@ -39,9 +39,13 @@ SPECIAL_KEYS = {
     "B": "F8",
     "C": "F9",
     "D": "F10",
+    "\x85": "F11",
+    "\x86": "F12",
     "Z": "SHIFT_TAB",
     "s": "CTRL_LEFT",
     "t": "CTRL_RIGHT",
+    "w": "CTRL_UP",
+    "x": "CTRL_DOWN",
 }
 
 CONTROL_KEYS = {
@@ -157,6 +161,12 @@ POSIX_SPECIAL_KEYS = {
     "[Z": "SHIFT_TAB",
     "[1;5D": "CTRL_LEFT",
     "[1;5C": "CTRL_RIGHT",
+    "[1;5A": "CTRL_UP",
+    "[1;5B": "CTRL_DOWN",
+    "[1;3A": "ALT_UP",
+    "[1;3B": "ALT_DOWN",
+    "[1;3C": "ALT_RIGHT",
+    "[1;3D": "ALT_LEFT",
     "[5D": "CTRL_LEFT",
     "[5C": "CTRL_RIGHT",
     "OP": "F1",
@@ -209,6 +219,14 @@ class KeyReader:
             key = msvcrt.getwch()
             if key in ("\x00", "\xe0"):
                 return SPECIAL_KEYS.get(msvcrt.getwch(), "UNKNOWN")
+            if key == "\x1b" and msvcrt.kbhit():
+                alt = msvcrt.getwch()
+                if alt in ("\x00", "\xe0"):
+                    return f"ALT_{SPECIAL_KEYS.get(msvcrt.getwch(), 'UNKNOWN')}"
+                mapped = CONTROL_KEYS.get(alt, alt)
+                if len(mapped) == 1 and mapped.isprintable():
+                    return f"ALT_{mapped.upper()}"
+                return f"ALT_{mapped}"
             return CONTROL_KEYS.get(key, key)
 
         key = sys.stdin.read(1)
@@ -218,7 +236,12 @@ class KeyReader:
             sequence = _read_escape_sequence_posix()
             if not sequence:
                 return "ESC"
-            return POSIX_SPECIAL_KEYS.get(sequence, "UNKNOWN")
+            mapped = POSIX_SPECIAL_KEYS.get(sequence)
+            if mapped is not None:
+                return mapped
+            if len(sequence) == 1 and sequence.isprintable():
+                return f"ALT_{sequence.upper()}"
+            return "UNKNOWN"
         return CONTROL_KEYS.get(key, key)
 
 

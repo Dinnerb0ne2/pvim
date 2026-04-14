@@ -1,0 +1,44 @@
+{
+  "meta": {
+    "name": "nvim-nightfox",
+    "version": "0.7.0",
+    "description": "Nightfox inspired Neovim palette with brighter statusline.",
+    "preview": "previews/nvim-nightfox.ppm"
+  },
+  "ui": {
+    "editor": { "fg": "#cdcecf", "bg": "#192330" },
+    "cursor_line": { "fg": "#cdcecf", "bg": "#223249" },
+    "line_number": { "fg": "#526176", "bg": "#192330" },
+    "line_number_current": { "fg": "#86abdc", "bg": "#223249", "bold": true },
+    "tilde": { "fg": "#394b70", "bg": "#192330" },
+    "status": { "fg": "#192330", "bg": "#86abdc", "bold": true },
+    "mode_normal": { "fg": "#192330", "bg": "#81b29a", "bold": true },
+    "mode_insert": { "fg": "#192330", "bg": "#f4a261", "bold": true },
+    "mode_command": { "fg": "#192330", "bg": "#c94f6d", "bold": true },
+    "message_info": { "fg": "#81b29a", "bg": "#131a24" },
+    "message_error": { "fg": "#e85d75", "bg": "#131a24", "bold": true },
+    "command_line": { "fg": "#cdcecf", "bg": "#223249" },
+    "sidebar": { "fg": "#9da9bb", "bg": "#131a24" },
+    "sidebar_header": { "fg": "#192330", "bg": "#63cdcf", "bold": true },
+    "sidebar_current": { "fg": "#192330", "bg": "#dbc074", "bold": true },
+    "selection": { "fg": "#cdcecf", "bg": "#364a82" },
+    "fuzzy_selected": { "fg": "#192330", "bg": "#81b29a", "bold": true },
+    "bracket_level_1": { "fg": "#c94f6d", "bold": true },
+    "bracket_level_2": { "fg": "#f4a261", "bold": true },
+    "bracket_level_3": { "fg": "#dbc074", "bold": true },
+    "bracket_level_4": { "fg": "#81b29a", "bold": true },
+    "bracket_level_5": { "fg": "#63cdcf", "bold": true },
+    "bracket_level_6": { "fg": "#86abdc", "bold": true },
+    "bracket_active": { "fg": "#192330", "bg": "#63cdcf", "bold": true }
+  },
+  "syntax": {
+    "keyword": { "fg": "#c94f6d" },
+    "builtin": { "fg": "#86abdc" },
+    "function": { "fg": "#63cdcf" },
+    "type": { "fg": "#dbc074" },
+    "decorator": { "fg": "#f4a261" },
+    "string": { "fg": "#81b29a" },
+    "comment": { "fg": "#526176" },
+    "number": { "fg": "#f4a261" }
+  }
+}

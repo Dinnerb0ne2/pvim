@@ -2,6 +2,9 @@
   "python": {
     "required": "3.14.3"
   },
+  "runtime": {
+    "directory": ""
+  },
   "editor": {
     "line_numbers": true,
     "tab_size": 4,
@@ -130,7 +133,8 @@
     },
     "swap": {
       "enabled": true,
-      "interval_seconds": 4.0
+      "interval_seconds": 4.0,
+      "directory": ""
     },
     "auto_save": {
       "enabled": true,
@@ -138,8 +142,9 @@
     },
     "session": {
       "enabled": true,
-      "file": ".pvim.session.json",
-      "profiles_directory": ".pvim.sessions"
+      "restore_on_startup": false,
+      "file": "",
+      "profiles_directory": ""
     },
     "plugin_keyhooks": {
       "enabled": false

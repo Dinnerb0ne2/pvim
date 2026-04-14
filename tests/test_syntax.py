@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import unittest
 
 from src.core.config import AppConfig
@@ -29,6 +30,27 @@ class SyntaxManagerTests(unittest.TestCase):
         second = self.syntax.highlight_line("$HOME && echo", profile, self.theme, "")
         self.assertEqual(first, second)
         self.assertEqual(self.syntax._token_style_from_regex_rules(profile, "$HOME"), "builtin")  # type: ignore[attr-defined]
+
+    def test_python_highlight_does_not_duplicate_text(self) -> None:
+        profile = self.syntax.profile_for_file(Path("demo.py"))
+        line = "value = call(arg)"
+        rendered = self.syntax.highlight_line(line, profile, self.theme, "")
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", rendered)
+        self.assertEqual(plain, line)
+
+    def test_python_highlight_preserves_text_for_edge_cases(self) -> None:
+        profile = self.syntax.profile_for_file(Path("demo.py"))
+        lines = [
+            "x = {'a': [1, 2, (3, 4)]}",
+            "print(\"http://x#y\")  # trailing",
+            "value = call(arg[0]) + other({'k': '(v)'})",
+            "unfinished = \"abc",
+            "f\"name={user.name}\"",
+        ]
+        for line in lines:
+            rendered = self.syntax.highlight_line(line, profile, self.theme, "")
+            plain = re.sub(r"\x1b\[[0-9;]*m", "", rendered)
+            self.assertEqual(plain, line)
 
 
 if __name__ == "__main__":

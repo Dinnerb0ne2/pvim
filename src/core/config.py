@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import json
+import getpass
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
+import tempfile
 from typing import Any, Mapping
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "python": {
         "required": "3.14.3",
+    },
+    "runtime": {
+        "directory": "",
     },
     "editor": {
         "line_numbers": True,
@@ -138,6 +143,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "swap": {
             "enabled": True,
             "interval_seconds": 4.0,
+            "directory": "",
         },
         "auto_save": {
             "enabled": True,
@@ -145,8 +151,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
         "session": {
             "enabled": True,
-            "file": ".pvim.session.json",
-            "profiles_directory": ".pvim.sessions",
+            "restore_on_startup": False,
+            "file": "",
+            "profiles_directory": "",
         },
         "plugins": {
             "enabled": False,
@@ -193,6 +200,42 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "config_reload": {
             "enabled": True,
             "interval_seconds": 1.0,
+        },
+        "quickfix": {
+            "enabled": True,
+            "max_items": 300,
+        },
+        "autocmds": {
+            "enabled": True,
+            "events": {},
+        },
+        "scoped_vars": {
+            "enabled": True,
+        },
+        "clipboard": {
+            "enabled": True,
+        },
+        "dap": {
+            "enabled": True,
+            "python_command": "python",
+        },
+        "plugin_sandbox": {
+            "enabled": True,
+            "allow_actions": [
+                "message",
+                "line_count",
+                "get_line",
+                "set_line",
+                "cursor",
+                "find",
+                "replace_all",
+                "current_file",
+                "virtual.add",
+                "virtual.set",
+                "virtual.clear",
+                "virtual.get",
+                "ast.node_at",
+            ],
         },
     },
 }
@@ -271,6 +314,18 @@ class AppConfig:
     def required_python(self) -> str:
         value = self._lookup("python", "required", default="3.14.3")
         return value if isinstance(value, str) else "3.14.3"
+
+    def runtime_directory(self) -> Path:
+        value = self._lookup("runtime", "directory", default="")
+        if isinstance(value, str) and value.strip():
+            path = Path(value.strip()).expanduser()
+            if path.is_absolute():
+                return path.resolve()
+            return (self.path.parent / path).resolve()
+        user = "".join(ch for ch in getpass.getuser().strip() if ch.isalnum() or ch in {"_", "-"})
+        if not user:
+            user = "user"
+        return (Path(tempfile.gettempdir()) / "pvim-runtime" / user).resolve()
 
     def show_line_numbers(self) -> bool:
         return _as_bool(self._lookup("editor", "line_numbers", default=True), default=True)
@@ -535,6 +590,16 @@ class AppConfig:
     def swap_enabled(self) -> bool:
         return self.feature_enabled("swap")
 
+    def swap_directory(self) -> Path:
+        value = self._lookup("features", "swap", "directory", default="")
+        if isinstance(value, str):
+            clean = value.strip()
+            if clean and clean.lower() not in {"legacy", "default"}:
+                resolved = self.resolve_path(clean)
+                if resolved is not None:
+                    return resolved
+        return (self.runtime_directory() / "swap").resolve()
+
     def swap_interval_seconds(self) -> float:
         return _as_float(
             self._lookup("features", "swap", "interval_seconds", default=4.0),
@@ -555,26 +620,44 @@ class AppConfig:
     def session_enabled(self) -> bool:
         return self.feature_enabled("session")
 
+    def session_restore_on_startup(self) -> bool:
+        return _as_bool(
+            self._lookup("features", "session", "restore_on_startup", default=False),
+            default=False,
+        )
+
     def session_file(self) -> Path:
-        value = self._lookup("features", "session", "file", default=".pvim.session.json")
-        if not isinstance(value, str):
-            value = ".pvim.session.json"
-        resolved = self.resolve_path(value)
-        return resolved if resolved is not None else (self.path.parent / ".pvim.session.json").resolve()
+        value = self._lookup("features", "session", "file", default="")
+        legacy_names = {".pvim.session.json"}
+        if isinstance(value, str):
+            clean = value.strip()
+            if clean and clean not in legacy_names:
+                resolved = self.resolve_path(clean)
+                if resolved is not None:
+                    return resolved
+        return (self.runtime_directory() / "session" / "current.json").resolve()
 
     def session_profiles_directory(self) -> Path:
-        value = self._lookup("features", "session", "profiles_directory", default=".pvim.sessions")
-        if not isinstance(value, str):
-            value = ".pvim.sessions"
-        resolved = self.resolve_path(value)
-        return resolved if resolved is not None else (self.path.parent / ".pvim.sessions").resolve()
+        value = self._lookup("features", "session", "profiles_directory", default="")
+        legacy_names = {".pvim.sessions"}
+        if isinstance(value, str):
+            clean = value.strip()
+            if clean and clean not in legacy_names:
+                resolved = self.resolve_path(clean)
+                if resolved is not None:
+                    return resolved
+        return (self.runtime_directory() / "session" / "profiles").resolve()
 
     def plugins_directory(self) -> Path:
         value = self._lookup("features", "plugins", "directory", default="plugins")
-        if not isinstance(value, str):
-            value = "plugins"
-        resolved = self.resolve_path(value)
-        return resolved if resolved is not None else (self.path.parent / "plugins").resolve()
+        legacy_names = {"plugins", ".\\plugins", "./plugins"}
+        if isinstance(value, str):
+            clean = value.strip()
+            if clean and clean not in legacy_names:
+                resolved = self.resolve_path(clean)
+                if resolved is not None:
+                    return resolved
+        return (self.runtime_directory() / "plugins").resolve()
 
     def plugins_auto_load(self) -> bool:
         return _as_bool(self._lookup("features", "plugins", "auto_load", default=True), default=True)
@@ -597,3 +680,72 @@ class AppConfig:
             default=1.0,
             minimum=0.2,
         )
+
+    def quickfix_max_items(self) -> int:
+        return _as_int(
+            self._lookup("features", "quickfix", "max_items", default=300),
+            default=300,
+            minimum=20,
+        )
+
+    def autocmd_events(self) -> dict[str, list[str]]:
+        if not self.feature_enabled("autocmds"):
+            return {}
+        value = self._lookup("features", "autocmds", "events", default={})
+        if not isinstance(value, Mapping):
+            return {}
+        parsed: dict[str, list[str]] = {}
+        for event_name, commands in value.items():
+            if not isinstance(event_name, str):
+                continue
+            event_key = event_name.strip().lower()
+            if not event_key:
+                continue
+            if isinstance(commands, str):
+                command_list = [commands.strip()] if commands.strip() else []
+            elif isinstance(commands, list):
+                command_list = [item.strip() for item in commands if isinstance(item, str) and item.strip()]
+            else:
+                command_list = []
+            parsed[event_key] = command_list
+        return parsed
+
+    def scoped_variables_enabled(self) -> bool:
+        return self.feature_enabled("scoped_vars")
+
+    def clipboard_enabled(self) -> bool:
+        return self.feature_enabled("clipboard")
+
+    def dap_enabled(self) -> bool:
+        return self.feature_enabled("dap")
+
+    def dap_python_command(self) -> str:
+        value = self._lookup("features", "dap", "python_command", default="python")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return "python"
+
+    def plugin_sandbox_enabled(self) -> bool:
+        return self.feature_enabled("plugin_sandbox")
+
+    def plugin_sandbox_allowed_actions(self) -> set[str]:
+        defaults = {
+            "message",
+            "line_count",
+            "get_line",
+            "set_line",
+            "cursor",
+            "find",
+            "replace_all",
+            "current_file",
+            "virtual.add",
+            "virtual.set",
+            "virtual.clear",
+            "virtual.get",
+            "ast.node_at",
+        }
+        value = self._lookup("features", "plugin_sandbox", "allow_actions", default=list(defaults))
+        if not isinstance(value, list):
+            return defaults
+        parsed = {str(item).strip() for item in value if isinstance(item, str) and str(item).strip()}
+        return parsed or defaults

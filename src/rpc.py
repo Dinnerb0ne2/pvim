@@ -15,12 +15,13 @@ class JsonRpcPeer:
         self._reader = reader
         self._writer = writer
         self._next_id = 1
-        self._pending: dict[int, asyncio.Future[Any]] = {}
+        self._pending: dict[int | str, asyncio.Future[Any]] = {}
         self._notification_handlers: dict[str, list[NotificationHandler]] = {}
         self._request_handlers: dict[str, RequestHandler] = {}
         self._recv_task: asyncio.Task[None] | None = None
         self._write_lock = asyncio.Lock()
         self._closed = False
+        self._default_request_timeout = 8.0
 
     async def start(self) -> None:
         if self._recv_task is None:
@@ -58,11 +59,23 @@ class JsonRpcPeer:
     def on_request(self, method: str, handler: RequestHandler) -> None:
         self._request_handlers[method] = handler
 
-    def send_request(self, method: str, params: Any) -> asyncio.Future[Any]:
-        _request_id, future = self.send_request_with_id(method, params)
+    def send_request(
+        self,
+        method: str,
+        params: Any,
+        *,
+        timeout: float | None = None,
+    ) -> asyncio.Future[Any]:
+        _request_id, future = self.send_request_with_id(method, params, timeout=timeout)
         return future
 
-    def send_request_with_id(self, method: str, params: Any) -> tuple[int, asyncio.Future[Any]]:
+    def send_request_with_id(
+        self,
+        method: str,
+        params: Any,
+        *,
+        timeout: float | None = None,
+    ) -> tuple[int, asyncio.Future[Any]]:
         if self._closed:
             raise RuntimeError("RPC peer is closed.")
         loop = asyncio.get_running_loop()
@@ -70,17 +83,27 @@ class JsonRpcPeer:
         self._next_id += 1
         future: asyncio.Future[Any] = loop.create_future()
         self._pending[request_id] = future
+        effective_timeout = self._default_request_timeout if timeout is None else float(timeout)
+        if effective_timeout < 0:
+            effective_timeout = 0.0
         payload = {
             "jsonrpc": "2.0",
             "id": request_id,
             "method": method,
             "params": params,
         }
-        asyncio.create_task(self._safe_send_request(payload, request_id))
+        asyncio.create_task(
+            self._safe_send_request(
+                payload,
+                request_id,
+                method=method,
+                timeout_seconds=effective_timeout,
+            )
+        )
         return request_id, future
 
-    async def request(self, method: str, params: Any) -> Any:
-        return await self.send_request(method, params)
+    async def request(self, method: str, params: Any, *, timeout: float | None = None) -> Any:
+        return await self.send_request(method, params, timeout=timeout)
 
     async def send_notification(self, method: str, params: Any) -> None:
         if self._closed:
@@ -92,13 +115,39 @@ class JsonRpcPeer:
         }
         await self._send_payload(payload)
 
-    async def _safe_send_request(self, payload: dict[str, Any], request_id: int) -> None:
+    def _arm_timeout(self, request_id: int | str, method: str, timeout_seconds: float) -> None:
+        if timeout_seconds <= 0:
+            return
+        future = self._pending.get(request_id)
+        if future is None or future.done():
+            return
+        loop = asyncio.get_running_loop()
+        timeout_message = f"RPC request timed out: {method}"
+
+        def _on_timeout() -> None:
+            pending = self._pending.pop(request_id, None)
+            if pending is not None and not pending.done():
+                pending.set_exception(asyncio.TimeoutError(timeout_message))
+
+        handle = loop.call_later(timeout_seconds, _on_timeout)
+        future.add_done_callback(lambda _done: handle.cancel())
+
+    async def _safe_send_request(
+        self,
+        payload: dict[str, Any],
+        request_id: int,
+        *,
+        method: str,
+        timeout_seconds: float,
+    ) -> None:
         try:
             await self._send_payload(payload)
         except Exception as exc:
             future = self._pending.pop(request_id, None)
             if future is not None and not future.done():
                 future.set_exception(RuntimeError(f"RPC write failed: {exc}"))
+            return
+        self._arm_timeout(request_id, method, timeout_seconds)
 
     async def _send_payload(self, payload: dict[str, Any]) -> None:
         body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -116,6 +165,8 @@ class JsonRpcPeer:
                     continue
                 if message is None:
                     break
+                if message.get("jsonrpc") != "2.0":
+                    continue
                 if "id" in message and "method" in message:
                     await self._handle_request(message)
                     continue
@@ -169,13 +220,24 @@ class JsonRpcPeer:
 
     def _handle_response(self, message: dict[str, Any]) -> None:
         request_id = message.get("id")
-        if not isinstance(request_id, int):
+        if not isinstance(request_id, (int, str)):
             return
         future = self._pending.pop(request_id, None)
         if future is None or future.done():
             return
-        if message.get("error") is not None:
-            future.set_exception(RuntimeError(str(message.get("error"))))
+        error_payload = message.get("error")
+        if error_payload is not None:
+            if isinstance(error_payload, dict):
+                code = error_payload.get("code")
+                message_text = error_payload.get("message")
+                details = (
+                    f"RPC error {code}: {message_text}"
+                    if message_text is not None
+                    else f"RPC error {error_payload}"
+                )
+            else:
+                details = f"RPC error {error_payload}"
+            future.set_exception(RuntimeError(details))
             return
         future.set_result(message.get("result"))
 
@@ -194,6 +256,7 @@ class JsonRpcPeer:
 
     @staticmethod
     async def _read_message(reader: asyncio.StreamReader) -> dict[str, Any] | None:
+        max_payload = 8 * 1024 * 1024
         headers: dict[str, str] = {}
         while True:
             line = await reader.readline()
@@ -218,6 +281,8 @@ class JsonRpcPeer:
             raise ValueError("Invalid Content-Length header.") from exc
         if content_length < 0:
             raise ValueError("Negative Content-Length is invalid.")
+        if content_length > max_payload:
+            raise ValueError("Content-Length exceeds safety limit.")
 
         payload = await reader.readexactly(content_length)
         try:

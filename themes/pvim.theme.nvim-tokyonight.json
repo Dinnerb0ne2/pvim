@@ -1,0 +1,44 @@
+{
+  "meta": {
+    "name": "nvim-tokyonight",
+    "version": "0.7.0",
+    "description": "High-contrast Tokyo Night inspired Neovim palette.",
+    "preview": "previews/nvim-tokyonight.ppm"
+  },
+  "ui": {
+    "editor": { "fg": "#c0caf5", "bg": "#1a1b26" },
+    "cursor_line": { "fg": "#c0caf5", "bg": "#24283b" },
+    "line_number": { "fg": "#565f89", "bg": "#1a1b26" },
+    "line_number_current": { "fg": "#7aa2f7", "bg": "#24283b", "bold": true },
+    "tilde": { "fg": "#414868", "bg": "#1a1b26" },
+    "status": { "fg": "#e0e6ff", "bg": "#33467c", "bold": true },
+    "mode_normal": { "fg": "#1a1b26", "bg": "#7dcfff", "bold": true },
+    "mode_insert": { "fg": "#1a1b26", "bg": "#9ece6a", "bold": true },
+    "mode_command": { "fg": "#1a1b26", "bg": "#e0af68", "bold": true },
+    "message_info": { "fg": "#9ece6a", "bg": "#16161e" },
+    "message_error": { "fg": "#f7768e", "bg": "#16161e", "bold": true },
+    "command_line": { "fg": "#c0caf5", "bg": "#1f2335" },
+    "sidebar": { "fg": "#a9b1d6", "bg": "#16161e" },
+    "sidebar_header": { "fg": "#1a1b26", "bg": "#73daca", "bold": true },
+    "sidebar_current": { "fg": "#1a1b26", "bg": "#bb9af7", "bold": true },
+    "selection": { "fg": "#c0caf5", "bg": "#2f3d6b" },
+    "fuzzy_selected": { "fg": "#1a1b26", "bg": "#9ece6a", "bold": true },
+    "bracket_level_1": { "fg": "#ff9e64", "bold": true },
+    "bracket_level_2": { "fg": "#9ece6a", "bold": true },
+    "bracket_level_3": { "fg": "#7dcfff", "bold": true },
+    "bracket_level_4": { "fg": "#bb9af7", "bold": true },
+    "bracket_level_5": { "fg": "#f7768e", "bold": true },
+    "bracket_level_6": { "fg": "#e0af68", "bold": true },
+    "bracket_active": { "fg": "#1a1b26", "bg": "#7aa2f7", "bold": true }
+  },
+  "syntax": {
+    "keyword": { "fg": "#bb9af7" },
+    "builtin": { "fg": "#7aa2f7" },
+    "function": { "fg": "#73daca" },
+    "type": { "fg": "#e0af68" },
+    "decorator": { "fg": "#7dcfff" },
+    "string": { "fg": "#9ece6a" },
+    "comment": { "fg": "#565f89" },
+    "number": { "fg": "#ff9e64" }
+  }
+}

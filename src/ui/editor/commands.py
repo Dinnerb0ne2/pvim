@@ -133,12 +133,15 @@ class CommandsMixin:
 
         if cmd in {"help", "h"}:
             self._set_message(
-                "Commands: :w :q :e :split/:vsplit/:only :wincmd :find/:findre :replace/:replacere :replaceall/:replaceallre :replaceproj/:replaceprojre :encoding :project :term :rename :format :fuzzy :grep :tree :theme :feature :workspace :session :swap :keys :script :plugin :proc :virtual :ast :profile :piece :termcaps :syntax :git :jump :lsp :diag :codeaction"
+                "Commands: :w :q :e :split/:vsplit/:only :wincmd :find/:findre :replace/:replacere :replaceall/:replaceallre :replaceproj/:replaceprojre :encoding :project :term :rename :format :fuzzy :grep :tree :theme :feature :workspace :runtime :session :swap :keys :script :plugin :proc :virtual :ast :profile :piece :termcaps :syntax :git :jump :lsp :diag :codeaction"
             )
             return
 
         if cmd in {"keys", "keyhint", "keymap"}:
-            self._open_key_hints()
+            if not args and cmd == "keyhint":
+                self._open_key_hints()
+            else:
+                self._handle_keys_command(args)
             return
 
         if cmd in {"find", "search"}:
@@ -234,6 +237,21 @@ class CommandsMixin:
 
         if cmd == "workspace":
             self._set_message(f"Workspace: {self._workspace_root}")
+            return
+
+        if cmd == "runtime":
+            lines = [
+                "Runtime Manager",
+                "",
+                f"root: {self._runtime_root}",
+                f"session: {self._session_path}",
+                f"profiles: {self._session_profiles_dir}",
+                f"swap_dir: {self.config.swap_directory()}",
+                f"plugins: {self.config.plugins_directory()}",
+                f"themes: {(self._runtime_root / 'themes').resolve()}",
+                f"keymaps: {self._shortcut_overrides_file()}",
+            ]
+            self._show_alert("\n".join(lines))
             return
 
         if cmd in {"jump", "jumps"}:
@@ -392,8 +410,54 @@ class CommandsMixin:
             return
 
         if cmd in {"term", "terminal"}:
-            command_text = " ".join(args).strip()
-            self._open_terminal(command_text or None)
+            if not args:
+                self._open_terminal(None)
+                return
+            action = args[0].strip().lower()
+            if action in {"open", "start", "run"}:
+                command_text = " ".join(args[1:]).strip()
+                self._open_terminal(command_text or None)
+                return
+            if action in {"close", "hide"}:
+                self._close_terminal(kill=False)
+                self._set_message("Terminal closed.")
+                return
+            if action in {"stop", "kill"}:
+                self._close_terminal(kill=True)
+                self._set_message("Terminal stop requested.")
+                return
+            if action == "status":
+                if self._terminal_process_id is None:
+                    self._set_message("Terminal: idle")
+                    return
+                state = self._process_manager.status(self._terminal_process_id)
+                self._set_message(f"Terminal {self._terminal_process_id}: {state}")
+                return
+            if action == "history":
+                count = 40
+                if len(args) >= 2:
+                    try:
+                        count = max(1, int(args[1]))
+                    except ValueError:
+                        self._set_message("Usage: :term history [lines]", error=True)
+                        return
+                lines = self._terminal_output[-count:]
+                if not lines:
+                    self._show_alert("(terminal history is empty)")
+                    return
+                self._show_alert("\n".join(lines))
+                return
+            if action == "send":
+                if len(args) < 2:
+                    self._set_message("Usage: :term send <text>", error=True)
+                    return
+                self._send_terminal_input(" ".join(args[1:]))
+                return
+            if action in {"clear", "cls"}:
+                self._terminal_output = []
+                self._set_message("Terminal history cleared.")
+                return
+            self._set_message("Usage: :term [open|close|stop|status|history|send|clear] [args...]", error=True)
             return
 
         if cmd == "virtual":
@@ -462,26 +526,59 @@ class CommandsMixin:
                 self._set_message(f"Theme: {self.config.theme_file()}")
                 return
             if lowered in {"list", "ls"}:
-                theme_dir = self.config.path.parent / "themes"
-                if not theme_dir.exists():
-                    self._show_alert("(no built-in themes)")
+                records = self._theme_manager.list_themes()
+                if not records:
+                    self._show_alert("(no themes)")
                     return
-                names = sorted(path.name for path in theme_dir.glob("*.json") if path.is_file())
-                self._show_alert("\n".join(names) if names else "(no built-in themes)")
+                lines = [
+                    (
+                        f"{item.name} v{item.version}"
+                        f" | {item.source}"
+                        f" | {item.description or 'no description'}"
+                        f" | preview={item.preview or '-'}"
+                    )
+                    for item in records
+                ]
+                self._show_alert("\n".join(lines))
                 return
-            candidates = []
-            direct = self.config.resolve_path(action)
-            if direct is not None:
-                candidates.append(direct)
-            clean = action.replace("/", "\\")
-            if not clean.lower().endswith(".json"):
-                themed = self.config.resolve_path(f"themes\\{clean}.json")
-                if themed is not None:
-                    candidates.append(themed)
-                modern = self.config.resolve_path(f"themes\\pvim.theme.{clean}.json")
-                if modern is not None:
-                    candidates.append(modern)
-            target = next((item for item in candidates if item.exists() and item.is_file()), None)
+            if lowered == "install":
+                if len(args) < 2:
+                    self._set_message("Usage: :theme install <path>", error=True)
+                    return
+                source = self._resolve_path(args[1])
+                try:
+                    record = self._theme_manager.install(source)
+                except Exception as exc:
+                    self._set_message(f"Theme install failed: {exc}", error=True)
+                    return
+                self._set_message(f"Theme installed: {record.name} v{record.version}")
+                return
+            if lowered in {"uninstall", "remove", "rm"}:
+                if len(args) < 2:
+                    self._set_message("Usage: :theme uninstall <name>", error=True)
+                    return
+                try:
+                    message = self._theme_manager.uninstall(args[1])
+                except Exception as exc:
+                    self._set_message(f"Theme uninstall failed: {exc}", error=True)
+                    return
+                self._set_message(message)
+                return
+            target = self._theme_manager.resolve(action)
+            if target is None:
+                candidates = []
+                direct = self.config.resolve_path(action)
+                if direct is not None:
+                    candidates.append(direct)
+                clean = action.replace("/", "\\")
+                if not clean.lower().endswith(".json"):
+                    themed = self.config.resolve_path(f"themes\\{clean}.json")
+                    if themed is not None:
+                        candidates.append(themed)
+                    modern = self.config.resolve_path(f"themes\\pvim.theme.{clean}.json")
+                    if modern is not None:
+                        candidates.append(modern)
+                target = next((item for item in candidates if item.exists() and item.is_file()), None)
             if target is None:
                 self._set_message(f"Theme not found: {action}", error=True)
                 return
@@ -672,6 +769,28 @@ class CommandsMixin:
                     self._close_explorer()
                 else:
                     self._open_explorer(refresh=False)
+                return
+            if action in {"status", "manager", "info"}:
+                total = len(self._file_tree_feature.entries)
+                files = sum(1 for item in self._file_tree_feature.entries if not item.is_dir)
+                state = "visible" if self.mode == MODE_EXPLORER else "hidden"
+                lines = [
+                    "File Tree Manager",
+                    "",
+                    f"state: {state}",
+                    f"workspace: {self._workspace_root}",
+                    f"entries: {total} (files: {files})",
+                    f"sort: {self._file_tree_feature.sort_mode()}",
+                    f"filter: {self._file_tree_feature.filter_query() or '(none)'}",
+                    f"show_hidden: {'on' if self._file_tree_feature.show_hidden() else 'off'}",
+                    "",
+                    "operations:",
+                    "  :tree open|refresh|close|toggle",
+                    "  :tree sort <name|type|mtime>",
+                    "  :tree filter <query>|clear-filter",
+                    "  :tree hidden <on|off>",
+                ]
+                self._show_alert("\n".join(lines))
                 return
             if action == "sort":
                 if len(args) < 2:

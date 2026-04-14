@@ -18,6 +18,7 @@ from ..core.theme import Theme
 TOKEN_RE = re.compile(
     r"@[A-Za-z_][A-Za-z0-9_]*|\$[A-Za-z_][A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_:-]*!?|\d+(?:\.\d+)?"
 )
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +226,7 @@ class SyntaxManager:
     def _highlight_python_line(self, text: str, profile: SyntaxProfile, theme: Theme, base_style: str) -> str:
         out: list[str] = [base_style]
         cursor = 0
+        text_length = len(text)
         previous_keyword = ""
         decorator_next = False
         try:
@@ -232,13 +234,15 @@ class SyntaxManager:
             for token_info in tokens:
                 token_type = token_info.type
                 token_text = token_info.string
-                start_col = max(0, token_info.start[1])
-                end_col = max(start_col, token_info.end[1])
-                if start_col > cursor:
-                    out.append(text[cursor:start_col])
-                segment = text[start_col:end_col]
+                start_col = min(text_length, max(0, token_info.start[1]))
+                end_col = min(text_length, max(start_col, token_info.end[1]))
+                segment_start = max(cursor, start_col)
+                segment_end = max(segment_start, end_col)
+                if segment_start > cursor:
+                    out.append(text[cursor:segment_start])
+                segment = text[segment_start:segment_end]
                 if not segment:
-                    cursor = end_col
+                    cursor = max(cursor, segment_end)
                     continue
 
                 style = ""
@@ -268,7 +272,7 @@ class SyntaxManager:
                     out.append(f"{style}{segment}{base_style}")
                 else:
                     out.append(segment)
-                cursor = end_col
+                cursor = max(cursor, segment_end)
 
                 if token_type == token_types.NAME and token_text in {"def", "class"}:
                     previous_keyword = token_text
@@ -284,7 +288,11 @@ class SyntaxManager:
 
         if cursor < len(text):
             out.append(text[cursor:])
-        return "".join(out)
+        rendered = "".join(out)
+        if ANSI_ESCAPE_RE.sub("", rendered) != text:
+            # Guard against token edge-cases that may duplicate characters while typing.
+            return f"{base_style}{self._highlight_code(text, profile, theme, base_style)}"
+        return rendered
 
     def _highlight_code(self, code: str, profile: SyntaxProfile, theme: Theme, base_style: str) -> str:
         if not code:

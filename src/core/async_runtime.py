@@ -50,6 +50,11 @@ class AsyncRuntime:
     def close(self) -> None:
         if self._loop.is_closed():
             return
+        try:
+            future = asyncio.run_coroutine_threadsafe(self._shutdown_loop(), self._loop)
+            future.result(timeout=1.0)
+        except Exception:
+            pass
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join(timeout=1.0)
 
@@ -79,3 +84,11 @@ class AsyncRuntime:
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
+
+    async def _shutdown_loop(self) -> None:
+        current = asyncio.current_task()
+        pending = [task for task in asyncio.all_tasks() if task is not current and not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)

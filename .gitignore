@@ -27,3 +27,12 @@ dist/
 # other
 .DS_Store
 p.txt
+
+# PVIM runtime artifacts (legacy)
+.pvim.session.json
+.pvim.sessions/
+*.pvim.swap
+*.pvim.swap.json
+
+# manual commit message handoff
+tmp/pvim-pending-commit-msg.txt
