@@ -1,7 +1,7 @@
 {
   "meta": {
     "name": "nvim-tokyonight",
-    "version": "0.7.0",
+    "version": "0.9.0",
     "description": "High-contrast Tokyo Night inspired Neovim palette.",
     "preview": "previews/nvim-tokyonight.ppm"
   },

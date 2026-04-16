@@ -38,6 +38,7 @@ class LiveGrep:
             clean,
             str(root),
         ]
+        process: asyncio.subprocess.Process | None = None
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
@@ -45,6 +46,14 @@ class LiveGrep:
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, _stderr = await process.communicate()
+        except asyncio.CancelledError:
+            if process is not None and process.returncode is None:
+                process.terminate()
+                try:
+                    await process.wait()
+                except OSError:
+                    pass
+            raise
         except OSError:
             return self._search_fallback(root, clean, limit=limit)
 

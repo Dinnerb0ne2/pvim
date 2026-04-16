@@ -2,10 +2,10 @@
   "name": "markdown",
   "line_comment": "",
   "keywords": [
-    "#", "##", "###", "####", "#####", "######", "-", "*", ">", "`", "```"
+    "#", "##", "###", "####", "#####", "######", "-", "*", "+", ">", "`", "```", "[", "]", "(", ")"
   ],
   "builtins": [
-    "TODO", "NOTE", "TIP", "WARNING", "INFO", "http", "https"
+    "TODO", "NOTE", "TIP", "WARNING", "INFO", "IMPORTANT", "BUG", "FIXME", "http", "https", "mailto"
   ],
   "string_delimiters": ["\"", "'", "`"]
 }

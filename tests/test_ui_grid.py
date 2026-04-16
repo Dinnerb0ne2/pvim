@@ -55,7 +55,7 @@ class EditorUiDecouplingTests(unittest.TestCase):
         self.editor = PvimEditor(None, self.config, ui=self.ui)
 
     def tearDown(self) -> None:
-        self.editor._async_runtime.close()
+        self.editor.shutdown()
         self._tmp.cleanup()
 
     def test_render_routes_grid_and_cursor_to_ui(self) -> None:

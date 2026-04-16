@@ -2,14 +2,19 @@
   "name": "javascript",
   "line_comment": "//",
   "keywords": [
-    "break", "case", "catch", "class", "const", "continue", "debugger", "default",
-    "delete", "do", "else", "export", "extends", "finally", "for", "function", "if",
-    "import", "in", "instanceof", "let", "new", "return", "super", "switch", "this",
-    "throw", "try", "typeof", "var", "void", "while", "with", "yield", "async", "await"
+    "async", "await", "break", "case", "catch", "class", "const", "continue", "debugger", "default",
+    "delete", "do", "else", "export", "extends", "finally", "for", "function", "if", "import", "in",
+    "instanceof", "let", "new", "null", "of", "return", "static", "super", "switch", "this", "throw",
+    "true", "try", "typeof", "undefined", "var", "void", "while", "with", "yield"
   ],
   "builtins": [
-    "Array", "Boolean", "Date", "Error", "JSON", "Map", "Math", "Number", "Object",
-    "Promise", "RegExp", "Set", "String", "Symbol", "console", "document", "window"
+    "Array", "ArrayBuffer", "BigInt", "BigInt64Array", "BigUint64Array", "Boolean", "Date", "DataView",
+    "Error", "EvalError", "FinalizationRegistry", "Float32Array", "Float64Array", "Function",
+    "Int8Array", "Int16Array", "Int32Array", "JSON", "Map", "Math", "Number", "Object", "Promise",
+    "Proxy", "Reflect", "RegExp", "Set", "String", "Symbol", "Uint8Array", "Uint16Array",
+    "Uint32Array", "Uint8ClampedArray", "WeakMap", "WeakRef", "WeakSet", "console", "document",
+    "window", "globalThis", "fetch", "URL", "URLSearchParams", "setTimeout", "clearTimeout",
+    "setInterval", "clearInterval", "requestAnimationFrame", "cancelAnimationFrame"
   ],
   "string_delimiters": ["\"", "'", "`"]
 }

@@ -3,12 +3,15 @@
   "line_comment": "//",
   "keywords": [
     "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
-    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut",
-    "pub", "ref", "return", "Self", "self", "static", "struct", "super", "trait", "true", "type",
-    "unsafe", "use", "where", "while"
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "Self", "self", "static", "struct", "super", "trait", "true", "type", "unsafe",
+    "use", "where", "while"
   ],
   "builtins": [
-    "String", "Vec", "Option", "Result", "Some", "None", "Ok", "Err", "println", "format", "panic"
+    "String", "str", "Vec", "Option", "Result", "Some", "None", "Ok", "Err", "Box", "Rc", "Arc",
+    "HashMap", "HashSet", "BTreeMap", "BTreeSet", "format", "println", "eprintln", "dbg", "panic",
+    "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize", "f32",
+    "f64", "bool", "char"
   ],
   "string_delimiters": ["\"", "'"]
 }

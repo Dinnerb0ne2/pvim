@@ -143,14 +143,14 @@ class ShortcutManagerTests(unittest.TestCase):
                 self.assertTrue(editor._handle_keys_command(["set", "toggle_comment", "F11"]))
                 self.assertEqual(editor._shortcut("toggle_comment", "CTRL_SLASH"), "F11")
             finally:
-                editor._async_runtime.close()
+                editor.shutdown()
 
             reloaded = AppConfig.load(config_path)
             editor2 = PvimEditor(None, reloaded)
             try:
                 self.assertEqual(editor2._shortcut("toggle_comment", "CTRL_SLASH"), "F11")
             finally:
-                editor2._async_runtime.close()
+                editor2.shutdown()
 
 
 if __name__ == "__main__":

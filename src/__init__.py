@@ -5,7 +5,7 @@ import subprocess
 
 APP_NAME = "PVIM"
 _BASE_MAJOR = 0
-_BASE_MINOR = 8
+_BASE_MINOR = 9
 _BASE_PATCH = 0
 
 

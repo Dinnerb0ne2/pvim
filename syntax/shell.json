@@ -3,10 +3,13 @@
   "line_comment": "#",
   "keywords": [
     "if", "then", "else", "elif", "fi", "case", "esac", "for", "while", "until", "do", "done",
-    "function", "in", "select", "time"
+    "function", "in", "select", "time", "coproc", "readonly", "local", "declare"
   ],
   "builtins": [
-    "echo", "printf", "read", "test", "cd", "pwd", "export", "unset", "alias", "trap", "exit"
+    "alias", "bg", "bind", "break", "builtin", "cd", "command", "continue", "dirs", "disown", "echo",
+    "eval", "exec", "exit", "export", "fg", "getopts", "hash", "help", "history", "jobs", "kill",
+    "popd", "printf", "pushd", "pwd", "read", "readonly", "set", "shift", "source", "test", "times",
+    "trap", "type", "ulimit", "umask", "unalias", "unset", "wait"
   ],
   "string_delimiters": ["\"", "'"]
 }

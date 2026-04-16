@@ -2,12 +2,14 @@
   "name": "html",
   "line_comment": "",
   "keywords": [
-    "html", "head", "body", "div", "span", "script", "style", "meta", "link", "title",
-    "h1", "h2", "h3", "p", "a", "img", "ul", "ol", "li", "table", "tr", "td", "th",
-    "form", "input", "button", "section", "article", "header", "footer", "main"
+    "a", "article", "aside", "audio", "body", "button", "canvas", "div", "footer", "form", "h1",
+    "h2", "h3", "h4", "h5", "h6", "head", "header", "html", "img", "input", "label", "li", "link",
+    "main", "meta", "nav", "ol", "option", "p", "script", "section", "select", "span", "style",
+    "table", "tbody", "td", "textarea", "th", "thead", "title", "tr", "ul", "video"
   ],
   "builtins": [
-    "class", "id", "href", "src", "alt", "type", "value", "name", "placeholder", "data"
+    "alt", "aria-label", "class", "content", "data", "disabled", "for", "href", "id", "lang",
+    "method", "name", "placeholder", "rel", "role", "src", "style", "target", "title", "type", "value"
   ],
   "string_delimiters": ["\"", "'"]
 }

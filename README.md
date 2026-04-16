@@ -1,4 +1,4 @@
-# PVIM - v0.8
+# PVIM - v0.9
 
 PVIM 是一个基于 **Python 3.14.3**、纯标准库实现的终端编辑器。
 
@@ -22,6 +22,7 @@ PVIM 是一个基于 **Python 3.14.3**、纯标准库实现的终端编辑器。
 - PieceTable 底层结构（大文件编辑基础）
 - 自定义脚本语言 + 插件管理（安装/卸载/版本/简介）
 - 主题管理（安装/卸载/列表/版本/预览路径）
+- 主题库扩展（Neovim / VSCode / JetBrains）与更细粒度语法着色（constant/operator/punctuation）
 - 快捷键管理（列表/自定义/冲突提示）
 - 文件树管理（排序/过滤/隐藏文件/状态标记/操作提示）
 - 括号对彩虹高亮与当前括号对标记
@@ -39,6 +40,17 @@ PVIM 是一个基于 **Python 3.14.3**、纯标准库实现的终端编辑器。
 - 轻量 DAP（pdb）调试管理（断点/单步/变量查看/调试控制台命令）
 - 命令式帮助系统（`:help topics|search|jump`）与宏管理（`:macro`）
 - 标准库工具集（配置校验/合并、HTTP 拉取、Python AST 分析、运行日志查看）
+- GitHub Actions + Nuitka 自动打包与 Release 发布（Python 3.14.3）
+
+## 0.9 收尾路线（通往完美）
+
+- 完整自动命令（Autocmds）：事件触发（保存格式化、文件类型配置）
+- 多作用域变量系统（全局 / 窗口 / 缓冲区）
+- 内置终端模拟器（分屏、历史搜索）
+- DAP 调试集成（断点、单步、变量查看）
+- Quickfix 错误导航列表
+- 文本对象 + 宏录制回放系统
+- 命令式内置帮助系统
 
 ## 启动
 
@@ -80,6 +92,11 @@ doc/
 ```bash
 python -m tests.run_tests
 ```
+
+## Release（Nuitka）
+
+- 推送 `v*` 标签后，`release-nuitka` workflow 会使用 **Python 3.14.3** 自动构建 Nuitka standalone 包并发布到 GitHub Releases。
+- 也可通过 `workflow_dispatch` 手动输入标签触发发布。
 
 ## License
 

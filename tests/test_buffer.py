@@ -62,7 +62,7 @@ class BufferEditorBehaviorTests(unittest.TestCase):
         self.editor = PvimEditor(None, self.config)
 
     def tearDown(self) -> None:
-        self.editor._async_runtime.close()
+        self.editor.shutdown()
         self._tmp.cleanup()
 
     def test_basic_insert_and_delete(self) -> None:
@@ -188,6 +188,41 @@ class BufferEditorBehaviorTests(unittest.TestCase):
         self.assertTrue(self.editor._jump_to_matching_bracket())
         self.assertEqual((self.editor.cy, self.editor.cx), (0, 3))
 
+    def test_bracket_rainbow_keeps_depth_across_lines(self) -> None:
+        self.editor.lines = [
+            "func(",
+            "  [",
+            "    {",
+            "    }",
+            "  ]",
+            ")",
+        ]
+        self.editor._sync_incremental_syntax(force=True)
+
+        open_paren = self.editor._line_bracket_style_map(0, self.editor.lines[0])[4]
+        open_bracket = self.editor._line_bracket_style_map(1, self.editor.lines[1])[2]
+        open_brace = self.editor._line_bracket_style_map(2, self.editor.lines[2])[4]
+        close_brace = self.editor._line_bracket_style_map(3, self.editor.lines[3])[4]
+        close_bracket = self.editor._line_bracket_style_map(4, self.editor.lines[4])[2]
+        close_paren = self.editor._line_bracket_style_map(5, self.editor.lines[5])[0]
+
+        self.assertNotEqual(open_paren, open_bracket)
+        self.assertNotEqual(open_bracket, open_brace)
+        self.assertEqual(open_brace, close_brace)
+        self.assertEqual(open_bracket, close_bracket)
+        self.assertEqual(open_paren, close_paren)
+
+    def test_bracket_rainbow_keeps_color_on_soft_wrap_segments(self) -> None:
+        line = "(((([[[[{{{{}}}}]]]]))))"
+        self.editor.lines = [line]
+        self.editor._sync_incremental_syntax(force=True)
+
+        full = self.editor._line_bracket_style_map(0, line)
+        segment = line[8:16]
+        visible = self.editor._visible_bracket_style_map(0, line, 8, segment)
+        self.assertEqual(visible.get(0), full.get(8))
+        self.assertEqual(visible.get(len(segment) - 1), full.get(15))
+
     def test_project_replace_all_updates_workspace_files(self) -> None:
         first = self._root / "a.py"
         second = self._root / "b.py"
@@ -239,7 +274,7 @@ class BufferEditorBehaviorTests(unittest.TestCase):
             self.assertIsNone(startup_editor.file_path)
             self.assertEqual(startup_editor.lines, [""])
         finally:
-            startup_editor._async_runtime.close()
+            startup_editor.shutdown()
 
     def test_incremental_search_preview_history_and_cancel_restore(self) -> None:
         self.editor.lines = ["alpha beta", "beta alpha", "omega"]

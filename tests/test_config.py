@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+import os
+import sys
 import tempfile
 import unittest
 
@@ -66,6 +68,29 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(custom.session_file().name, "current.json")
         self.assertEqual(custom.session_profiles_directory().name, "profiles")
         self.assertEqual(custom.swap_directory().name, "swap")
+
+    def test_default_load_prefers_executable_directory_when_cwd_missing_config(self) -> None:
+        payload = copy.deepcopy(DEFAULT_CONFIG)
+        payload["editor"]["line_numbers"] = False
+        executable_dir = self._root / "bin"
+        executable_dir.mkdir(parents=True, exist_ok=True)
+        (executable_dir / "pvim.config.json").write_text(json.dumps(payload), encoding="utf-8")
+
+        work_dir = self._root / "work"
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        original_cwd = Path.cwd()
+        original_argv0 = sys.argv[0]
+        try:
+            os.chdir(work_dir)
+            sys.argv[0] = str(executable_dir / "pvim.exe")
+            loaded = AppConfig.load()
+        finally:
+            os.chdir(original_cwd)
+            sys.argv[0] = original_argv0
+
+        self.assertEqual(loaded.path.parent, executable_dir.resolve())
+        self.assertFalse(loaded.show_line_numbers())
 
 
 if __name__ == "__main__":

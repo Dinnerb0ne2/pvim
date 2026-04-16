@@ -1,7 +1,10 @@
 {
   "name": "toml",
   "line_comment": "#",
-  "keywords": ["true", "false"],
-  "builtins": ["datetime", "array", "table", "inline-table", "float", "integer"],
+  "keywords": ["true", "false", "inf", "nan"],
+  "builtins": [
+    "datetime", "offset-datetime", "local-datetime", "local-date", "local-time",
+    "array", "table", "inline-table", "float", "integer", "string", "boolean"
+  ],
   "string_delimiters": ["\"", "'"]
 }

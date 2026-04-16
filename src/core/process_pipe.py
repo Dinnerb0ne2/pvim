@@ -55,6 +55,11 @@ class AsyncProcessManager:
             return False
         return True
 
+    def stop_all_sync(self, *, timeout: float = 1.0) -> None:
+        process_ids = list(self._states.keys())
+        for process_id in process_ids:
+            self.stop_sync(process_id, timeout=timeout)
+
     def status(self, process_id: int) -> str:
         state = self._states.get(process_id)
         if state is None:
@@ -105,13 +110,35 @@ class AsyncProcessManager:
         state = self._states.get(process_id)
         if state is None or state.exited:
             return
-        state.process.terminate()
+        process = state.process
+        stdin = process.stdin
+        if stdin is not None and not stdin.is_closing():
+            stdin.close()
+        if process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=0.8)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+        if not state.exited:
+            state.exited = True
+            state.return_code = process.returncode
+            self._runtime.post_event(
+                {
+                    "type": "process_exit",
+                    "process_id": process_id,
+                    "return_code": process.returncode,
+                }
+            )
 
     async def _wait_for_exit(self, process_id: int) -> None:
         state = self._states.get(process_id)
         if state is None:
             return
         code = await state.process.wait()
+        if state.exited:
+            return
         state.exited = True
         state.return_code = code
         self._runtime.post_event(

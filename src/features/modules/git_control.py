@@ -71,6 +71,7 @@ class GitControlFeature:
         return markers
 
     async def _run_git(self, cwd: Path, *args: str) -> str:
+        process: asyncio.subprocess.Process | None = None
         try:
             process = await asyncio.create_subprocess_exec(
                 "git",
@@ -81,8 +82,16 @@ class GitControlFeature:
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, _stderr = await process.communicate()
+        except asyncio.CancelledError:
+            if process is not None and process.returncode is None:
+                process.terminate()
+                try:
+                    await process.wait()
+                except OSError:
+                    pass
+            raise
         except OSError:
             return ""
-        if process.returncode != 0:
+        if process is None or process.returncode != 0:
             return ""
         return stdout.decode("utf-8", errors="replace").strip()

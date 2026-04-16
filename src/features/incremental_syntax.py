@@ -114,6 +114,15 @@ class IncrementalSyntaxModel:
                 best = fold
         return best
 
+    def depth_before_line(self, line: int) -> int:
+        if not self._depth_before:
+            return 0
+        if line <= 0:
+            return max(0, self._depth_before[0])
+        if line < len(self._depth_before):
+            return max(0, self._depth_before[line])
+        return max(0, self._depth_after[-1] if self._depth_after else 0)
+
     def enclosing_fold(self, line: int) -> FoldRange | None:
         best: FoldRange | None = None
         for fold in self._folds:

@@ -2,12 +2,17 @@
   "name": "sql",
   "line_comment": "--",
   "keywords": [
-    "select", "from", "where", "join", "left", "right", "inner", "outer", "on", "group", "by",
-    "order", "having", "insert", "into", "values", "update", "set", "delete", "create", "table",
-    "alter", "drop", "index", "view", "distinct", "limit", "offset", "union", "all", "as"
+    "add", "all", "alter", "and", "any", "as", "asc", "between", "by", "case", "check", "column",
+    "constraint", "create", "cross", "database", "default", "delete", "desc", "distinct", "drop",
+    "else", "end", "exists", "foreign", "from", "full", "group", "having", "if", "in", "index",
+    "inner", "insert", "into", "is", "join", "key", "left", "like", "limit", "not", "null", "offset",
+    "on", "or", "order", "outer", "primary", "references", "right", "schema", "select", "set",
+    "table", "then", "union", "unique", "update", "values", "view", "when", "where"
   ],
   "builtins": [
-    "count", "sum", "avg", "min", "max", "coalesce", "now", "current_date", "current_timestamp"
+    "abs", "avg", "cast", "coalesce", "concat", "count", "current_date", "current_time",
+    "current_timestamp", "date_part", "ifnull", "length", "lower", "max", "min", "now", "nullif",
+    "round", "substr", "sum", "trim", "upper"
   ],
   "string_delimiters": ["\"", "'"]
 }

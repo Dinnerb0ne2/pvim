@@ -1,7 +1,7 @@
 {
   "meta": {
     "name": "nvim-catppuccin",
-    "version": "0.7.0",
+    "version": "0.9.0",
     "description": "Neovim Catppuccin-inspired palette with readable statusline.",
     "preview": "previews/nvim-catppuccin.ppm"
   },

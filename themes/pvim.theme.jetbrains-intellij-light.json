@@ -1,0 +1,52 @@
+{
+  "meta": {
+    "name": "jetbrains-intellij-light",
+    "version": "0.9.0",
+    "description": "JetBrains IntelliJ Light inspired palette."
+  },
+  "ui": {
+    "editor": { "fg": "#1f2328", "bg": "#ffffff" },
+    "cursor_line": { "fg": "#1f2328", "bg": "#f5f7fa" },
+    "line_number": { "fg": "#9aa4b2", "bg": "#ffffff" },
+    "line_number_current": { "fg": "#1f2328", "bg": "#f5f7fa", "bold": true },
+    "tilde": { "fg": "#d0d7de", "bg": "#ffffff" },
+    "status": { "fg": "#ffffff", "bg": "#4a90e2", "bold": true },
+    "mode_normal": { "fg": "#ffffff", "bg": "#007acc", "bold": true },
+    "mode_insert": { "fg": "#ffffff", "bg": "#4caf50", "bold": true },
+    "mode_command": { "fg": "#ffffff", "bg": "#9c27b0", "bold": true },
+    "message_info": { "fg": "#4caf50", "bg": "#ffffff" },
+    "message_error": { "fg": "#d32f2f", "bg": "#ffffff", "bold": true },
+    "command_line": { "fg": "#1f2328", "bg": "#f5f7fa" },
+    "sidebar": { "fg": "#1f2328", "bg": "#f5f7fa" },
+    "sidebar_header": { "fg": "#ffffff", "bg": "#009688", "bold": true },
+    "sidebar_current": { "fg": "#ffffff", "bg": "#ff9800", "bold": true },
+    "selection": { "fg": "#1f2328", "bg": "#dbe9ff" },
+    "fuzzy_selected": { "fg": "#ffffff", "bg": "#4caf50", "bold": true },
+    "bracket_level_1": { "fg": "#d32f2f", "bold": true },
+    "bracket_level_2": { "fg": "#1976d2", "bold": true },
+    "bracket_level_3": { "fg": "#f9a825", "bold": true },
+    "bracket_level_4": { "fg": "#2e7d32", "bold": true },
+    "bracket_level_5": { "fg": "#8e24aa", "bold": true },
+    "bracket_level_6": { "fg": "#ef6c00", "bold": true },
+    "bracket_level_7": { "fg": "#00897b", "bold": true },
+    "bracket_level_8": { "fg": "#1565c0", "bold": true },
+    "bracket_active": { "fg": "#ffffff", "bg": "#4a90e2", "bold": true }
+  },
+  "syntax": {
+    "keyword": { "fg": "#0033b3" },
+    "builtin": { "fg": "#005cc5" },
+    "function": { "fg": "#795e26" },
+    "type": { "fg": "#267f99" },
+    "decorator": { "fg": "#9c27b0" },
+    "string": { "fg": "#067d17" },
+    "comment": { "fg": "#8c8c8c" },
+    "number": { "fg": "#1750eb" },
+    "constant": { "fg": "#871094" },
+    "operator": { "fg": "#1f2328" },
+    "punctuation": { "fg": "#4d5966" },
+    "namespace": { "fg": "#267f99" },
+    "property": { "fg": "#1f2328" },
+    "parameter": { "fg": "#795e26" },
+    "tag": { "fg": "#800000" }
+  }
+}

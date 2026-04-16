@@ -17,12 +17,16 @@ class AsyncRuntime:
         self._thread.start()
         self._next_task_id = 1
         self._task_lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._closed = False
 
     @property
     def loop(self) -> asyncio.AbstractEventLoop:
         return self._loop
 
     def submit(self, label: str, coro: Coroutine[Any, Any, Any]) -> int:
+        if self._closed or self._loop.is_closed():
+            raise RuntimeError("Async runtime is closed.")
         with self._task_lock:
             task_id = self._next_task_id
             self._next_task_id += 1
@@ -32,6 +36,8 @@ class AsyncRuntime:
         return task_id
 
     def run_sync(self, coro: Coroutine[Any, Any, Any], *, timeout: float = 5.0) -> Any:
+        if self._closed or self._loop.is_closed():
+            raise RuntimeError("Async runtime is closed.")
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return future.result(timeout=timeout)
 
@@ -48,15 +54,22 @@ class AsyncRuntime:
         self._events.put(event)
 
     def close(self) -> None:
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
         if self._loop.is_closed():
             return
         try:
             future = asyncio.run_coroutine_threadsafe(self._shutdown_loop(), self._loop)
-            future.result(timeout=1.0)
+            future.result(timeout=2.5)
         except Exception:
             pass
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        self._thread.join(timeout=1.0)
+        try:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        except RuntimeError:
+            return
+        self._thread.join(timeout=3.0)
 
     async def _wrap_task(self, task_id: int, label: str, coro: Coroutine[Any, Any, Any]) -> None:
         try:
@@ -83,11 +96,24 @@ class AsyncRuntime:
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
-        self._loop.run_forever()
+        try:
+            self._loop.run_forever()
+        finally:
+            pending = [task for task in asyncio.all_tasks(self._loop) if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+            self._loop.run_until_complete(self._loop.shutdown_default_executor())
+            self._loop.close()
 
     async def _shutdown_loop(self) -> None:
         current = asyncio.current_task()
         pending = [task for task in asyncio.all_tasks() if task is not current and not task.done()]
+        if pending:
+            _done, pending_set = await asyncio.wait(pending, timeout=0.35)
+            pending = [task for task in pending_set if not task.done()]
         for task in pending:
             task.cancel()
         if pending:

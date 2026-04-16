@@ -1,7 +1,9 @@
 {
   "name": "yaml",
   "line_comment": "#",
-  "keywords": ["true", "false", "null", "yes", "no", "on", "off"],
-  "builtins": ["anchors", "aliases", "tags", "map", "seq"],
+  "keywords": ["true", "false", "null", "yes", "no", "on", "off", "~"],
+  "builtins": [
+    "anchors", "aliases", "tags", "map", "seq", "merge", "timestamp", "binary", "set", "omap"
+  ],
   "string_delimiters": ["\"", "'"]
 }

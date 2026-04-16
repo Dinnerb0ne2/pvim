@@ -16,7 +16,16 @@
     "sidebar_header": { "fg": "#1a1d23", "bg": "#56b6c2", "bold": true },
     "sidebar_current": { "fg": "#1a1d23", "bg": "#d19a66", "bold": true },
     "selection": { "fg": "#e0e6ed", "bg": "#444c5e" },
-    "fuzzy_selected": { "fg": "#1a1d23", "bg": "#98c379", "bold": true }
+    "fuzzy_selected": { "fg": "#1a1d23", "bg": "#98c379", "bold": true },
+    "bracket_level_1": { "fg": "#ff6b6b", "bold": true },
+    "bracket_level_2": { "fg": "#61afef", "bold": true },
+    "bracket_level_3": { "fg": "#ffd166", "bold": true },
+    "bracket_level_4": { "fg": "#98c379", "bold": true },
+    "bracket_level_5": { "fg": "#c678dd", "bold": true },
+    "bracket_level_6": { "fg": "#e5c07b", "bold": true },
+    "bracket_level_7": { "fg": "#56b6c2", "bold": true },
+    "bracket_level_8": { "fg": "#f77fbe", "bold": true },
+    "bracket_active": { "fg": "#1a1d23", "bg": "#8ab4f8", "bold": true }
   },
   "syntax": {
     "keyword": { "fg": "#c678dd" },
@@ -26,6 +35,13 @@
     "decorator": { "fg": "#61afef" },
     "string": { "fg": "#98c379" },
     "comment": { "fg": "#7f848e" },
-    "number": { "fg": "#e59866" }
+    "number": { "fg": "#e59866" },
+    "constant": { "fg": "#e06c75" },
+    "operator": { "fg": "#56b6c2" },
+    "punctuation": { "fg": "#abb2bf" },
+    "namespace": { "fg": "#61afef" },
+    "property": { "fg": "#e0e6ed" },
+    "parameter": { "fg": "#e5c07b" },
+    "tag": { "fg": "#56b6c2" }
   }
 }

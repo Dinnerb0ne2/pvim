@@ -1,37 +1,62 @@
 {
   "javascript": [
     { "pattern": "^[A-Z][A-Za-z0-9_]*$", "style": "type" },
-    { "pattern": "^[A-Z0-9_]{2,}$", "style": "builtin" }
+    { "pattern": "^[A-Z0-9_]{2,}$", "style": "constant" },
+    { "pattern": "^[_$][A-Za-z_][A-Za-z0-9_]*$", "style": "property" }
   ],
   "typescript": [
     { "pattern": "^[A-Z][A-Za-z0-9_]*$", "style": "type" },
-    { "pattern": "^[A-Z0-9_]{2,}$", "style": "builtin" }
+    { "pattern": "^[A-Z0-9_]{2,}$", "style": "constant" },
+    { "pattern": "^[_$][A-Za-z_][A-Za-z0-9_]*$", "style": "property" }
   ],
   "go": [
     { "pattern": "^[A-Z][A-Za-z0-9_]*$", "style": "type" },
-    { "pattern": "^[A-Z0-9_]{2,}$", "style": "builtin" }
+    { "pattern": "^[A-Z0-9_]{2,}$", "style": "constant" }
   ],
   "rust": [
     { "pattern": "^[A-Z][A-Za-z0-9_]*$", "style": "type" },
-    { "pattern": "^[A-Z0-9_]{2,}$", "style": "builtin" }
+    { "pattern": "^[A-Z0-9_]{2,}$", "style": "constant" }
   ],
   "java": [
     { "pattern": "^[A-Z][A-Za-z0-9_]*$", "style": "type" },
-    { "pattern": "^[A-Z0-9_]{2,}$", "style": "builtin" }
+    { "pattern": "^[A-Z0-9_]{2,}$", "style": "constant" }
   ],
   "cpp": [
     { "pattern": "^[A-Z][A-Za-z0-9_]*$", "style": "type" },
-    { "pattern": "^[A-Z0-9_]{2,}$", "style": "builtin" }
+    { "pattern": "^[A-Z0-9_]{2,}$", "style": "constant" },
+    { "pattern": "^std$", "style": "namespace" }
+  ],
+  "csharp": [
+    { "pattern": "^[A-Z][A-Za-z0-9_]*$", "style": "type" },
+    { "pattern": "^[A-Z0-9_]{2,}$", "style": "constant" }
+  ],
+  "kotlin": [
+    { "pattern": "^[A-Z][A-Za-z0-9_]*$", "style": "type" },
+    { "pattern": "^[A-Z0-9_]{2,}$", "style": "constant" }
+  ],
+  "lua": [
+    { "pattern": "^[A-Z_][A-Z0-9_]*$", "style": "constant" }
   ],
   "shell": [
-    { "pattern": "^\\$[A-Za-z_][A-Za-z0-9_]*$", "style": "builtin" }
+    { "pattern": "^\\$[A-Za-z_][A-Za-z0-9_]*$", "style": "builtin" },
+    { "pattern": "^[A-Z_][A-Z0-9_]*$", "style": "constant" }
   ],
   "json": [
-    { "pattern": "^(true|false|null)$", "style": "keyword" },
-    { "pattern": "^[0-9]+$", "style": "number" }
+    { "pattern": "^(true|false|null)$", "style": "constant" },
+    { "pattern": "^[0-9]+(?:\\.[0-9]+)?$", "style": "number" }
   ],
   "css": [
     { "pattern": "^[a-z-]+:$", "style": "keyword" },
+    { "pattern": "^--[a-zA-Z0-9_-]+$", "style": "property" },
     { "pattern": "^[a-z-]+$", "style": "builtin" }
+  ],
+  "html": [
+    { "pattern": "^[a-z][a-z0-9-]*$", "style": "tag" }
+  ],
+  "markdown": [
+    { "pattern": "^(TODO|NOTE|TIP|WARNING|IMPORTANT|BUG|FIXME)$", "style": "constant" }
+  ],
+  "sql": [
+    { "pattern": "^[A-Z_][A-Z0-9_]*$", "style": "constant" }
   ]
 }

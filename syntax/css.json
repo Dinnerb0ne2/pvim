@@ -2,12 +2,16 @@
   "name": "css",
   "line_comment": "",
   "keywords": [
-    "color", "background", "border", "display", "position", "width", "height", "margin", "padding",
-    "font", "font-size", "font-weight", "line-height", "flex", "grid", "align-items", "justify-content",
-    "overflow", "opacity", "transform", "transition", "animation", "z-index"
+    "align-content", "align-items", "align-self", "animation", "background", "background-color",
+    "border", "border-radius", "box-shadow", "color", "display", "filter", "flex", "flex-direction",
+    "font", "font-family", "font-size", "font-weight", "gap", "grid", "grid-template-columns",
+    "height", "justify-content", "line-height", "margin", "max-height", "max-width", "min-height",
+    "min-width", "opacity", "overflow", "padding", "position", "text-align", "text-decoration",
+    "transform", "transition", "visibility", "width", "z-index"
   ],
   "builtins": [
-    "px", "em", "rem", "vh", "vw", "rgb", "rgba", "hsl", "var", "calc", "url"
+    "auto", "calc", "clamp", "em", "fr", "hsl", "hsla", "inherit", "initial", "max", "min", "none",
+    "normal", "px", "rad", "rem", "rgb", "rgba", "unset", "url", "var", "vh", "vmax", "vmin", "vw"
   ],
   "string_delimiters": ["\"", "'"]
 }

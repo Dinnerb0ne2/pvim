@@ -2,16 +2,24 @@
   "name": "cpp",
   "line_comment": "//",
   "keywords": [
-    "alignas", "alignof", "asm", "auto", "bool", "break", "case", "catch", "char", "class",
-    "const", "constexpr", "constinit", "continue", "decltype", "default", "delete", "do",
-    "double", "else", "enum", "explicit", "extern", "false", "float", "for", "friend", "goto",
-    "if", "inline", "int", "long", "mutable", "namespace", "new", "noexcept", "nullptr",
-    "operator", "private", "protected", "public", "register", "return", "short", "signed",
-    "sizeof", "static", "struct", "switch", "template", "this", "throw", "true", "try",
-    "typedef", "typename", "union", "unsigned", "using", "virtual", "void", "volatile", "while"
+    "alignas", "alignof", "and", "and_eq", "asm", "auto", "bitand", "bitor", "bool", "break",
+    "case", "catch", "char", "char8_t", "char16_t", "char32_t", "class", "compl", "concept",
+    "const", "consteval", "constexpr", "constinit", "const_cast", "continue", "co_await",
+    "co_return", "co_yield", "decltype", "default", "delete", "do", "double", "dynamic_cast",
+    "else", "enum", "explicit", "export", "extern", "false", "float", "for", "friend", "goto",
+    "if", "inline", "int", "long", "mutable", "namespace", "new", "noexcept", "not", "not_eq",
+    "nullptr", "operator", "or", "or_eq", "private", "protected", "public", "register",
+    "reinterpret_cast", "requires", "return", "short", "signed", "sizeof", "static",
+    "static_assert", "static_cast", "struct", "switch", "template", "this", "thread_local",
+    "throw", "true", "try", "typedef", "typeid", "typename", "union", "unsigned", "using",
+    "virtual", "void", "volatile", "wchar_t", "while", "xor", "xor_eq"
   ],
   "builtins": [
-    "std", "string", "vector", "map", "set", "unordered_map", "unordered_set", "cout", "cin", "endl"
+    "std", "string", "string_view", "vector", "array", "deque", "list", "map", "set", "multimap",
+    "multiset", "unordered_map", "unordered_set", "stack", "queue", "priority_queue", "span",
+    "optional", "variant", "any", "tuple", "pair", "unique_ptr", "shared_ptr", "weak_ptr",
+    "make_unique", "make_shared", "cout", "cin", "cerr", "clog", "endl", "format", "filesystem",
+    "chrono", "thread", "mutex", "atomic"
   ],
   "string_delimiters": ["\"", "'"]
 }

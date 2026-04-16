@@ -1,0 +1,52 @@
+{
+  "meta": {
+    "name": "vscode-dark-plus",
+    "version": "0.9.0",
+    "description": "Visual Studio Code Dark+ inspired palette."
+  },
+  "ui": {
+    "editor": { "fg": "#d4d4d4", "bg": "#1e1e1e" },
+    "cursor_line": { "fg": "#d4d4d4", "bg": "#252526" },
+    "line_number": { "fg": "#858585", "bg": "#1e1e1e" },
+    "line_number_current": { "fg": "#c6c6c6", "bg": "#252526", "bold": true },
+    "tilde": { "fg": "#4b4b4b", "bg": "#1e1e1e" },
+    "status": { "fg": "#1e1e1e", "bg": "#569cd6", "bold": true },
+    "mode_normal": { "fg": "#1e1e1e", "bg": "#4fc1ff", "bold": true },
+    "mode_insert": { "fg": "#1e1e1e", "bg": "#6a9955", "bold": true },
+    "mode_command": { "fg": "#1e1e1e", "bg": "#c586c0", "bold": true },
+    "message_info": { "fg": "#6a9955", "bg": "#1e1e1e" },
+    "message_error": { "fg": "#f44747", "bg": "#1e1e1e", "bold": true },
+    "command_line": { "fg": "#d4d4d4", "bg": "#252526" },
+    "sidebar": { "fg": "#cccccc", "bg": "#252526" },
+    "sidebar_header": { "fg": "#1e1e1e", "bg": "#4ec9b0", "bold": true },
+    "sidebar_current": { "fg": "#1e1e1e", "bg": "#dcdcaa", "bold": true },
+    "selection": { "fg": "#d4d4d4", "bg": "#264f78" },
+    "fuzzy_selected": { "fg": "#1e1e1e", "bg": "#6a9955", "bold": true },
+    "bracket_level_1": { "fg": "#f44747", "bold": true },
+    "bracket_level_2": { "fg": "#4fc1ff", "bold": true },
+    "bracket_level_3": { "fg": "#dcdcaa", "bold": true },
+    "bracket_level_4": { "fg": "#6a9955", "bold": true },
+    "bracket_level_5": { "fg": "#c586c0", "bold": true },
+    "bracket_level_6": { "fg": "#ce9178", "bold": true },
+    "bracket_level_7": { "fg": "#4ec9b0", "bold": true },
+    "bracket_level_8": { "fg": "#9cdcfe", "bold": true },
+    "bracket_active": { "fg": "#1e1e1e", "bg": "#569cd6", "bold": true }
+  },
+  "syntax": {
+    "keyword": { "fg": "#c586c0" },
+    "builtin": { "fg": "#569cd6" },
+    "function": { "fg": "#dcdcaa" },
+    "type": { "fg": "#4ec9b0" },
+    "decorator": { "fg": "#9cdcfe" },
+    "string": { "fg": "#ce9178" },
+    "comment": { "fg": "#6a9955" },
+    "number": { "fg": "#b5cea8" },
+    "constant": { "fg": "#4fc1ff" },
+    "operator": { "fg": "#d4d4d4" },
+    "punctuation": { "fg": "#c8c8c8" },
+    "namespace": { "fg": "#4ec9b0" },
+    "property": { "fg": "#9cdcfe" },
+    "parameter": { "fg": "#d7ba7d" },
+    "tag": { "fg": "#569cd6" }
+  }
+}

@@ -2,36 +2,12 @@
   "name": "pvimscript",
   "line_comment": "#",
   "keywords": [
-    "let",
-    "fn",
-    "if",
-    "else",
-    "while",
-    "return",
-    "break",
-    "continue",
-    "true",
-    "false",
-    "null",
-    "and",
-    "or"
+    "let", "fn", "if", "else", "while", "for", "return", "break", "continue", "true", "false", "null",
+    "and", "or", "not", "in", "match", "case", "try", "catch"
   ],
   "builtins": [
-    "api",
-    "len",
-    "push",
-    "pop",
-    "slice",
-    "sort",
-    "split",
-    "join",
-    "str",
-    "int",
-    "float",
-    "print"
+    "api", "len", "push", "pop", "slice", "sort", "split", "join", "str", "int", "float", "bool",
+    "print", "range", "keys", "values", "has", "upper", "lower", "trim"
   ],
-  "string_delimiters": [
-    "\"",
-    "'"
-  ]
+  "string_delimiters": ["\"", "'"]
 }

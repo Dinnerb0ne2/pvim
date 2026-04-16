@@ -177,7 +177,7 @@ class LspClient:
                         "symbol": {},
                     },
                 },
-                "clientInfo": {"name": "pvim", "version": "0.8"},
+                "clientInfo": {"name": "pvim", "version": "0.9"},
             },
         )
         await self._notify("initialized", {})
@@ -216,7 +216,7 @@ class LspClient:
         if self._rpc is not None:
             rpc = self._rpc
             try:
-                await rpc.request("shutdown", {})
+                await rpc.request("shutdown", {}, timeout=0.4)
             except Exception:
                 pass
             try:

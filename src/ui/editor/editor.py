@@ -227,6 +227,8 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._last_view_state: tuple[object, ...] | None = None
         self._last_cursor_line = 0
         self._ui = ui if ui is not None else TerminalUI()
+        self._ui_entered = False
+        self._shutdown_complete = False
         self._async_runtime = AsyncRuntime()
         self._process_manager = AsyncProcessManager(self._async_runtime)
         self._last_tick = time.monotonic()
@@ -460,7 +462,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._notifications = NotificationCenter()
         if (not self._lsp_enabled or not self._lsp_command) and self._lsp_client is not None:
             try:
-                self._async_runtime.run_sync(self._lsp_client.stop(), timeout=0.8)
+                self._async_runtime.run_sync(self._lsp_client.stop(), timeout=2.0)
             except Exception:
                 pass
 
@@ -510,6 +512,8 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self.theme.ui_style("bracket_level_4"),
             self.theme.ui_style("bracket_level_5"),
             self.theme.ui_style("bracket_level_6"),
+            self.theme.ui_style("bracket_level_7"),
+            self.theme.ui_style("bracket_level_8"),
         ]
         fallback_bracket_styles = [
             self.theme.syntax_style("decorator"),
@@ -518,6 +522,8 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self.theme.syntax_style("keyword"),
             self.theme.syntax_style("builtin"),
             self.theme.syntax_style("number"),
+            self.theme.syntax_style("string"),
+            self.theme.syntax_style("constant"),
         ]
         self._bracket_styles = tuple(style for style in bracket_styles if style) or tuple(
             style for style in fallback_bracket_styles if style
@@ -4092,22 +4098,20 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         if not text:
             return {}
         style_map: dict[int, str] = {}
-        open_to_close = {"(": ")", "[": "]", "{": "}"}
-        close_to_open = {")": "(", "]": "[", "}": "{"}
-        stack: list[tuple[str, int]] = []
+        open_tokens = {"(", "[", "{"}
+        close_tokens = {")", "]", "}"}
         levels = max(1, len(self._bracket_styles))
+        depth = max(0, self._syntax_model.depth_before_line(line_index))
         for index, token in enumerate(text):
-            if token in open_to_close:
-                style_index = len(stack) % levels
+            if token in open_tokens:
+                style_index = depth % levels
                 if self._bracket_styles:
                     style_map[index] = self._bracket_styles[style_index]
-                stack.append((open_to_close[token], style_index))
+                depth += 1
                 continue
-            if token in close_to_open:
-                if stack and stack[-1][0] == token:
-                    _expected, style_index = stack.pop()
-                else:
-                    style_index = len(stack) % levels
+            if token in close_tokens:
+                depth = max(0, depth - 1)
+                style_index = depth % levels
                 if self._bracket_styles:
                     style_map[index] = self._bracket_styles[style_index]
 
@@ -7032,6 +7036,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
     def run(self) -> None:
         if isinstance(self._ui, TerminalUI):
             self._ui.enter()
+            self._ui_entered = True
         try:
             while self.running:
                 self._poll_config_reload()
@@ -7059,16 +7064,32 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                 self.render()
                 time.sleep(0.01)
         finally:
-            self._save_session()
-            self._write_swap_if_needed(force=True)
-            if self._lsp_client is not None:
-                try:
-                    self._async_runtime.run_sync(self._lsp_client.stop(), timeout=0.8)
-                except Exception:
-                    pass
-            self._async_runtime.close()
-            if isinstance(self._ui, TerminalUI):
-                self._ui.exit()
+            self.shutdown()
+
+    def shutdown(self) -> None:
+        if self._shutdown_complete:
+            return
+        self._shutdown_complete = True
+        self.running = False
+        self._save_session()
+        self._write_swap_if_needed(force=True)
+        if hasattr(self._process_manager, "stop_all_sync"):
+            self._process_manager.stop_all_sync(timeout=1.2)
+        else:
+            for process_id in list(self._terminal_sessions):
+                self._process_manager.stop_sync(process_id, timeout=1.2)
+        self._terminal_sessions.clear()
+        self._terminal_session_order.clear()
+        self._terminal_process_id = None
+        if self._lsp_client is not None:
+            try:
+                self._async_runtime.run_sync(self._lsp_client.stop(), timeout=2.0)
+            except Exception:
+                pass
+        self._async_runtime.close()
+        if self._ui_entered and isinstance(self._ui, TerminalUI):
+            self._ui.exit()
+            self._ui_entered = False
 
 
 # Backward-compat alias for older imports.

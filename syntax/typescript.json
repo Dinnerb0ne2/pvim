@@ -2,17 +2,21 @@
   "name": "typescript",
   "line_comment": "//",
   "keywords": [
-    "abstract", "any", "as", "asserts", "async", "await", "bigint", "boolean", "break",
-    "case", "catch", "class", "const", "continue", "declare", "default", "delete", "do",
-    "else", "enum", "export", "extends", "finally", "for", "from", "function", "if",
+    "abstract", "any", "as", "asserts", "async", "await", "bigint", "boolean", "break", "case",
+    "catch", "class", "const", "constructor", "continue", "declare", "default", "delete", "do",
+    "else", "enum", "export", "extends", "false", "finally", "for", "from", "function", "get", "if",
     "implements", "import", "in", "infer", "instanceof", "interface", "is", "keyof", "let",
-    "module", "namespace", "never", "new", "null", "number", "object", "private", "protected",
-    "public", "readonly", "return", "satisfies", "static", "string", "super", "switch",
-    "this", "throw", "try", "type", "typeof", "undefined", "unknown", "var", "void", "while"
+    "module", "namespace", "never", "new", "null", "number", "object", "of", "out", "override",
+    "package", "private", "protected", "public", "readonly", "require", "return", "satisfies", "set",
+    "static", "string", "super", "switch", "symbol", "this", "throw", "true", "try", "type",
+    "typeof", "undefined", "unknown", "using", "var", "void", "while", "yield"
   ],
   "builtins": [
-    "Array", "Boolean", "Date", "Error", "JSON", "Map", "Math", "Number", "Object",
-    "Promise", "RegExp", "Set", "String", "Symbol", "console", "document", "window"
+    "Array", "ArrayBuffer", "BigInt", "BigInt64Array", "BigUint64Array", "Boolean", "Date", "DataView",
+    "Error", "FinalizationRegistry", "Float32Array", "Float64Array", "JSON", "Map", "Math", "Number",
+    "Object", "Promise", "ReadonlyArray", "Record", "RegExp", "Set", "String", "Symbol", "Uint8Array",
+    "Uint16Array", "Uint32Array", "WeakMap", "WeakRef", "WeakSet", "console", "document", "window",
+    "globalThis", "fetch", "Request", "Response", "Headers", "URL", "URLSearchParams", "AbortController"
   ],
   "string_delimiters": ["\"", "'", "`"]
 }

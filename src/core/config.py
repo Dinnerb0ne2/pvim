@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import getpass
 import shlex
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 import tempfile
@@ -260,6 +261,19 @@ def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[st
     return merged
 
 
+def _default_config_path() -> Path:
+    cwd_candidate = (Path.cwd() / "pvim.config.json").resolve()
+    if cwd_candidate.exists():
+        return cwd_candidate
+    try:
+        executable_candidate = (Path(sys.argv[0]).resolve().parent / "pvim.config.json").resolve()
+    except (OSError, RuntimeError, ValueError):
+        return cwd_candidate
+    if executable_candidate.exists():
+        return executable_candidate
+    return cwd_candidate
+
+
 def _as_bool(value: Any, *, default: bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -285,7 +299,7 @@ class AppConfig:
 
     @classmethod
     def load(cls, path: Path | None = None) -> AppConfig:
-        config_path = path or (Path.cwd() / "pvim.config.json")
+        config_path = path.expanduser().resolve() if path is not None else _default_config_path()
         merged = _deep_copy(DEFAULT_CONFIG)
 
         if config_path.exists():

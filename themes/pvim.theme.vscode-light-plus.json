@@ -1,0 +1,52 @@
+{
+  "meta": {
+    "name": "vscode-light-plus",
+    "version": "0.9.0",
+    "description": "Visual Studio Code Light+ inspired palette."
+  },
+  "ui": {
+    "editor": { "fg": "#333333", "bg": "#ffffff" },
+    "cursor_line": { "fg": "#333333", "bg": "#f3f3f3" },
+    "line_number": { "fg": "#9e9e9e", "bg": "#ffffff" },
+    "line_number_current": { "fg": "#333333", "bg": "#f3f3f3", "bold": true },
+    "tilde": { "fg": "#c8c8c8", "bg": "#ffffff" },
+    "status": { "fg": "#ffffff", "bg": "#007acc", "bold": true },
+    "mode_normal": { "fg": "#ffffff", "bg": "#005fb8", "bold": true },
+    "mode_insert": { "fg": "#ffffff", "bg": "#2f8f2f", "bold": true },
+    "mode_command": { "fg": "#ffffff", "bg": "#af4fbf", "bold": true },
+    "message_info": { "fg": "#2f8f2f", "bg": "#ffffff" },
+    "message_error": { "fg": "#c72e0f", "bg": "#ffffff", "bold": true },
+    "command_line": { "fg": "#333333", "bg": "#f3f3f3" },
+    "sidebar": { "fg": "#2f2f2f", "bg": "#f3f3f3" },
+    "sidebar_header": { "fg": "#ffffff", "bg": "#008080", "bold": true },
+    "sidebar_current": { "fg": "#ffffff", "bg": "#b58900", "bold": true },
+    "selection": { "fg": "#333333", "bg": "#cce8ff" },
+    "fuzzy_selected": { "fg": "#ffffff", "bg": "#2f8f2f", "bold": true },
+    "bracket_level_1": { "fg": "#d70000", "bold": true },
+    "bracket_level_2": { "fg": "#0060c0", "bold": true },
+    "bracket_level_3": { "fg": "#a07100", "bold": true },
+    "bracket_level_4": { "fg": "#008b5e", "bold": true },
+    "bracket_level_5": { "fg": "#8b5fbf", "bold": true },
+    "bracket_level_6": { "fg": "#b45f06", "bold": true },
+    "bracket_level_7": { "fg": "#006d77", "bold": true },
+    "bracket_level_8": { "fg": "#3a86ff", "bold": true },
+    "bracket_active": { "fg": "#ffffff", "bg": "#007acc", "bold": true }
+  },
+  "syntax": {
+    "keyword": { "fg": "#af00db" },
+    "builtin": { "fg": "#005cc5" },
+    "function": { "fg": "#795e26" },
+    "type": { "fg": "#267f99" },
+    "decorator": { "fg": "#007acc" },
+    "string": { "fg": "#a31515" },
+    "comment": { "fg": "#008000" },
+    "number": { "fg": "#098658" },
+    "constant": { "fg": "#0451a5" },
+    "operator": { "fg": "#333333" },
+    "punctuation": { "fg": "#5c5c5c" },
+    "namespace": { "fg": "#267f99" },
+    "property": { "fg": "#001080" },
+    "parameter": { "fg": "#795e26" },
+    "tag": { "fg": "#800000" }
+  }
+}

@@ -2,13 +2,15 @@
   "name": "go",
   "line_comment": "//",
   "keywords": [
-    "break", "case", "chan", "const", "continue", "default", "defer", "else", "fallthrough",
-    "for", "func", "go", "goto", "if", "import", "interface", "map", "package", "range",
-    "return", "select", "struct", "switch", "type", "var"
+    "break", "case", "chan", "const", "continue", "default", "defer", "else", "fallthrough", "for",
+    "func", "go", "goto", "if", "import", "interface", "map", "package", "range", "return", "select",
+    "struct", "switch", "type", "var"
   ],
   "builtins": [
-    "append", "cap", "close", "complex", "copy", "delete", "imag", "len", "make", "new",
-    "panic", "print", "println", "real", "recover"
+    "append", "cap", "close", "complex", "copy", "delete", "imag", "len", "make", "new", "panic",
+    "print", "println", "real", "recover", "any", "comparable", "error", "bool", "byte", "rune",
+    "int", "int8", "int16", "int32", "int64", "uint", "uint8", "uint16", "uint32", "uint64",
+    "float32", "float64", "string", "uintptr"
   ],
   "string_delimiters": ["\"", "'", "`"]
 }

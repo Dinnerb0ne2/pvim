@@ -16,9 +16,52 @@ from ..core.config import AppConfig
 from ..core.theme import Theme
 
 TOKEN_RE = re.compile(
-    r"@[A-Za-z_][A-Za-z0-9_]*|\$[A-Za-z_][A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_:-]*!?|\d+(?:\.\d+)?"
+    r"@[A-Za-z_][A-Za-z0-9_]*"
+    r"|\$[A-Za-z_][A-Za-z0-9_]*"
+    r"|[A-Za-z_][A-Za-z0-9_:-]*!?"
+    r"|\d+(?:\.\d+)?"
+    r"|==|!=|<=|>=|=>|->|\+\+|--|\+=|-=|\*=|/=|%=|&&|\|\||::|\?\?"
+    r"|[+\-*/%=&|^~<>!?]"
+    r"|[(){}\[\],.;:]"
 )
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+OPERATOR_TOKENS = frozenset(
+    {
+        "==",
+        "!=",
+        "<=",
+        ">=",
+        "=>",
+        "->",
+        "++",
+        "--",
+        "+=",
+        "-=",
+        "*=",
+        "/=",
+        "%=",
+        "&&",
+        "||",
+        "::",
+        "??",
+        "+",
+        "-",
+        "*",
+        "/",
+        "%",
+        "=",
+        "&",
+        "|",
+        "^",
+        "~",
+        "<",
+        ">",
+        "!",
+        "?",
+    }
+)
+PUNCTUATION_TOKENS = frozenset({"(", ")", "{", "}", "[", "]", ",", ".", ";", ":"})
+CONSTANT_TOKENS = frozenset({"true", "false", "null", "none", "undefined", "nan", "inf", "infinity"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,6 +299,8 @@ class SyntaxManager:
                     if decorator_next:
                         style = theme.syntax_style("decorator")
                         decorator_next = False
+                    elif token_text in {"True", "False", "None"}:
+                        style = theme.syntax_style("constant")
                     elif keyword.iskeyword(token_text):
                         style = theme.syntax_style("keyword")
                     elif token_text in profile.builtins or token_text in self._python_builtins:
@@ -267,6 +312,11 @@ class SyntaxManager:
                 elif token_type == token_types.OP and token_text == "@":
                     style = theme.syntax_style("decorator")
                     decorator_next = True
+                elif token_type == token_types.OP:
+                    if token_text in PUNCTUATION_TOKENS:
+                        style = theme.syntax_style("punctuation")
+                    elif token_text in OPERATOR_TOKENS:
+                        style = theme.syntax_style("operator")
 
                 if style:
                     out.append(f"{style}{segment}{base_style}")
@@ -337,6 +387,12 @@ class SyntaxManager:
             style = ""
             if token[:1].isdigit():
                 style = theme.syntax_style("number")
+            elif token in OPERATOR_TOKENS:
+                style = theme.syntax_style("operator")
+            elif token in PUNCTUATION_TOKENS:
+                style = theme.syntax_style("punctuation")
+            elif token.lower() in CONSTANT_TOKENS:
+                style = theme.syntax_style("constant")
             elif token.startswith("@"):
                 style = theme.syntax_style("decorator")
             elif token in profile.keywords:
@@ -363,7 +419,10 @@ class SyntaxManager:
             else:
                 out.append(token)
             cursor = end
-            previous_token = token
+            if token in OPERATOR_TOKENS or token in PUNCTUATION_TOKENS:
+                previous_token = ""
+            else:
+                previous_token = token
 
         if cursor < len(segment):
             out.append(segment[cursor:])
