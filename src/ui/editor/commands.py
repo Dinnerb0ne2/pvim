@@ -14,7 +14,7 @@ from ...features.git_tools import (
 )
 from ...features.modules.git_control import GitSnapshot
 from ..layout import NotificationCenter
-from .modes import MODE_EXPLORER
+from .modes import MODE_EXPLORER, MODE_TERMINAL
 
 
 class CommandsMixin:
@@ -55,11 +55,11 @@ class CommandsMixin:
             return
 
         if cmd in {"undo", "u"}:
-            self._undo()
+            self._handle_undo_command(args)
             return
 
         if cmd in {"redo"}:
-            self._redo()
+            self._handle_undo_command(["redo", *args])
             return
 
         if cmd in {"e", "edit"} and args:
@@ -147,6 +147,10 @@ class CommandsMixin:
             self._handle_quickfix_command(args)
             return
 
+        if cmd in {"fold", "zf"}:
+            self._handle_fold_command(args)
+            return
+
         if cmd == "autocmd":
             self._handle_autocmd_command(args)
             return
@@ -155,8 +159,20 @@ class CommandsMixin:
             self._handle_var_command(args)
             return
 
+        if cmd in {"macro", "macros"}:
+            self._handle_macro_command(args)
+            return
+
         if cmd in {"clip", "clipboard"}:
             self._handle_clipboard_command(args)
+            return
+
+        if cmd in {"stdlib", "std"}:
+            self._handle_stdlib_command(args)
+            return
+
+        if cmd in {"iselect", "isel"}:
+            self._handle_incremental_select_command(args)
             return
 
         if cmd in {"find", "search"}:
@@ -383,7 +399,7 @@ class CommandsMixin:
             )
             return
 
-        if cmd == "dap":
+        if cmd in {"dap", "debug"}:
             self._handle_dap_command(args)
             return
 
@@ -437,20 +453,112 @@ class CommandsMixin:
                 command_text = " ".join(args[1:]).strip()
                 self._open_terminal(command_text or None)
                 return
+            if action in {"new", "spawn"}:
+                command_text = " ".join(args[1:]).strip()
+                self._open_terminal(command_text or None, force_new=True)
+                return
+            if action in {"split", "vsp", "hsplit"}:
+                if len(args) >= 2:
+                    token = args[1].strip().lower()
+                    if token in {"on", "1", "true"}:
+                        self._terminal_split_view = True
+                    elif token in {"off", "0", "false"}:
+                        self._terminal_split_view = False
+                    elif token in {"toggle", "tog"}:
+                        self._terminal_split_view = not self._terminal_split_view
+                    else:
+                        self._set_message("Usage: :term split [on|off|toggle]", error=True)
+                        return
+                else:
+                    self._terminal_split_view = not self._terminal_split_view
+                if self._terminal_split_view and len(self._terminal_sessions) < 2:
+                    self._open_terminal(None, force_new=True)
+                elif self._active_terminal_session() is not None:
+                    self.mode = MODE_TERMINAL
+                self._set_message(f"Terminal split {'on' if self._terminal_split_view else 'off'}.")
+                return
+            if action in {"list", "ls"}:
+                if not self._terminal_sessions:
+                    self._show_alert("(no terminal sessions)")
+                    return
+                lines: list[str] = []
+                active_id = self._terminal_process_id
+                for process_id in self._terminal_session_order:
+                    session = self._terminal_sessions.get(process_id)
+                    if session is None:
+                        continue
+                    marker = "*" if process_id == active_id else " "
+                    state = self._process_manager.status(process_id)
+                    lines.append(f"{marker} {process_id} [{state}] {session.command}")
+                if not lines:
+                    self._show_alert("(no terminal sessions)")
+                    return
+                self._show_alert("\n".join(lines))
+                return
+            if action == "use":
+                if len(args) < 2:
+                    self._set_message("Usage: :term use <id|next|prev>", error=True)
+                    return
+                token = args[1].strip().lower()
+                if token in {"next", "n"}:
+                    self._switch_terminal_relative(1)
+                    return
+                if token in {"prev", "p", "previous"}:
+                    self._switch_terminal_relative(-1)
+                    return
+                try:
+                    process_id = int(token)
+                except ValueError:
+                    self._set_message("Usage: :term use <id|next|prev>", error=True)
+                    return
+                if not self._switch_terminal_session(process_id):
+                    self._set_message(f"Terminal session not found: {process_id}", error=True)
+                    return
+                self.mode = MODE_TERMINAL
+                self._set_message(f"Terminal switched: {process_id}")
+                return
+            if action in {"next", "n"}:
+                self._switch_terminal_relative(1)
+                return
+            if action in {"prev", "p", "previous"}:
+                self._switch_terminal_relative(-1)
+                return
             if action in {"close", "hide"}:
                 self._close_terminal(kill=False)
                 self._set_message("Terminal closed.")
                 return
             if action in {"stop", "kill"}:
+                if len(args) >= 2 and args[1].strip().lower() == "all":
+                    process_ids = [pid for pid in self._terminal_session_order if pid in self._terminal_sessions]
+                    if not process_ids:
+                        self._set_message("No terminal sessions.", error=True)
+                        return
+                    for process_id in process_ids:
+                        self._process_manager.stop_sync(process_id, timeout=0.6)
+                        session = self._terminal_sessions.get(process_id)
+                        if session is None:
+                            continue
+                        if process_id == self._dap_session_process_id:
+                            self._dap_session_process_id = None
+                            self._dap_target_path = None
+                        session.output.append("[term] stop requested")
+                        if len(session.output) > 2000:
+                            session.output = session.output[-2000:]
+                    self._set_message("Terminal stop requested for all sessions.")
+                    return
                 self._close_terminal(kill=True)
                 self._set_message("Terminal stop requested.")
                 return
             if action == "status":
-                if self._terminal_process_id is None:
+                session = self._active_terminal_session()
+                if session is None:
                     self._set_message("Terminal: idle")
                     return
-                state = self._process_manager.status(self._terminal_process_id)
-                self._set_message(f"Terminal {self._terminal_process_id}: {state}")
+                state = self._process_manager.status(session.process_id)
+                self._set_message(
+                    f"Terminal {session.process_id}: {state} "
+                    f"(sessions={len(self._terminal_sessions)} split={'on' if self._terminal_split_view else 'off'})"
+                )
                 return
             if action == "history":
                 count = 40
@@ -460,11 +568,31 @@ class CommandsMixin:
                     except ValueError:
                         self._set_message("Usage: :term history [lines]", error=True)
                         return
-                lines = self._terminal_output[-count:]
+                session = self._active_terminal_session()
+                if session is None:
+                    self._set_message("Terminal is not running.", error=True)
+                    return
+                lines = session.output[-count:]
                 if not lines:
                     self._show_alert("(terminal history is empty)")
                     return
                 self._show_alert("\n".join(lines))
+                return
+            if action == "search":
+                if len(args) < 2:
+                    self._set_message("Usage: :term search <query|next|prev|clear>", error=True)
+                    return
+                token = args[1].strip().lower()
+                if token in {"next", "n"}:
+                    self._terminal_search_shift(1)
+                    return
+                if token in {"prev", "p", "previous"}:
+                    self._terminal_search_shift(-1)
+                    return
+                if token in {"clear", "cls"}:
+                    self._clear_terminal_search()
+                    return
+                self._terminal_search(" ".join(args[1:]))
                 return
             if action == "send":
                 if len(args) < 2:
@@ -473,10 +601,30 @@ class CommandsMixin:
                 self._send_terminal_input(" ".join(args[1:]))
                 return
             if action in {"clear", "cls"}:
-                self._terminal_output = []
+                if len(args) >= 2 and args[1].strip().lower() == "all":
+                    for session in self._terminal_sessions.values():
+                        session.output.clear()
+                        session.search_hits = []
+                        session.search_index = -1
+                        session.search_query = ""
+                    self._sync_active_terminal_refs()
+                    self._set_message("Terminal history cleared (all sessions).")
+                    return
+                session = self._active_terminal_session()
+                if session is None:
+                    self._set_message("Terminal is not running.", error=True)
+                    return
+                session.output.clear()
+                session.search_hits = []
+                session.search_index = -1
+                session.search_query = ""
+                self._sync_active_terminal_refs()
                 self._set_message("Terminal history cleared.")
                 return
-            self._set_message("Usage: :term [open|close|stop|status|history|send|clear] [args...]", error=True)
+            self._set_message(
+                "Usage: :term [open|new|split|list|use|next|prev|close|stop|status|history|search|send|clear] [args...]",
+                error=True,
+            )
             return
 
         if cmd == "virtual":

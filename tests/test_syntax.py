@@ -6,6 +6,7 @@ import unittest
 
 from src.core.config import AppConfig
 from src.core.theme import load_theme
+from src.features.incremental_syntax import IncrementalSyntaxModel
 from src.features.syntax import SyntaxManager
 
 
@@ -51,6 +52,47 @@ class SyntaxManagerTests(unittest.TestCase):
             rendered = self.syntax.highlight_line(line, profile, self.theme, "")
             plain = re.sub(r"\x1b\[[0-9;]*m", "", rendered)
             self.assertEqual(plain, line)
+
+    def test_incremental_syntax_model_reports_incremental_parse_window(self) -> None:
+        model = IncrementalSyntaxModel()
+        lines = [
+            "def outer():",
+            "    if ready:",
+            "        run()",
+            "    return 1",
+        ]
+        first = model.update(lines)
+        self.assertTrue(first.changed)
+        self.assertEqual(first.parsed_from, 0)
+        self.assertEqual(first.parsed_lines, len(lines))
+
+        second = model.update(lines)
+        self.assertFalse(second.changed)
+        self.assertEqual(second.parsed_lines, 0)
+
+        updated = list(lines)
+        updated[-1] = "    return 2"
+        third = model.update(updated)
+        self.assertTrue(third.changed)
+        self.assertGreaterEqual(third.parsed_from, 0)
+        self.assertLessEqual(third.parsed_from, len(updated) - 1)
+        self.assertGreaterEqual(third.parsed_lines, 1)
+
+    def test_incremental_syntax_model_builds_indent_and_brace_folds(self) -> None:
+        model = IncrementalSyntaxModel()
+        lines = [
+            "def fold_me():",
+            "    if flag:",
+            "        pass",
+            "",
+            "config = {",
+            "  'k': 1,",
+            "}",
+        ]
+        model.update(lines)
+        folds = model.folds()
+        self.assertTrue(any(item.kind == "indent" and item.start_line == 0 for item in folds))
+        self.assertTrue(any(item.kind.startswith("brace:") and item.start_line == 4 for item in folds))
 
 
 if __name__ == "__main__":

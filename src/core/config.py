@@ -208,6 +208,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "autocmds": {
             "enabled": True,
             "events": {},
+            "filetypes": {},
         },
         "scoped_vars": {
             "enabled": True,
@@ -688,10 +689,13 @@ class AppConfig:
             minimum=20,
         )
 
-    def autocmd_events(self) -> dict[str, list[str]]:
-        if not self.feature_enabled("autocmds"):
-            return {}
-        value = self._lookup("features", "autocmds", "events", default={})
+    def _parse_autocmd_event_mapping(self, value: Any) -> dict[str, list[str]]:
+        if isinstance(value, str):
+            clean = value.strip()
+            return {"bufreadpost": [clean]} if clean else {}
+        if isinstance(value, list):
+            commands = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+            return {"bufreadpost": commands} if commands else {}
         if not isinstance(value, Mapping):
             return {}
         parsed: dict[str, list[str]] = {}
@@ -709,6 +713,42 @@ class AppConfig:
                 command_list = []
             parsed[event_key] = command_list
         return parsed
+
+    def autocmd_events(self) -> dict[str, list[str]]:
+        if not self.feature_enabled("autocmds"):
+            return {}
+        value = self._lookup("features", "autocmds", "events", default={})
+        return self._parse_autocmd_event_mapping(value)
+
+    def autocmd_filetype_events(self, *, language_id: str = "", extension: str = "") -> dict[str, list[str]]:
+        if not self.feature_enabled("autocmds"):
+            return {}
+        value = self._lookup("features", "autocmds", "filetypes", default={})
+        if not isinstance(value, Mapping):
+            return {}
+        language = language_id.strip().lower()
+        suffix = extension.strip().lower().lstrip(".")
+        dotted_suffix = f".{suffix}" if suffix else ""
+        accepted = {"*"}
+        if language:
+            accepted.add(language)
+        if suffix:
+            accepted.add(suffix)
+            accepted.add(dotted_suffix)
+        merged: dict[str, list[str]] = {}
+        for filetype, event_map in value.items():
+            if not isinstance(filetype, str):
+                continue
+            key = filetype.strip().lower()
+            if key not in accepted:
+                continue
+            parsed = self._parse_autocmd_event_mapping(event_map)
+            for event, commands in parsed.items():
+                target = merged.setdefault(event, [])
+                for command in commands:
+                    if command not in target:
+                        target.append(command)
+        return merged
 
     def scoped_variables_enabled(self) -> bool:
         return self.feature_enabled("scoped_vars")

@@ -3,13 +3,16 @@ from __future__ import annotations
 import asyncio
 import cProfile
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import io
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import pstats
 import re
+import shutil
 import subprocess
 import time
 import traceback
@@ -32,8 +35,16 @@ from ...features.file_index import FileIndex
 from ...features.formatter import normalize_code_style, organize_python_imports
 from ...features.fuzzy import fuzzy_filter
 from ...features.git_status import GitStatusProvider
+from ...features.incremental_syntax import FoldRange, IncrementalSyntaxModel, ParseSummary
 from ...features.lsp import LspClient
 from ...features.live_grep import GrepMatch, LiveGrep
+from ...features.stdlib_bridge import (
+    deep_merge_dicts,
+    fetch_http_text,
+    python_source_summary,
+    read_json_mapping,
+    validate_required_keys,
+)
 from ...features.modules import FileTreeFeature, GitControlFeature, TabCompletionFeature
 from ...features.modules.git_control import GitSnapshot
 from ...features.refactor import find_next, rename_symbol, replace_all, replace_next, word_at_cursor
@@ -73,6 +84,17 @@ class QuickfixItem:
     line: int
     col: int
     text: str
+
+
+@dataclass(slots=True)
+class TerminalSession:
+    process_id: int
+    command: str
+    output: list[str] = field(default_factory=list)
+    scroll: int = 0
+    search_query: str = ""
+    search_hits: list[int] = field(default_factory=list)
+    search_index: int = -1
 
 
 class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
@@ -161,14 +183,31 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._runtime_root = Path.cwd().resolve()
         self._session_path = self._runtime_root / "session" / "current.json"
         self._session_profiles_dir = self._runtime_root / "session" / "profiles"
+        self._runtime_logger: logging.Logger | None = None
+        self._runtime_logger_path: Path | None = None
         self._autocmd_events: dict[str, list[str]] = {}
+        self._autocmd_filetype_events: dict[str, list[str]] = {}
         self._autocmd_depth = 0
         self._soft_wrap_enabled = True
         self._global_vars: dict[str, str] = {}
-        self._window_vars: dict[str, str] = {}
+        self._window_vars: dict[str, dict[str, str]] = {}
         self._buffer_vars: dict[str, dict[str, str]] = {}
         self._clipboard_cache = ""
         self._dap_breakpoints: dict[str, set[int]] = {}
+        self._dap_session_process_id: int | None = None
+        self._dap_target_path: Path | None = None
+        self._syntax_model = IncrementalSyntaxModel()
+        self._fold_ranges: tuple[FoldRange, ...] = ()
+        self._fold_collapsed: set[int] = set()
+        self._syntax_parse_summary = ParseSummary(
+            changed=False,
+            changed_start=-1,
+            changed_end=-1,
+            parsed_from=-1,
+            parsed_lines=0,
+        )
+        self._incremental_select_ranges: list[tuple[int, int, int, int, str]] = []
+        self._incremental_select_index = -1
 
         self.key_hints_enabled = True
         self.key_hints_trigger = "F1"
@@ -231,6 +270,9 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._terminal_output: list[str] = []
         self._terminal_input = ""
         self._terminal_scroll = 0
+        self._terminal_sessions: dict[int, TerminalSession] = {}
+        self._terminal_session_order: list[int] = []
+        self._terminal_split_view = False
         self._theme_manager = ThemeManager(
             builtin_dirs=[Path.cwd(), Path.cwd() / "themes"],
             user_dir=Path.cwd() / "themes",
@@ -259,6 +301,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._register_feature_descriptors()
 
         self._apply_runtime_config()
+        self._history.set_root_snapshot(self._capture_snapshot())
 
         if file_path is not None:
             target = file_path.expanduser()
@@ -376,6 +419,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         if self._current_encoding not in self._encoding_candidates:
             self._current_encoding = self._encoding_candidates[0]
         self._runtime_root = self.config.runtime_directory()
+        self._load_macro_store(noisy=False)
         self._load_shortcut_overrides()
         self._session_enabled = self.config.session_enabled()
         self._session_restore_on_startup = self.config.session_restore_on_startup()
@@ -388,6 +432,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._config_watch_enabled = self.config.config_reload_enabled()
         self._config_watch_interval = self.config.config_reload_interval_seconds()
         self._autocmd_events = self.config.autocmd_events()
+        self._refresh_filetype_autocmds(self.file_path)
         self._history_enabled = self.config.undo_tree_enabled()
         self._history.set_limit(self.config.undo_tree_max_actions())
         self._feature_registry.set_enabled("tabline", self.config.feature_enabled("tabline"))
@@ -455,6 +500,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self.file_path is None or len(self.lines) >= self.config.piece_table_line_threshold()
         )
         self.buffer.configure_piece_table(use_piece_table)
+        self._sync_incremental_syntax(force=True)
         self._auto_pairs = self._load_auto_pairs()
         self._auto_pair_closers = set(self._auto_pairs.values())
         bracket_styles = [
@@ -785,6 +831,9 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             "  n repeat last search",
             "  q a ... q record macro / @a replay",
             "  ciw da\" vap cif text objects",
+            "  dib dab di( da( di[ da[ di{ da{ bracket text objects",
+            "  gv / gV incremental selection expand/shrink",
+            "  za / zo / zc syntax fold toggle/open/close",
             "",
             "Tools",
             "  Ctrl+F quick find",
@@ -822,28 +871,34 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             "  :profile script <path>",
             "  :piece",
             "  :termcaps",
+            "  :stdlib config-validate|config-merge|http-get|py-analyze|log-tail",
             "  :theme list | :theme <name>",
             "  :workspace",
             "  :runtime show runtime-managed storage paths",
             "  :project <dir> open folder workspace",
             "  :split / :vsplit / :only / :wincmd w|h|l|q",
-            "  :term [cmd] built-in terminal panel",
+            "  :term open|new|split|list|use|search built-in terminal sessions",
             "  :git status|diff|blame|stage|unstage|branches|checkout",
             "  :encoding [name]",
             "  :session save|load|list  (optional profile name)",
             "  :swap write|clear",
             "  :keys list|set|unset|conflicts|reset",
-            "  :quickfix list|next|prev|clear|fromgrep|fromdiag",
+            "  :quickfix list|jump|next|prev|first|last|clear|fromgrep|fromdiag",
+            "  :fold list|refresh|toggle|open|close|next|prev",
             "  :autocmd list|reload|run <event>",
             "  :var set|get|list|unset ...",
             "  :clip copy|paste|show",
+            "  :iselect expand|shrink|reset|list",
+            "  :macro list|show|record|stop|play|clear|save|load",
+            "  :undo tree|restore <node-id>|branch-prev|branch-next",
             "  :theme install|uninstall|list|<name>",
             "  :tree open|refresh|close|toggle|sort|filter|clear-filter|hidden  (Tab/- fold)",
             "  :feature <name> <on|off>",
             "  :syntax reload",
+            "  :help topics|search <keyword>|jump <topic>",
             "  :jump back|forward|list",
             "  :lsp status|start|stop|refs|impl|symbols|wsymbol|rename|format",
-            "  :dap status|start|stop|continue|next|step|where|break ...",
+            "  :dap status|start|stop|continue|next|step|where|up|down|out|vars|print|console|break ...",
             "  :diag show LSP diagnostics",
         ]
         return lines
@@ -994,59 +1049,184 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._set_message("Usage: :keys list|set|unset|conflicts|reset", error=True)
         return False
 
-    def _help_text(self, topic: str = "") -> str:
-        clean = topic.strip().lower()
-        if clean in {"quickfix", "qf"}:
-            return (
+    def _help_topics_catalog(self) -> dict[str, str]:
+        return {
+            "quickfix": (
                 "Quickfix\n\n"
-                ":quickfix list|next|prev|clear\n"
+                ":quickfix list\n"
+                ":quickfix jump <index>\n"
+                ":quickfix next|prev|first|last\n"
+                ":quickfix clear\n"
                 ":quickfix fromgrep [query]\n"
                 ":quickfix fromdiag"
-            )
-        if clean in {"autocmd", "ac"}:
-            return (
+            ),
+            "fold": (
+                "Syntax Fold\n\n"
+                ":fold list\n"
+                ":fold refresh\n"
+                ":fold toggle [line]\n"
+                ":fold open|close [line]\n"
+                ":fold next|prev"
+            ),
+            "iselect": (
+                "Incremental Selection\n\n"
+                ":iselect expand\n"
+                ":iselect shrink\n"
+                ":iselect reset\n"
+                ":iselect list\n\n"
+                "Normal mode shortcuts: gv (expand), gV (shrink)"
+            ),
+            "autocmd": (
                 "Autocmds\n\n"
-                "Configure in pvim.config.json -> features.autocmds.events\n"
+                "Configure in pvim.config.json -> features.autocmds.events / features.autocmds.filetypes\n"
                 "Supported events: bufreadpre, bufreadpost, bufwritepre, bufwritepost\n"
+                "Filetype keys: python / .py / *\n"
                 ":autocmd list|reload|run <event>"
-            )
-        if clean in {"var", "vars"}:
-            return (
+            ),
+            "var": (
                 "Scoped Vars\n\n"
                 ":var set <g:name|w:name|b:name> <value>\n"
                 ":var get <g:name|w:name|b:name>\n"
                 ":var list [g|w|b]\n"
-                ":var unset <g:name|w:name|b:name>"
-            )
-        if clean in {"clip", "clipboard"}:
-            return (
+                ":var unset <g:name|w:name|b:name>\n\n"
+                "w: scope is isolated by current split pane (main/secondary)."
+            ),
+            "clip": (
                 "Clipboard\n\n"
                 ":clip copy [text]\n"
                 ":clip paste\n"
-                ":clip show"
-            )
-        if clean in {"dap", "debug"}:
-            return (
+                ":clip show\n\n"
+                "Adapters: Windows clip/Get-Clipboard, macOS pbcopy/pbpaste, Linux wl-copy/wl-paste/xclip/xsel, fallback tkinter."
+            ),
+            "dap": (
                 "DAP (pdb backend)\n\n"
                 ":dap status\n"
                 ":dap start [python_file]\n"
-                ":dap break add|remove|list|clear [line]\n"
-                ":dap continue|next|step|where|stop"
-            )
-        return (
-            "PVIM Help\n\n"
+                ":dap continue|next|step|where|up|down|out|stop\n"
+                ":dap vars|globals|print <expr>\n"
+                ":dap console <pdb-command>\n"
+                ":dap log [lines]\n"
+                ":dap break add|remove|list|clear [line]"
+            ),
+            "term": (
+                "Terminal\n\n"
+                ":term open [cmd]\n"
+                ":term new [cmd]\n"
+                ":term split [on|off|toggle]\n"
+                ":term list|use <id|next|prev>|next|prev\n"
+                ":term history [lines]\n"
+                ":term search <query|next|prev|clear>\n"
+                ":term send <text>\n"
+                ":term clear [all]\n"
+                ":term close|stop [all]"
+            ),
+            "macro": (
+                "Macros\n\n"
+                "Normal mode: q{register} ... q, @{register}\n"
+                ":macro list|show <reg>|record <reg>|stop\n"
+                ":macro play <reg> [count]\n"
+                ":macro clear [reg|all]\n"
+                ":macro save|load"
+            ),
+            "undo": (
+                "Undo Tree\n\n"
+                "u undo, Ctrl+R redo, g- / g+ branch switch\n"
+                ":undo tree\n"
+                ":undo restore <node-id>\n"
+                ":undo branch-prev|branch-next"
+            ),
+            "stdlib": (
+                "Stdlib Toolkit\n\n"
+                ":stdlib config-validate <json-path> [required.keys,...]\n"
+                ":stdlib config-merge <base-json> <override-json> [output-json]\n"
+                ":stdlib http-get <url> [timeout-seconds]\n"
+                ":stdlib py-analyze [python-file]\n"
+                ":stdlib log-tail [lines]"
+            ),
+        }
+
+    def _help_topic_aliases(self) -> dict[str, str]:
+        return {
+            "qf": "quickfix",
+            "zf": "fold",
+            "isel": "iselect",
+            "selection": "iselect",
+            "ac": "autocmd",
+            "vars": "var",
+            "clipboard": "clip",
+            "debug": "dap",
+            "terminal": "term",
+            "macros": "macro",
+            "history": "undo",
+            "std": "stdlib",
+        }
+
+    def _help_topics_overview(self) -> str:
+        topics = sorted(self._help_topics_catalog().keys())
+        lines = [
+            "PVIM Help",
+            "",
+            "Usage:",
+            "  :help topics",
+            "  :help search <keyword>",
+            "  :help jump <topic>",
+            "  :help <topic>",
+            "",
+            "Topics:",
+            "  " + ", ".join(topics),
+            "",
             "Commands: :w :q :e :split/:vsplit/:only :wincmd :find/:findre :replace/:replacere "
             ":replaceall/:replaceallre :replaceproj/:replaceprojre :encoding :project :term "
             ":rename :format :fuzzy :grep :tree :theme :feature :workspace :runtime :session :swap "
-            ":keys :script :plugin :proc :virtual :ast :profile :piece :termcaps :syntax :git :jump "
-            ":lsp :diag :codeaction :dap :quickfix :autocmd :var :clip"
-        )
+            ":keys :script :plugin :proc :virtual :ast :profile :piece :termcaps :stdlib :syntax :git :jump "
+            ":lsp :diag :codeaction :dap :quickfix :fold :autocmd :var :clip :iselect :macro :undo",
+        ]
+        return "\n".join(lines)
+
+    def _help_search(self, keyword: str) -> str:
+        clean = keyword.strip().lower()
+        if not clean:
+            return "Usage: :help search <keyword>"
+        catalog = self._help_topics_catalog()
+        aliases = self._help_topic_aliases()
+        rows: list[str] = []
+        for topic in sorted(catalog.keys()):
+            body = catalog[topic]
+            haystack = f"{topic}\n{body}".lower()
+            if clean not in haystack:
+                continue
+            first_line = body.splitlines()[0] if body else topic
+            rows.append(f"{topic}: {first_line}")
+        for alias, topic in sorted(aliases.items()):
+            if clean in alias.lower():
+                rows.append(f"{alias} -> {topic}")
+        if not rows:
+            return f"No help matches for '{keyword}'."
+        return "Help search results\n\n" + "\n".join(dict.fromkeys(rows))
+
+    def _help_text(self, topic: str = "") -> str:
+        clean = topic.strip().lower()
+        if not clean or clean in {"topics", "topic", "list", "index"}:
+            return self._help_topics_overview()
+        if clean.startswith("search "):
+            return self._help_search(clean[7:])
+        if clean.startswith("jump "):
+            clean = clean[5:].strip()
+        if clean.startswith("open "):
+            clean = clean[5:].strip()
+        aliases = self._help_topic_aliases()
+        catalog = self._help_topics_catalog()
+        resolved = aliases.get(clean, clean)
+        if resolved in catalog:
+            return catalog[resolved]
+        return self._help_search(clean)
 
     def _run_autocmds(self, event_name: str) -> None:
         event = event_name.strip().lower()
         if not event:
             return
-        commands = self._autocmd_events.get(event, [])
+        commands = list(self._autocmd_events.get(event, []))
+        commands.extend(self._autocmd_filetype_events.get(event, []))
         if not commands:
             return
         if self._autocmd_depth >= 4:
@@ -1065,18 +1245,23 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
     def _handle_autocmd_command(self, args: list[str]) -> bool:
         action = args[0].strip().lower() if args else "list"
         if action in {"list", "ls"}:
-            if not self._autocmd_events:
+            if not self._autocmd_events and not self._autocmd_filetype_events:
                 self._show_alert("(no autocmds configured)")
                 return True
             lines: list[str] = []
             for event, commands in sorted(self._autocmd_events.items()):
-                lines.append(f"[{event}]")
+                lines.append(f"[global:{event}]")
+                for command in commands:
+                    lines.append(f"  {command}")
+            for event, commands in sorted(self._autocmd_filetype_events.items()):
+                lines.append(f"[filetype:{event}]")
                 for command in commands:
                     lines.append(f"  {command}")
             self._show_alert("\n".join(lines))
             return True
         if action in {"reload", "refresh"}:
             self._autocmd_events = self.config.autocmd_events()
+            self._refresh_filetype_autocmds(self.file_path)
             self._set_message("Autocmds reloaded.")
             return True
         if action == "run":
@@ -1093,16 +1278,32 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._set_message("Usage: :autocmd list|reload|run <event>", error=True)
         return False
 
+    def _refresh_filetype_autocmds(self, path: Path | None) -> None:
+        if path is None:
+            self._autocmd_filetype_events = {}
+            return
+        language_id = self._language_id_for_file(path)
+        self._autocmd_filetype_events = self.config.autocmd_filetype_events(
+            language_id=language_id,
+            extension=path.suffix,
+        )
+
     def _current_buffer_scope_key(self) -> str:
         if self.file_path is None:
             return "__no_name__"
         return str(self.file_path.resolve())
 
+    def _current_window_scope_key(self) -> str:
+        if not self._split_enabled:
+            return "main"
+        return self._split_focus if self._split_focus in {"main", "secondary"} else "main"
+
     def _scope_bucket(self, scope: str) -> dict[str, str] | None:
         if scope == "g":
             return self._global_vars
         if scope == "w":
-            return self._window_vars
+            key = self._current_window_scope_key()
+            return self._window_vars.setdefault(key, {})
         if scope == "b":
             key = self._current_buffer_scope_key()
             return self._buffer_vars.setdefault(key, {})
@@ -1147,7 +1348,10 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                 self._set_message("Invalid variable scope.", error=True)
                 return False
             bucket[key] = " ".join(args[2:])
-            self._set_message(f"Var set: {scope}:{key}")
+            if scope == "w":
+                self._set_message(f"Var set: {scope}:{key}@{self._current_window_scope_key()}")
+            else:
+                self._set_message(f"Var set: {scope}:{key}")
             return True
         if action == "get":
             if len(args) < 2:
@@ -1165,13 +1369,32 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             if key not in bucket:
                 self._set_message(f"Var not found: {scope}:{key}", error=True)
                 return False
-            self._set_message(f"{scope}:{key}={bucket[key]}")
+            if scope == "w":
+                self._set_message(f"{scope}:{key}@{self._current_window_scope_key()}={bucket[key]}")
+            else:
+                self._set_message(f"{scope}:{key}={bucket[key]}")
             return True
         if action in {"list", "ls"}:
             requested = args[1].strip().lower() if len(args) >= 2 else ""
             scopes = [requested] if requested in {"g", "w", "b"} else ["g", "w", "b"]
             lines: list[str] = []
             for scope in scopes:
+                if scope == "w":
+                    window_keys = sorted(self._window_vars.keys())
+                    current_window = self._current_window_scope_key()
+                    if requested == "w":
+                        window_keys = [current_window]
+                    elif current_window not in window_keys:
+                        window_keys.append(current_window)
+                    for window_key in window_keys:
+                        bucket = self._window_vars.setdefault(window_key, {})
+                        lines.append(f"[w:{window_key}]")
+                        if not bucket:
+                            lines.append("  (empty)")
+                            continue
+                        for key, value in sorted(bucket.items()):
+                            lines.append(f"  {key}={value}")
+                    continue
                 bucket = self._scope_bucket(scope)
                 if bucket is None:
                     continue
@@ -1197,10 +1420,43 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                 self._set_message(f"Var not found: {scope}:{key}", error=True)
                 return False
             bucket.pop(key, None)
-            self._set_message(f"Var unset: {scope}:{key}")
+            if scope == "w":
+                self._set_message(f"Var unset: {scope}:{key}@{self._current_window_scope_key()}")
+            else:
+                self._set_message(f"Var unset: {scope}:{key}")
             return True
         self._set_message("Usage: :var set|get|list|unset ...", error=True)
         return False
+
+    def _write_tk_clipboard(self, text: str) -> bool:
+        try:
+            import tkinter as tk
+        except Exception:
+            return False
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            root.clipboard_clear()
+            root.clipboard_append(text)
+            root.update()
+            root.destroy()
+        except Exception:
+            return False
+        return True
+
+    def _read_tk_clipboard(self) -> str | None:
+        try:
+            import tkinter as tk
+        except Exception:
+            return None
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            text = root.clipboard_get()
+            root.destroy()
+        except Exception:
+            return None
+        return text.replace("\r\n", "\n")
 
     def _write_system_clipboard(self, text: str) -> bool:
         if not self.config.clipboard_enabled():
@@ -1218,7 +1474,39 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             except (OSError, subprocess.SubprocessError):
                 return False
             return True
-        return False
+        if shutil.which("pbcopy"):
+            try:
+                subprocess.run(
+                    ["pbcopy"],
+                    input=text,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=0.8,
+                    check=True,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return False
+            return True
+        for command in (
+            ["wl-copy", "--type", "text/plain"],
+            ["xclip", "-selection", "clipboard"],
+            ["xsel", "--clipboard", "--input"],
+        ):
+            if shutil.which(command[0]) is None:
+                continue
+            try:
+                subprocess.run(
+                    command,
+                    input=text,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=0.8,
+                    check=True,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            return True
+        return self._write_tk_clipboard(text)
 
     def _read_system_clipboard(self) -> str | None:
         if not self.config.clipboard_enabled():
@@ -1238,7 +1526,42 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             if result.returncode != 0:
                 return None
             return result.stdout.replace("\r\n", "\n")
-        return None
+        if shutil.which("pbpaste"):
+            try:
+                result = subprocess.run(
+                    ["pbpaste"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=0.8,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return None
+            if result.returncode == 0:
+                return result.stdout.replace("\r\n", "\n")
+            return None
+        for command in (
+            ["wl-paste", "--no-newline"],
+            ["xclip", "-selection", "clipboard", "-o"],
+            ["xsel", "--clipboard", "--output"],
+        ):
+            if shutil.which(command[0]) is None:
+                continue
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=0.8,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if result.returncode == 0:
+                return result.stdout.replace("\r\n", "\n")
+        return self._read_tk_clipboard()
 
     def _insert_clipboard_text(self, text: str) -> bool:
         normalized = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -1294,6 +1617,195 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._show_alert(text[:7000])
             return True
         self._set_message("Usage: :clip copy|paste|show [text]", error=True)
+        return False
+
+    def _runtime_log_file(self) -> Path:
+        return (self._runtime_root / "logs" / "pvim.log").resolve()
+
+    def _ensure_runtime_logger(self) -> logging.Logger:
+        path = self._runtime_log_file()
+        if self._runtime_logger is not None and self._runtime_logger_path == path:
+            return self._runtime_logger
+        path.parent.mkdir(parents=True, exist_ok=True)
+        logger = logging.getLogger("pvim.runtime")
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+        handler = RotatingFileHandler(path, maxBytes=512_000, backupCount=3, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        logger.addHandler(handler)
+        self._runtime_logger = logger
+        self._runtime_logger_path = path
+        return logger
+
+    def _runtime_log(self, level: int, message: str) -> None:
+        try:
+            logger = self._ensure_runtime_logger()
+            logger.log(level, message)
+        except OSError:
+            pass
+
+    def _runtime_log_tail(self, lines: int) -> list[str]:
+        path = self._runtime_log_file()
+        if not path.exists():
+            return []
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            return []
+        split = content.splitlines()
+        return split[-max(1, lines) :]
+
+    def _handle_stdlib_command(self, args: list[str]) -> bool:
+        if not args:
+            self._set_message(
+                "Usage: :stdlib config-validate|config-merge|http-get|py-analyze|log-tail ...",
+                error=True,
+            )
+            return False
+        action = args[0].strip().lower()
+
+        if action in {"config-validate", "validate"}:
+            if len(args) < 2:
+                self._set_message("Usage: :stdlib config-validate <json-path> [required.keys,...]", error=True)
+                return False
+            target = self._resolve_path(args[1])
+            required_keys: list[str] = ["python.required", "editor.tab_size"]
+            if len(args) >= 3:
+                required_keys = []
+                for chunk in args[2:]:
+                    parts = [item.strip() for item in chunk.split(",") if item.strip()]
+                    required_keys.extend(parts)
+            try:
+                payload = read_json_mapping(str(target))
+            except Exception as exc:
+                self._set_message(f"Config validate failed: {exc}", error=True)
+                self._runtime_log(logging.ERROR, f"config-validate failed: {target} -> {exc}")
+                return False
+            missing = validate_required_keys(payload, required_keys)
+            if missing:
+                self._set_message(f"Config missing keys: {', '.join(missing)}", error=True)
+                self._runtime_log(logging.WARNING, f"config-validate missing keys in {target}: {missing}")
+                return False
+            self._set_message(f"Config valid: {target.name}")
+            self._runtime_log(logging.INFO, f"config-validate ok: {target}")
+            return True
+
+        if action in {"config-merge", "merge"}:
+            if len(args) < 3:
+                self._set_message("Usage: :stdlib config-merge <base-json> <override-json> [output-json]", error=True)
+                return False
+            base_path = self._resolve_path(args[1])
+            override_path = self._resolve_path(args[2])
+            output_path = self._resolve_path(args[3]) if len(args) >= 4 else None
+            try:
+                base_payload = read_json_mapping(str(base_path))
+                override_payload = read_json_mapping(str(override_path))
+                merged = deep_merge_dicts(base_payload, override_payload)
+            except Exception as exc:
+                self._set_message(f"Config merge failed: {exc}", error=True)
+                self._runtime_log(logging.ERROR, f"config-merge failed: {base_path} + {override_path} -> {exc}")
+                return False
+            rendered = json.dumps(merged, ensure_ascii=False, indent=2)
+            if output_path is not None:
+                try:
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    output_path.write_text(rendered, encoding="utf-8")
+                except OSError as exc:
+                    self._set_message(f"Config merge write failed: {exc}", error=True)
+                    self._runtime_log(logging.ERROR, f"config-merge write failed: {output_path} -> {exc}")
+                    return False
+                self._set_message(f"Config merged: {output_path}")
+                self._runtime_log(logging.INFO, f"config-merge wrote: {output_path}")
+                return True
+            self._show_alert(rendered[:7000])
+            self._set_message("Config merged (preview).")
+            self._runtime_log(logging.INFO, "config-merge preview")
+            return True
+
+        if action in {"http-get", "http"}:
+            if len(args) < 2:
+                self._set_message("Usage: :stdlib http-get <url> [timeout-seconds]", error=True)
+                return False
+            url = args[1].strip()
+            timeout = 5.0
+            if len(args) >= 3:
+                try:
+                    timeout = max(0.2, float(args[2]))
+                except ValueError:
+                    self._set_message("Usage: :stdlib http-get <url> [timeout-seconds]", error=True)
+                    return False
+            try:
+                result = fetch_http_text(url, timeout=timeout)
+            except Exception as exc:
+                self._set_message(f"HTTP request failed: {exc}", error=True)
+                self._runtime_log(logging.ERROR, f"http-get failed: {url} -> {exc}")
+                return False
+            body = result.body
+            if "json" in result.content_type.lower():
+                try:
+                    body = json.dumps(json.loads(body), ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+            preview = body[:7000]
+            self._show_alert(f"HTTP {result.status} {result.url}\n{result.content_type}\n\n{preview}")
+            self._set_message(f"HTTP {result.status}: {result.url}")
+            self._runtime_log(logging.INFO, f"http-get {result.status}: {result.url}")
+            return True
+
+        if action in {"py-analyze", "analyze"}:
+            if len(args) >= 2:
+                target = self._resolve_path(args[1])
+            else:
+                if self.file_path is None:
+                    self._set_message("Usage: :stdlib py-analyze <python-file>", error=True)
+                    return False
+                target = self.file_path
+            try:
+                source = target.read_text(encoding="utf-8")
+                summary = python_source_summary(source)
+            except Exception as exc:
+                self._set_message(f"Analyze failed: {exc}", error=True)
+                self._runtime_log(logging.ERROR, f"py-analyze failed: {target} -> {exc}")
+                return False
+            self._show_alert(
+                "\n".join(
+                    [
+                        f"file: {target}",
+                        f"lines: {summary['lines']}",
+                        f"functions: {summary['functions']}",
+                        f"classes: {summary['classes']}",
+                        f"imports: {summary['imports']}",
+                        f"tokens: {summary['tokens']}",
+                    ]
+                )
+            )
+            self._set_message(f"Analyze done: {target.name}")
+            self._runtime_log(logging.INFO, f"py-analyze: {target}")
+            return True
+
+        if action in {"log-tail", "logs"}:
+            count = 40
+            if len(args) >= 2:
+                try:
+                    count = max(1, int(args[1]))
+                except ValueError:
+                    self._set_message("Usage: :stdlib log-tail [lines]", error=True)
+                    return False
+            rows = self._runtime_log_tail(count)
+            if not rows:
+                self._show_alert("(runtime log is empty)")
+                return True
+            self._show_alert("\n".join(rows))
+            self._set_message(f"Runtime log tail: {len(rows)} line(s)")
+            return True
+
+        self._set_message(
+            "Usage: :stdlib config-validate|config-merge|http-get|py-analyze|log-tail ...",
+            error=True,
+        )
         return False
 
     def _quickfix_label(self, item: QuickfixItem) -> str:
@@ -1420,7 +1932,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._set_message("Quickfix is disabled in config.", error=True)
             return False
         action = args[0].strip().lower() if args else "list"
-        if action in {"list", "ls", "open"}:
+        if action in {"list", "ls"}:
             if not self._quickfix_items:
                 self._show_alert("(quickfix is empty)")
                 return True
@@ -1434,6 +1946,20 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             return self._quickfix_shift(1)
         if action in {"prev", "previous", "p"}:
             return self._quickfix_shift(-1)
+        if action in {"jump", "j", "open"}:
+            if len(args) < 2:
+                self._set_message("Usage: :quickfix jump <index>", error=True)
+                return False
+            try:
+                index = int(args[1]) - 1
+            except ValueError:
+                self._set_message("Usage: :quickfix jump <index>", error=True)
+                return False
+            return self._quickfix_jump(index)
+        if action in {"first", "head"}:
+            return self._quickfix_jump(0)
+        if action in {"last", "tail"}:
+            return self._quickfix_jump(len(self._quickfix_items) - 1)
         if action == "clear":
             self._quickfix_items = []
             self._quickfix_index = -1
@@ -1444,7 +1970,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         if action in {"fromdiag", "diag", "diagnostics"}:
             return self._quickfix_from_diagnostics()
         self._set_message(
-            "Usage: :quickfix list|next|prev|clear|fromgrep [query]|fromdiag",
+            "Usage: :quickfix list|jump <index>|next|prev|first|last|clear|fromgrep [query]|fromdiag",
             error=True,
         )
         return False
@@ -1456,16 +1982,62 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         key = self._dap_path_key(path)
         return self._dap_breakpoints.setdefault(key, set())
 
+    def _dap_active_session(self) -> TerminalSession | None:
+        if self._dap_session_process_id is None:
+            return None
+        return self._terminal_sessions.get(self._dap_session_process_id)
+
+    def _dap_is_running(self) -> bool:
+        if self._dap_session_process_id is None:
+            return False
+        return self._process_manager.status(self._dap_session_process_id) == "running"
+
+    def _dap_send_console(self, command: str) -> bool:
+        clean = command.strip()
+        if not clean:
+            self._set_message("DAP console command is empty.", error=True)
+            return False
+        session = self._dap_active_session()
+        if session is None or not self._dap_is_running():
+            self._set_message("DAP is not running.", error=True)
+            return False
+        active_before = self._terminal_process_id
+        self._switch_terminal_session(session.process_id)
+        self._send_terminal_input(clean)
+        if active_before is not None and active_before != session.process_id:
+            self._switch_terminal_session(active_before)
+        return True
+
+    def _dap_sync_breakpoint(self, *, path: Path, line: int, add: bool) -> None:
+        if not self._dap_is_running():
+            return
+        session = self._dap_active_session()
+        if session is None:
+            return
+        resolved = path.resolve()
+        if self._dap_target_path is not None and resolved == self._dap_target_path:
+            command = f"b {line}" if add else f"cl {line}"
+        else:
+            command = f"b {resolved}:{line}" if add else f"cl {resolved}:{line}"
+        active_before = self._terminal_process_id
+        self._switch_terminal_session(session.process_id)
+        self._send_terminal_input(command)
+        if active_before is not None and active_before != session.process_id:
+            self._switch_terminal_session(active_before)
+
     def _handle_dap_command(self, args: list[str]) -> bool:
         if not self.config.dap_enabled():
             self._set_message("DAP is disabled in config.", error=True)
             return False
         action = args[0].strip().lower() if args else "status"
         if action == "status":
-            running = self._terminal_process_id is not None and self._process_manager.status(self._terminal_process_id) == "running"
+            running = self._dap_is_running()
             total_breakpoints = sum(len(lines) for lines in self._dap_breakpoints.values())
+            session_id = self._dap_session_process_id if self._dap_session_process_id is not None else "-"
+            target = self._dap_target_path.name if self._dap_target_path is not None else "-"
             self._set_message(
-                f"DAP(pdb): {'running' if running else 'idle'} | breakpoints={total_breakpoints}"
+                f"DAP(pdb): {'running' if running else 'idle'} "
+                f"| session={session_id} target={target} breakpoints={total_breakpoints}"
             )
             return True
         if action in {"start", "run"}:
@@ -1482,34 +2054,116 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                 return False
             python_cmd = self.config.dap_python_command()
             command = f'{python_cmd} -m pdb "{target}"'
-            if not self._open_terminal(command):
+            if not self._open_terminal(command, force_new=True):
                 return False
-            for line in sorted(self._dap_breakpoint_set(target)):
-                self._send_terminal_input(f"b {target}:{line}")
+            session = self._active_terminal_session()
+            if session is None:
+                self._set_message("DAP start failed: terminal session missing.", error=True)
+                return False
+            resolved_target = target.resolve()
+            self._dap_session_process_id = session.process_id
+            self._dap_target_path = resolved_target
+            for line in sorted(self._dap_breakpoint_set(resolved_target)):
+                self._dap_send_console(f"b {line}")
             self._set_message(f"DAP started: {target.name}")
             return True
         if action in {"stop", "close"}:
-            self._close_terminal(kill=True)
+            process_id = self._dap_session_process_id
+            if process_id is None:
+                self._set_message("DAP is not running.", error=True)
+                return False
+            self._process_manager.stop_sync(process_id, timeout=0.6)
+            session = self._terminal_sessions.get(process_id)
+            if session is not None:
+                session.output.append("[dap] stop requested")
+                if len(session.output) > 2000:
+                    session.output = session.output[-2000:]
+            if self._terminal_process_id == process_id:
+                self._close_terminal(kill=False)
+            self._dap_session_process_id = None
+            self._dap_target_path = None
             self._set_message("DAP stopped.")
             return True
         if action in {"continue", "c"}:
-            self._send_terminal_input("c")
+            if not self._dap_send_console("c"):
+                return False
             self._set_message("DAP continue.")
             return True
         if action in {"next", "n"}:
-            self._send_terminal_input("n")
+            if not self._dap_send_console("n"):
+                return False
             self._set_message("DAP next.")
             return True
         if action in {"step", "s"}:
-            self._send_terminal_input("s")
+            if not self._dap_send_console("s"):
+                return False
             self._set_message("DAP step.")
             return True
         if action in {"where", "bt", "stack"}:
-            self._send_terminal_input("w")
+            if not self._dap_send_console("w"):
+                return False
             self._set_message("DAP stack trace requested.")
             return True
-        if action == "break":
+        if action in {"up", "down", "out"}:
+            command = "u" if action == "up" else ("d" if action == "down" else "r")
+            if not self._dap_send_console(command):
+                return False
+            self._set_message(f"DAP {action}.")
+            return True
+        if action in {"vars", "locals"}:
+            if not self._dap_send_console("p locals()"):
+                return False
+            self._set_message("DAP locals requested.")
+            return True
+        if action == "globals":
+            if not self._dap_send_console("p globals()"):
+                return False
+            self._set_message("DAP globals requested.")
+            return True
+        if action in {"print", "eval", "p"}:
+            if len(args) < 2:
+                self._set_message("Usage: :dap print <expr>", error=True)
+                return False
+            if not self._dap_send_console(f"p {' '.join(args[1:])}"):
+                return False
+            self._set_message("DAP expression requested.")
+            return True
+        if action in {"console", "cmd"}:
+            if len(args) < 2:
+                self._set_message("Usage: :dap console <pdb-command>", error=True)
+                return False
+            if not self._dap_send_console(" ".join(args[1:])):
+                return False
+            self._set_message("DAP console command sent.")
+            return True
+        if action in {"log", "history"}:
+            session = self._dap_active_session()
+            if session is None:
+                self._set_message("DAP is not running.", error=True)
+                return False
+            count = 40
+            if len(args) >= 2:
+                try:
+                    count = max(1, int(args[1]))
+                except ValueError:
+                    self._set_message("Usage: :dap log [lines]", error=True)
+                    return False
+            lines = session.output[-count:]
+            self._show_alert("\n".join(lines) if lines else "(dap log is empty)")
+            return True
+        if action in {"break", "breakpoint", "bp"}:
             sub = args[1].strip().lower() if len(args) >= 2 else "list"
+            if sub in {"list", "ls"} and len(args) == 2:
+                lines: list[str] = []
+                for path_text in sorted(self._dap_breakpoints.keys()):
+                    entries = sorted(self._dap_breakpoints.get(path_text, set()))
+                    if not entries:
+                        continue
+                    name = Path(path_text).name
+                    for line in entries:
+                        lines.append(f"{name}:{line}")
+                self._show_alert("\n".join(lines) if lines else "(no breakpoints)")
+                return True
             if self.file_path is None:
                 self._set_message("Open a file before managing breakpoints.", error=True)
                 return False
@@ -1524,6 +2178,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                         self._set_message("Usage: :dap break add [line]", error=True)
                         return False
                 breaks.add(line)
+                self._dap_sync_breakpoint(path=target, line=line, add=True)
                 self._set_message(f"DAP breakpoint added: {target.name}:{line}")
                 return True
             if sub in {"remove", "rm", "del"}:
@@ -1536,11 +2191,22 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                         return False
                 if line in breaks:
                     breaks.remove(line)
+                    self._dap_sync_breakpoint(path=target, line=line, add=False)
                     self._set_message(f"DAP breakpoint removed: {target.name}:{line}")
                     return True
                 self._set_message(f"DAP breakpoint not found: {target.name}:{line}", error=True)
                 return False
             if sub in {"clear", "all"}:
+                if len(args) >= 3 and args[2].strip().lower() == "all":
+                    for path_text, lines in self._dap_breakpoints.items():
+                        path_value = Path(path_text)
+                        for line in sorted(lines):
+                            self._dap_sync_breakpoint(path=path_value, line=line, add=False)
+                        lines.clear()
+                    self._set_message("DAP breakpoints cleared: all files")
+                    return True
+                for line in sorted(breaks):
+                    self._dap_sync_breakpoint(path=target, line=line, add=False)
                 breaks.clear()
                 self._set_message(f"DAP breakpoints cleared: {target.name}")
                 return True
@@ -1554,9 +2220,225 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             self._set_message("Usage: :dap break add|remove|list|clear [line]", error=True)
             return False
         self._set_message(
-            "Usage: :dap status|start [file]|stop|continue|next|step|where|break add|remove|list|clear [line]",
+            "Usage: :dap status|start [file]|stop|continue|next|step|where|up|down|out|"
+            "vars|globals|print <expr>|console <cmd>|log [lines]|break add|remove|list|clear [line]",
             error=True,
         )
+        return False
+
+    def _sync_incremental_syntax(self, *, force: bool = False) -> ParseSummary:
+        summary = self._syntax_model.update(self.lines)
+        if not summary.changed and not force:
+            return summary
+        self._fold_ranges = self._syntax_model.folds()
+        valid_starts = {item.start_line for item in self._fold_ranges}
+        if self._fold_collapsed:
+            self._fold_collapsed = {line for line in self._fold_collapsed if line in valid_starts}
+        self._syntax_parse_summary = summary
+        return summary
+
+    def _fold_range_at_line(self, line_index: int) -> FoldRange | None:
+        if line_index < 0 or line_index >= len(self.lines):
+            return None
+        direct = self._syntax_model.fold_starting_at(line_index)
+        if direct is not None:
+            return direct
+        return self._syntax_model.enclosing_fold(line_index)
+
+    def _handle_fold_command(self, args: list[str]) -> bool:
+        action = args[0].strip().lower() if args else "list"
+        if action in {"refresh", "rebuild"}:
+            summary = self._sync_incremental_syntax(force=True)
+            self._set_message(
+                f"Fold rules refreshed: parsed_from={summary.parsed_from + 1 if summary.parsed_from >= 0 else '-'} "
+                f"lines={summary.parsed_lines} folds={len(self._fold_ranges)}"
+            )
+            return True
+
+        if action in {"list", "ls"}:
+            if not self._fold_ranges:
+                self._show_alert("(no syntax folds)")
+                return True
+            lines: list[str] = []
+            for item in self._fold_ranges[:300]:
+                state = "closed" if item.start_line in self._fold_collapsed else "open"
+                size = item.end_line - item.start_line
+                lines.append(
+                    f"{item.start_line + 1:>4}-{item.end_line + 1:<4} {item.kind:<10} size={size:<3} {state}"
+                )
+            self._show_alert("\n".join(lines))
+            return True
+
+        if action in {"toggle", "open", "close"}:
+            line = self.cy + 1
+            if len(args) >= 2:
+                try:
+                    line = max(1, int(args[1]))
+                except ValueError:
+                    self._set_message("Usage: :fold toggle|open|close [line]", error=True)
+                    return False
+            fold = self._fold_range_at_line(line - 1)
+            if fold is None:
+                self._set_message(f"No fold at line {line}.", error=True)
+                return False
+            if action == "open":
+                self._fold_collapsed.discard(fold.start_line)
+                self._set_message(f"Fold opened: {fold.start_line + 1}-{fold.end_line + 1}")
+                return True
+            if action == "close":
+                self._fold_collapsed.add(fold.start_line)
+                self._set_message(f"Fold closed: {fold.start_line + 1}-{fold.end_line + 1}")
+                return True
+            if fold.start_line in self._fold_collapsed:
+                self._fold_collapsed.discard(fold.start_line)
+                self._set_message(f"Fold opened: {fold.start_line + 1}-{fold.end_line + 1}")
+            else:
+                self._fold_collapsed.add(fold.start_line)
+                self._set_message(f"Fold closed: {fold.start_line + 1}-{fold.end_line + 1}")
+            return True
+
+        if action in {"next", "n"}:
+            for fold in self._fold_ranges:
+                if fold.start_line > self.cy:
+                    self.cy = fold.start_line
+                    self.cx = min(self.cx, len(self._line()))
+                    self._set_message(f"Fold jump: {fold.start_line + 1}-{fold.end_line + 1}")
+                    return True
+            self._set_message("No next fold.", error=True)
+            return False
+
+        if action in {"prev", "previous", "p"}:
+            for fold in reversed(self._fold_ranges):
+                if fold.start_line < self.cy:
+                    self.cy = fold.start_line
+                    self.cx = min(self.cx, len(self._line()))
+                    self._set_message(f"Fold jump: {fold.start_line + 1}-{fold.end_line + 1}")
+                    return True
+            self._set_message("No previous fold.", error=True)
+            return False
+
+        if action in {"info", "status"}:
+            summary = self._syntax_parse_summary
+            changed = "yes" if summary.changed else "no"
+            self._set_message(
+                f"Syntax incremental: changed={changed} parsed_from={summary.parsed_from + 1 if summary.parsed_from >= 0 else '-'} "
+                f"parsed_lines={summary.parsed_lines} folds={len(self._fold_ranges)}"
+            )
+            return True
+
+        self._set_message("Usage: :fold list|refresh|toggle|open|close|next|prev|info [line]", error=True)
+        return False
+
+    def _reset_incremental_selection(self) -> None:
+        self._incremental_select_ranges = []
+        self._incremental_select_index = -1
+
+    def _selection_candidates(self) -> list[tuple[int, int, int, int, str]]:
+        if not self.lines:
+            return []
+        max_line = len(self.lines) - 1
+        candidates: list[tuple[int, int, int, int, str]] = []
+        line = self._line()
+
+        word = word_range(line, self.cx, "i")
+        if word is not None:
+            candidates.append((self.cy, word[0], self.cy, word[1], "word"))
+
+        quote = quote_range(line, self.cx, '"', "a")
+        if quote is not None:
+            candidates.append((self.cy, quote[0], self.cy, quote[1], "quote"))
+
+        bracket = self._bracket_text_object_range("a", "b")
+        if bracket is not None:
+            candidates.append((bracket[0], bracket[1], bracket[2], bracket[3], "bracket"))
+
+        paragraph = self._paragraph_range("a")
+        if paragraph is not None:
+            start_line, end_line = paragraph
+            candidates.append((start_line, 0, end_line, len(self.lines[end_line]), "paragraph"))
+
+        fold = self._syntax_model.enclosing_fold(self.cy)
+        if fold is not None:
+            candidates.append((fold.start_line, 0, fold.end_line, len(self.lines[fold.end_line]), "fold"))
+
+        for kind in ("function", "class"):
+            ast_range = self._ast_text_object_range(kind, "a")
+            if ast_range is None:
+                continue
+            candidates.append((ast_range[0], 0, ast_range[2], len(self.lines[ast_range[2]]), f"ast:{kind}"))
+
+        candidates.append((self.cy, 0, self.cy, len(line), "line"))
+        candidates.append((0, 0, max_line, len(self.lines[max_line]), "buffer"))
+
+        unique: dict[tuple[int, int, int, int], tuple[int, int, int, int, str]] = {}
+        for item in candidates:
+            key = item[:4]
+            unique.setdefault(key, item)
+
+        def _span_size(item: tuple[int, int, int, int, str]) -> tuple[int, int]:
+            return (item[2] - item[0], item[3] - item[1])
+
+        ordered = sorted(unique.values(), key=_span_size)
+        return ordered
+
+    def _apply_visual_range(self, target: tuple[int, int, int, int, str]) -> None:
+        start_line, _start_col, end_line, end_col, label = target
+        start_line = clamp(start_line, 0, len(self.lines) - 1)
+        end_line = clamp(end_line, 0, len(self.lines) - 1)
+        self.mode = MODE_VISUAL
+        self.visual_anchor = start_line
+        self.cy = end_line
+        self.cx = clamp(end_col, 0, len(self._line()))
+        self._set_message(f"Incremental selection: {label} ({start_line + 1}-{end_line + 1})")
+
+    def _incremental_select_expand(self) -> bool:
+        candidates = self._selection_candidates()
+        if not candidates:
+            self._set_message("No incremental selection candidates.", error=True)
+            return False
+        if candidates != self._incremental_select_ranges:
+            self._incremental_select_ranges = candidates
+            self._incremental_select_index = -1
+        if self._incremental_select_index + 1 < len(self._incremental_select_ranges):
+            self._incremental_select_index += 1
+        self._apply_visual_range(self._incremental_select_ranges[self._incremental_select_index])
+        return True
+
+    def _incremental_select_shrink(self) -> bool:
+        if not self._incremental_select_ranges:
+            self._set_message("Incremental selection is empty.", error=True)
+            return False
+        if self._incremental_select_index <= 0:
+            self._set_message("Incremental selection already at smallest range.")
+            return True
+        self._incremental_select_index -= 1
+        self._apply_visual_range(self._incremental_select_ranges[self._incremental_select_index])
+        return True
+
+    def _handle_incremental_select_command(self, args: list[str]) -> bool:
+        action = args[0].strip().lower() if args else "expand"
+        if action in {"expand", "e", "next"}:
+            return self._incremental_select_expand()
+        if action in {"shrink", "s", "prev"}:
+            return self._incremental_select_shrink()
+        if action in {"reset", "clear"}:
+            self._reset_incremental_selection()
+            self.mode = MODE_NORMAL
+            self.visual_anchor = None
+            self._set_message("Incremental selection reset.")
+            return True
+        if action in {"list", "ls"}:
+            items = self._selection_candidates()
+            if not items:
+                self._show_alert("(no incremental selection candidates)")
+                return True
+            lines = [
+                f"{index + 1:>2}. {label:<12} {start + 1}:{start_col + 1} -> {end + 1}:{end_col + 1}"
+                for index, (start, start_col, end, end_col, label) in enumerate(items)
+            ]
+            self._show_alert("\n".join(lines))
+            return True
+        self._set_message("Usage: :iselect expand|shrink|reset|list", error=True)
         return False
 
     def _set_message(self, message: str, *, error: bool = False) -> None:
@@ -1610,6 +2492,8 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             current_view = self._capture_view_state()
             self._split_main_view = current_view
             self._split_secondary_view = current_view
+            self._sync_incremental_syntax(force=True)
+            self._reset_incremental_selection()
         finally:
             self._history_suspended = False
 
@@ -1657,10 +2541,68 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self.pending_scope = ""
         self._set_message(f"Undo branch: {record.label}")
 
+    def _undo_tree_lines(self) -> list[str]:
+        rows = self._history.view()
+        if not rows:
+            return ["(undo tree is empty)"]
+        lines: list[str] = []
+        for row in rows:
+            marker = "*" if row.is_current else " "
+            parent = "-" if row.parent is None else str(row.parent)
+            children = ",".join(str(item) for item in row.children) if row.children else "-"
+            lines.append(f"{marker} {row.node_id:>3} <- {parent:>3} -> [{children}] {row.label}")
+        return lines
+
+    def _undo_restore(self, node_id: int) -> bool:
+        snapshot = self._history.restore(node_id)
+        if snapshot is None:
+            self._set_message(f"Undo tree node not found: {node_id}", error=True)
+            return False
+        self._skip_history_once = True
+        self._apply_snapshot(snapshot)
+        self.pending_operator = ""
+        self.pending_scope = ""
+        self._pending_motion = ""
+        self._set_message(f"Undo tree restored: {node_id}")
+        return True
+
+    def _handle_undo_command(self, args: list[str]) -> bool:
+        if not args:
+            self._undo()
+            return True
+        action = args[0].strip().lower()
+        if action in {"undo", "u", "back"}:
+            self._undo()
+            return True
+        if action in {"redo", "r"}:
+            self._redo()
+            return True
+        if action in {"tree", "list", "ls"}:
+            self._show_alert("\n".join(self._undo_tree_lines()))
+            return True
+        if action in {"restore", "goto", "jump"}:
+            if len(args) < 2:
+                self._set_message("Usage: :undo restore <node-id>", error=True)
+                return False
+            try:
+                node_id = int(args[1])
+            except ValueError:
+                self._set_message("Usage: :undo restore <node-id>", error=True)
+                return False
+            return self._undo_restore(node_id)
+        if action in {"branch-prev", "prev"}:
+            self._undo_branch_prev()
+            return True
+        if action in {"branch-next", "next"}:
+            self._undo_branch_next()
+            return True
+        self._set_message("Usage: :undo [undo|redo|tree|restore <node-id>|branch-prev|branch-next]", error=True)
+        return False
+
     def _start_macro_recording(self, register: str) -> None:
-        self._macro_recording_register = register
+        self._macro_recording_register = register.lower()
         self._macro_recording_keys = []
-        self._set_message(f"Recording macro @{register}")
+        self._set_message(f"Recording macro @{register.lower()}")
 
     def _stop_macro_recording(self) -> None:
         register = self._macro_recording_register
@@ -1669,6 +2611,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._macro_registers[register] = list(self._macro_recording_keys)
         self._macro_recording_register = None
         self._macro_recording_keys = []
+        self._save_macro_store(noisy=False)
         self._set_message(f"Recorded macro @{register}")
 
     def _replay_macro(self, register: str) -> None:
@@ -1691,6 +2634,154 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         if self._macro_waiting_action:
             return
         self._macro_recording_keys.append(key)
+
+    def _macro_store_path(self) -> Path:
+        return (self._runtime_root / "macros.json").resolve()
+
+    def _save_macro_store(self, *, noisy: bool) -> bool:
+        path = self._macro_store_path()
+        payload = {
+            "registers": {
+                register: list(keys)
+                for register, keys in sorted(self._macro_registers.items())
+                if register and keys
+            }
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            if noisy:
+                self._set_message(f"Macro save failed: {exc}", error=True)
+            return False
+        if noisy:
+            self._set_message(f"Macros saved: {path}")
+        return True
+
+    def _load_macro_store(self, *, noisy: bool) -> bool:
+        path = self._macro_store_path()
+        if not path.exists():
+            if noisy:
+                self._set_message(f"Macro store not found: {path}", error=True)
+            return False
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            if noisy:
+                self._set_message(f"Macro load failed: {exc}", error=True)
+            return False
+        if not isinstance(payload, dict):
+            if noisy:
+                self._set_message("Macro load failed: invalid payload.", error=True)
+            return False
+        raw_registers = payload.get("registers", payload)
+        if not isinstance(raw_registers, dict):
+            if noisy:
+                self._set_message("Macro load failed: invalid register map.", error=True)
+            return False
+        loaded: dict[str, list[str]] = {}
+        for register, keys in raw_registers.items():
+            if not isinstance(register, str):
+                continue
+            clean = register.strip().lower()
+            if len(clean) != 1 or not clean.isalpha():
+                continue
+            if not isinstance(keys, list):
+                continue
+            parsed = [item for item in keys if isinstance(item, str)]
+            if parsed:
+                loaded[clean] = parsed
+        self._macro_registers = loaded
+        if noisy:
+            self._set_message(f"Macros loaded: {len(loaded)} register(s)")
+        return True
+
+    def _handle_macro_command(self, args: list[str]) -> bool:
+        if not self.config.macros_enabled():
+            self._set_message("Macros are disabled in config.", error=True)
+            return False
+        action = args[0].strip().lower() if args else "list"
+        if action in {"list", "ls"}:
+            if not self._macro_registers:
+                self._show_alert("(no macros)")
+                return True
+            lines = [
+                f"@{register} ({len(keys)} keys)"
+                for register, keys in sorted(self._macro_registers.items())
+            ]
+            self._show_alert("\n".join(lines))
+            return True
+        if action in {"show", "print"}:
+            if len(args) < 2:
+                self._set_message("Usage: :macro show <register>", error=True)
+                return False
+            register = args[1].strip().lower()
+            keys = self._macro_registers.get(register, [])
+            if not keys:
+                self._set_message(f"Macro @{register} is empty.", error=True)
+                return False
+            self._show_alert(" ".join(keys))
+            return True
+        if action in {"play", "run"}:
+            if len(args) < 2:
+                self._set_message("Usage: :macro play <register> [count]", error=True)
+                return False
+            register = args[1].strip().lower()
+            keys = self._macro_registers.get(register, [])
+            if not keys:
+                self._set_message(f"Macro @{register} is empty.", error=True)
+                return False
+            count = 1
+            if len(args) >= 3:
+                try:
+                    count = max(1, int(args[2]))
+                except ValueError:
+                    self._set_message("Usage: :macro play <register> [count]", error=True)
+                    return False
+            for _ in range(count):
+                for key in reversed(keys):
+                    self._input_queue.appendleft(key)
+            self._set_message(f"Replay macro @{register} x{count}")
+            return True
+        if action in {"clear", "rm", "remove"}:
+            if len(args) < 2 or args[1].strip().lower() in {"all", "*"}:
+                self._macro_registers.clear()
+                self._save_macro_store(noisy=False)
+                self._set_message("Macros cleared: all")
+                return True
+            register = args[1].strip().lower()
+            if register not in self._macro_registers:
+                self._set_message(f"Macro @{register} is empty.", error=True)
+                return False
+            self._macro_registers.pop(register, None)
+            self._save_macro_store(noisy=False)
+            self._set_message(f"Macro cleared: @{register}")
+            return True
+        if action == "save":
+            return self._save_macro_store(noisy=True)
+        if action == "load":
+            return self._load_macro_store(noisy=True)
+        if action == "record":
+            if len(args) < 2:
+                self._set_message("Usage: :macro record <register>", error=True)
+                return False
+            register = args[1].strip().lower()
+            if len(register) != 1 or not register.isalpha():
+                self._set_message("Macro register must be [a-z].", error=True)
+                return False
+            if self._macro_recording_register is not None:
+                self._set_message("A macro recording is already in progress.", error=True)
+                return False
+            self._start_macro_recording(register)
+            return True
+        if action in {"stop", "end"}:
+            if self._macro_recording_register is None:
+                self._set_message("Macro recording is not active.", error=True)
+                return False
+            self._stop_macro_recording()
+            return True
+        self._set_message("Usage: :macro list|show|record|stop|play|clear|save|load", error=True)
+        return False
 
     def _normalize_loaded_text(self, text: str) -> tuple[str, str]:
         if "\r\n" in text:
@@ -2030,10 +3121,13 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                 process_id = int(event.get("process_id", 0))
                 line = str(event.get("line", ""))
                 if line:
-                    if process_id == self._terminal_process_id:
-                        self._terminal_output.append(line)
-                        if len(self._terminal_output) > 2000:
-                            self._terminal_output = self._terminal_output[-2000:]
+                    session = self._terminal_sessions.get(process_id)
+                    if session is not None:
+                        session.output.append(line)
+                        if len(session.output) > 2000:
+                            session.output = session.output[-2000:]
+                        if process_id == self._terminal_process_id:
+                            self._terminal_output = session.output
                     else:
                         self._set_message(f"[proc:{process_id}] {line}")
                 continue
@@ -2041,12 +3135,19 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             if event_type == "process_exit":
                 process_id = int(event.get("process_id", 0))
                 code = event.get("return_code", None)
-                if process_id == self._terminal_process_id:
-                    self._terminal_output.append(f"[exit] code={code}")
-                    self._set_message(f"Terminal exited ({code}).")
-                    self._terminal_process_id = None
+                session = self._terminal_sessions.get(process_id)
+                if session is not None:
+                    session.output.append(f"[exit] code={code}")
+                    if len(session.output) > 2000:
+                        session.output = session.output[-2000:]
+                    if process_id == self._terminal_process_id:
+                        self._terminal_output = session.output
+                        self._set_message(f"Terminal exited ({code}).")
                 else:
                     self._set_message(f"Process {process_id} exited ({code}).")
+                if process_id == self._dap_session_process_id:
+                    self._dap_session_process_id = None
+                    self._dap_target_path = None
 
     def _ast_query(self) -> AstQueryService:
         if self._ast_query_service is None:
@@ -2655,6 +3756,8 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self.modified = True
         self.pending_operator = ""
         self.buffer.mark_dirty(self.cy)
+        self._sync_incremental_syntax()
+        self._reset_incremental_selection()
 
     def _target_edit_rows(self) -> list[int]:
         rows = {self.cy}
@@ -3460,7 +4563,91 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                 self._set_message("-- INSERT --")
             return True
 
+        if key in {"b", "(", "[", "{"}:
+            bracket = self._bracket_text_object_range(scope, key)
+            if bracket is None:
+                self._set_message("No bracket text object.", error=True)
+                return True
+            if operator == "v":
+                self.mode = MODE_VISUAL
+                self.visual_anchor = bracket[0]
+                self.cy = bracket[2]
+                self.cx = clamp(bracket[3], 0, len(self._line()))
+                return True
+            self._delete_char_range(bracket[0], bracket[1], bracket[2], bracket[3])
+            if operator == "c":
+                self.mode = MODE_INSERT
+                self._set_message("-- INSERT --")
+            return True
+
         return False
+
+    def _bracket_text_object_range(self, scope: str, key: str) -> tuple[int, int, int, int] | None:
+        expected_open = key if key in {"(", "[", "{"} else ""
+
+        def _normalize(match: tuple[int, int, int, int, bool]) -> tuple[int, int, int, int]:
+            probe_row, probe_col, target_row, target_col, opening = match
+            if opening:
+                return probe_row, probe_col, target_row, target_col
+            return target_row, target_col, probe_row, probe_col
+
+        def _contains_cursor(start_row: int, start_col: int, end_row: int, end_col: int) -> bool:
+            if self.cy < start_row or self.cy > end_row:
+                return False
+            if self.cy == start_row and self.cx < start_col:
+                return False
+            if self.cy == end_row and self.cx > end_col:
+                return False
+            return True
+
+        candidates: list[tuple[int, int, int, int]] = []
+
+        direct = self._find_matching_bracket(self.cy, self.cx)
+        if direct is not None:
+            candidates.append(_normalize(direct))
+
+        for row in range(self.cy, -1, -1):
+            text = self.lines[row]
+            if not text:
+                continue
+            start_col = self.cx if row == self.cy else len(text) - 1
+            start_col = clamp(start_col, 0, len(text) - 1)
+            for col in range(start_col, -1, -1):
+                token = text[col]
+                if token not in {"(", "[", "{"}:
+                    continue
+                if expected_open and token != expected_open:
+                    continue
+                maybe = self._find_matching_bracket(row, col)
+                if maybe is None:
+                    continue
+                normalized = _normalize(maybe)
+                if _contains_cursor(*normalized):
+                    candidates.append(normalized)
+
+        best: tuple[int, int, int, int] | None = None
+        for item in candidates:
+            start_row, start_col, end_row, end_col = item
+            if not (0 <= start_row < len(self.lines) and 0 <= end_row < len(self.lines)):
+                continue
+            opener = self.lines[start_row][start_col] if 0 <= start_col < len(self.lines[start_row]) else ""
+            if expected_open and opener != expected_open:
+                continue
+            if best is None:
+                best = item
+                continue
+            best_span = (best[2] - best[0], best[3] - best[1])
+            span = (end_row - start_row, end_col - start_col)
+            if span < best_span:
+                best = item
+        if best is None:
+            return None
+        start_row, start_col, end_row, end_col = best
+        if scope == "i":
+            inner_start_col = start_col + 1
+            inner_end_col = max(inner_start_col, end_col)
+            return start_row, inner_start_col, end_row, inner_end_col
+        return start_row, start_col, end_row, end_col + 1
 
     def _goto_definition(self) -> None:
         symbol = word_at_cursor(self._line(), self.cx)
@@ -3899,10 +5086,163 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         shell = os.environ.get("SHELL", "").strip()
         return shell or "/bin/sh"
 
-    def _open_terminal(self, command: str | None = None) -> bool:
-        if self._terminal_process_id is not None and self._process_manager.status(self._terminal_process_id) == "running":
+    def _active_terminal_session(self) -> TerminalSession | None:
+        if self._terminal_process_id is None:
+            return None
+        return self._terminal_sessions.get(self._terminal_process_id)
+
+    def _sync_active_terminal_refs(self) -> None:
+        session = self._active_terminal_session()
+        if session is None:
+            self._terminal_output = []
+            self._terminal_scroll = 0
+            return
+        self._terminal_output = session.output
+        self._terminal_scroll = max(0, session.scroll)
+
+    def _save_terminal_scroll(self) -> None:
+        session = self._active_terminal_session()
+        if session is None:
+            return
+        session.scroll = max(0, self._terminal_scroll)
+
+    def _switch_terminal_session(self, process_id: int) -> bool:
+        if process_id not in self._terminal_sessions:
+            return False
+        self._save_terminal_scroll()
+        self._terminal_process_id = process_id
+        self._sync_active_terminal_refs()
+        return True
+
+    def _visible_terminal_sessions(self) -> list[TerminalSession]:
+        active = self._active_terminal_session()
+        if active is None:
+            return []
+        if not self._terminal_split_view:
+            return [active]
+        other: TerminalSession | None = None
+        for process_id in reversed(self._terminal_session_order):
+            if process_id == active.process_id:
+                continue
+            candidate = self._terminal_sessions.get(process_id)
+            if candidate is None:
+                continue
+            other = candidate
+            break
+        if other is None:
+            return [active]
+        return [active, other]
+
+    def _terminal_scroll_to_output_index(self, session: TerminalSession, output_index: int) -> None:
+        output_len = len(session.output)
+        if output_len <= 0:
+            session.scroll = 0
+            if session.process_id == self._terminal_process_id:
+                self._terminal_scroll = 0
+            return
+        safe_index = clamp(output_index, 0, output_len - 1)
+        visible_rows = max(1, self._terminal_size()[1] - 8)
+        target_end = min(output_len, safe_index + 1 + (visible_rows // 2))
+        session.scroll = max(0, output_len - target_end)
+        if session.process_id == self._terminal_process_id:
+            self._terminal_scroll = session.scroll
+
+    def _terminal_search(self, query: str) -> bool:
+        session = self._active_terminal_session()
+        if session is None:
+            self._set_message("Terminal is not running.", error=True)
+            return False
+        clean = query.strip()
+        if not clean:
+            self._set_message("Usage: :term search <query>|next|prev|clear", error=True)
+            return False
+        lowered = clean.lower()
+        hits = [index for index, line in enumerate(session.output) if lowered in line.lower()]
+        session.search_query = clean
+        session.search_hits = hits
+        if not hits:
+            session.search_index = -1
+            self._set_message(f"Terminal search not found: {clean}", error=True)
+            return False
+        session.search_index = len(hits) - 1
+        self._terminal_scroll_to_output_index(session, hits[session.search_index])
+        self._set_message(f"Terminal search: {len(hits)} match(es) for '{clean}'")
+        return True
+
+    def _terminal_search_shift(self, delta: int) -> bool:
+        session = self._active_terminal_session()
+        if session is None:
+            self._set_message("Terminal is not running.", error=True)
+            return False
+        if not session.search_hits:
+            self._set_message("Terminal search: no active matches.", error=True)
+            return False
+        if session.search_index < 0:
+            session.search_index = 0
+        else:
+            session.search_index = (session.search_index + delta) % len(session.search_hits)
+        index = session.search_hits[session.search_index]
+        self._terminal_scroll_to_output_index(session, index)
+        self._set_message(
+            f"Terminal search hit {session.search_index + 1}/{len(session.search_hits)}: '{session.search_query}'"
+        )
+        return True
+
+    def _clear_terminal_search(self) -> bool:
+        session = self._active_terminal_session()
+        if session is None:
+            self._set_message("Terminal is not running.", error=True)
+            return False
+        session.search_query = ""
+        session.search_hits = []
+        session.search_index = -1
+        self._set_message("Terminal search cleared.")
+        return True
+
+    def _switch_terminal_relative(self, step: int) -> bool:
+        order = [process_id for process_id in self._terminal_session_order if process_id in self._terminal_sessions]
+        if not order:
+            self._set_message("No terminal sessions.", error=True)
+            return False
+        current = self._terminal_process_id if self._terminal_process_id in order else order[0]
+        index = order.index(current)
+        target = order[(index + step) % len(order)]
+        if not self._switch_terminal_session(target):
+            self._set_message(f"Terminal session missing: {target}", error=True)
+            return False
+        self.mode = MODE_TERMINAL
+        self._set_message(f"Terminal switched: {target}")
+        return True
+
+    def _terminal_session_rows(self, session: TerminalSession, rows: int) -> list[str]:
+        if rows <= 0:
+            return []
+        status = self._process_manager.status(session.process_id)
+        output_rows = max(0, rows - 1)
+        total = len(session.output)
+        end = max(0, total - max(0, session.scroll))
+        start = max(0, end - output_rows)
+        highlighted = set(session.search_hits)
+        body: list[str] = []
+        for index in range(start, end):
+            text = session.output[index]
+            if index in highlighted:
+                text = f"? {text}"
+            body.append(text)
+        while len(body) < output_rows:
+            body.append("")
+        header = f"[{session.process_id} {status}] {session.command}"
+        return [header, *body[:output_rows]]
+
+    def _open_terminal(self, command: str | None = None, *, force_new: bool = False) -> bool:
+        active = self._active_terminal_session()
+        if (
+            not force_new
+            and active is not None
+            and self._process_manager.status(active.process_id) == "running"
+        ):
             self.mode = MODE_TERMINAL
-            self._set_message("Terminal resumed.")
+            self._set_message(f"Terminal resumed: {active.process_id}")
             return True
         command_text = command.strip() if isinstance(command, str) and command.strip() else self._terminal_default_command()
         try:
@@ -3910,34 +5250,56 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         except Exception as exc:
             self._set_message(f"Terminal start failed: {exc}", error=True)
             return False
-        self._terminal_process_id = process_id
-        self._terminal_output = [f"[term:{process_id}] {command_text}"]
+        session = TerminalSession(
+            process_id=process_id,
+            command=command_text,
+            output=[f"[term:{process_id}] {command_text}"],
+        )
+        self._terminal_sessions[process_id] = session
+        if process_id not in self._terminal_session_order:
+            self._terminal_session_order.append(process_id)
+        self._switch_terminal_session(process_id)
         self._terminal_input = ""
-        self._terminal_scroll = 0
+        self._terminal_split_view = self._terminal_split_view and len(self._terminal_sessions) >= 2
         self.mode = MODE_TERMINAL
         self._set_message(f"Terminal started: {process_id}")
         return True
 
     def _send_terminal_input(self, text: str) -> None:
-        if self._terminal_process_id is None:
+        session = self._active_terminal_session()
+        if session is None:
             self._set_message("Terminal is not running.", error=True)
+            return
+        if self._process_manager.status(session.process_id) != "running":
+            self._set_message(f"Terminal is not running: {session.process_id}", error=True)
             return
         if text in {"\u0003", "\u0004"}:
             payload = text
         else:
             payload = text.rstrip("\n")
             if payload:
-                self._terminal_output.append(f"> {payload}")
-        if not self._process_manager.write(self._terminal_process_id, payload):
+                session.output.append(f"> {payload}")
+                if len(session.output) > 2000:
+                    session.output = session.output[-2000:]
+                if session.process_id == self._terminal_process_id:
+                    self._terminal_output = session.output
+        if not self._process_manager.write(session.process_id, payload):
             self._set_message("Terminal input failed.", error=True)
 
     def _close_terminal(self, *, kill: bool) -> None:
-        if self._terminal_process_id is not None and kill:
-            self._process_manager.stop_sync(self._terminal_process_id, timeout=0.6)
-            self._terminal_output.append("[term] stop requested")
-            self._terminal_process_id = None
+        session = self._active_terminal_session()
+        if session is not None and kill:
+            self._process_manager.stop_sync(session.process_id, timeout=0.6)
+            if session.process_id == self._dap_session_process_id:
+                self._dap_session_process_id = None
+                self._dap_target_path = None
+            session.output.append("[term] stop requested")
+            if len(session.output) > 2000:
+                session.output = session.output[-2000:]
+            if session.process_id == self._terminal_process_id:
+                self._terminal_output = session.output
+        self._save_terminal_scroll()
         self._terminal_input = ""
-        self._terminal_scroll = 0
         self.mode = MODE_NORMAL
 
     def _search_query_from_command_text(self) -> str:
@@ -4565,7 +5927,11 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self._jump_back_stack = []
         self._jump_forward_stack = []
         self._history.clear()
+        self._history.set_root_snapshot(self._capture_snapshot())
+        self._refresh_filetype_autocmds(None)
         self._syntax_profile = self._syntax_manager().profile_for_file(self.file_path)
+        self._sync_incremental_syntax(force=True)
+        self._reset_incremental_selection()
         current_view = self._capture_view_state()
         self._split_main_view = current_view
         self._split_secondary_view = current_view
@@ -4585,6 +5951,7 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             return False
 
         path = self._resolve_path(target)
+        self._refresh_filetype_autocmds(path)
         self._run_autocmds("bufreadpre")
         if path.exists() and path.is_dir():
             return self.open_project(path, force=force, startup=startup)
@@ -4636,7 +6003,11 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         self.visual_anchor = None
         self._clear_multi_cursor()
         self._history.clear()
+        self._history.set_root_snapshot(self._capture_snapshot())
+        self._refresh_filetype_autocmds(self.file_path)
         self._syntax_profile = self._syntax_manager().profile_for_file(self.file_path)
+        self._sync_incremental_syntax(force=True)
+        self._reset_incremental_selection()
         current_view = self._capture_view_state()
         self._split_main_view = current_view
         self._split_secondary_view = current_view
@@ -4906,7 +6277,9 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
                 colored = colored_code
             if gutter > 0:
                 marker = " "
-                if line_index in self._active_pair_line_markers():
+                if line_index in self._fold_collapsed:
+                    marker = "▸" if self._unicode_ui else ">"
+                elif line_index in self._active_pair_line_markers():
                     marker = "•"
                 elif self._git_control_feature.enabled:
                     marker = self._git_control_feature.line_markers.get(line_index + 1, " ")
@@ -4953,19 +6326,39 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
         base_style = self.theme.ui_style("editor")
         border_style = self.theme.ui_style("command_line")
         top_left, top_right, bottom_left, bottom_right, vertical, horizontal = self._box_chars()
+        sessions = self._visible_terminal_sessions()
         if width <= 2:
             return f"{base_style}{' ' * max(0, width)}{RESET}"
         if screen_row == 0:
-            title = f" Terminal [{self._terminal_process_id or '-'}] Esc close Ctrl+Q stop "
+            if not sessions:
+                title = " Terminal [idle] Esc close Ctrl+Q stop "
+            elif len(sessions) == 1:
+                active = sessions[0]
+                title = f" Terminal [{active.process_id}] Esc close Ctrl+Q stop "
+            else:
+                active = sessions[0]
+                peer = sessions[1]
+                title = (
+                    f" Terminal Split active={active.process_id} peer={peer.process_id} "
+                    "Esc close Ctrl+Q stop Ctrl+W switch "
+                )
             head = pad_to_display(slice_by_display(title, 0, width - 2), width - 2)
             return f"{border_style}{top_left}{head}{top_right}{RESET}"
         if screen_row == text_rows - 1:
             return f"{border_style}{bottom_left}{(horizontal * (width - 2))}{bottom_right}{RESET}"
         body_rows = max(1, text_rows - 2)
-        total = len(self._terminal_output)
-        end = max(0, total - self._terminal_scroll)
-        start = max(0, end - body_rows)
-        visible = self._terminal_output[start:end]
+        if not sessions:
+            visible = ["(terminal is idle)"]
+        elif len(sessions) == 1:
+            visible = self._terminal_session_rows(sessions[0], body_rows)
+        else:
+            top_rows = max(2, body_rows // 2)
+            bottom_rows = max(2, body_rows - top_rows)
+            if top_rows + bottom_rows > body_rows:
+                bottom_rows = max(1, body_rows - top_rows)
+            top_lines = self._terminal_session_rows(sessions[0], top_rows)
+            bottom_lines = self._terminal_session_rows(sessions[1], bottom_rows)
+            visible = [*top_lines, *bottom_lines]
         index = screen_row - 1
         content = visible[index] if 0 <= index < len(visible) else ""
         text = pad_to_display(slice_by_display(content, 0, width - 2), width - 2)
@@ -5114,7 +6507,9 @@ class PvimEditor(NormalModeMixin, InsertModeMixin, UIModeMixin, CommandsMixin):
             return f"{self.theme.ui_style('command_line')}{visible}{RESET}", clamp(cursor_col, 1, width)
 
         if self.mode == MODE_TERMINAL:
-            text = f"term> {self._terminal_input}"
+            active = self._active_terminal_session()
+            prefix = f"term[{active.process_id}]> " if active is not None else "term> "
+            text = f"{prefix}{self._terminal_input}"
             text_width = display_width(text)
             if text_width <= width:
                 visible = pad_to_display(text, width)

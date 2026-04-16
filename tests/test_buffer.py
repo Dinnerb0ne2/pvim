@@ -8,7 +8,44 @@ import unittest
 
 from src.core.config import AppConfig, DEFAULT_CONFIG
 from src.ui.editor import PvimEditor
-from src.ui.editor.modes import MODE_INSERT, MODE_NORMAL
+from src.ui.editor.modes import MODE_INSERT, MODE_NORMAL, MODE_TERMINAL, MODE_VISUAL
+
+
+class _FakeProcessManager:
+    def __init__(self) -> None:
+        self._next_id = 100
+        self._states: dict[int, str] = {}
+        self.writes: list[tuple[int, str]] = []
+
+    def start(self, _command: str, *, cwd: str | None = None) -> int:
+        _ = cwd
+        process_id = self._next_id
+        self._next_id += 1
+        self._states[process_id] = "running"
+        return process_id
+
+    def write(self, process_id: int, data: str) -> bool:
+        if self._states.get(process_id) != "running":
+            return False
+        self.writes.append((process_id, data))
+        return True
+
+    def stop_sync(self, process_id: int, *, timeout: float = 1.0) -> bool:
+        _ = timeout
+        if process_id not in self._states:
+            return False
+        self._states[process_id] = "exited:0"
+        return True
+
+    def stop(self, process_id: int) -> bool:
+        return self.stop_sync(process_id)
+
+    def status(self, process_id: int) -> str:
+        return self._states.get(process_id, "unknown")
+
+    def read(self, _process_id: int, *, max_lines: int = 20) -> list[str]:
+        _ = max_lines
+        return []
 
 
 class BufferEditorBehaviorTests(unittest.TestCase):
@@ -298,6 +335,203 @@ class BufferEditorBehaviorTests(unittest.TestCase):
 
         self.editor.execute_command("dap break remove 1")
         self.assertNotIn(1, self.editor._dap_breakpoints.get(key, set()))
+
+    def test_fold_command_and_gv_incremental_selection(self) -> None:
+        self.editor.lines = [
+            "def outer():",
+            "    if cond:",
+            "        value = call(inner)",
+            "    return value",
+        ]
+        self.editor.cy = 2
+        self.editor.cx = 15
+        self.editor.execute_command("fold refresh")
+        self.assertGreaterEqual(len(self.editor._fold_ranges), 1)
+
+        self.editor.handle_key("g")
+        self.editor.handle_key("v")
+        self.assertEqual(self.editor.mode, MODE_VISUAL)
+        self.assertIsNotNone(self.editor.visual_anchor)
+
+        self.editor.handle_key("g")
+        self.editor.handle_key("V")
+        self.assertEqual(self.editor.mode, MODE_VISUAL)
+
+    def test_bracket_text_object_delete_inner(self) -> None:
+        self.editor.lines = ["call(foo(bar))"]
+        self.editor.cy = 0
+        self.editor.cx = 10
+        handled = self.editor._apply_text_object("d", "i", "(")
+        self.assertTrue(handled)
+        self.assertEqual(self.editor.lines[0], "call(foo())")
+
+    def test_terminal_split_and_session_switch(self) -> None:
+        self.editor._process_manager = _FakeProcessManager()
+
+        self.editor.execute_command("term open")
+        first = self.editor._terminal_process_id
+        self.assertIsNotNone(first)
+        self.assertEqual(self.editor.mode, MODE_TERMINAL)
+
+        self.editor.execute_command("term split on")
+        self.assertTrue(self.editor._terminal_split_view)
+        self.assertGreaterEqual(len(self.editor._terminal_sessions), 2)
+
+        second = self.editor._terminal_process_id
+        self.assertIsNotNone(second)
+        self.assertNotEqual(first, second)
+
+        self.editor.execute_command("term prev")
+        self.assertEqual(self.editor._terminal_process_id, first)
+
+        self.editor.execute_command("term next")
+        self.assertEqual(self.editor._terminal_process_id, second)
+
+    def test_terminal_search_command_and_ctrl_r(self) -> None:
+        self.editor._process_manager = _FakeProcessManager()
+        self.editor.execute_command("term open")
+        session = self.editor._active_terminal_session()
+        self.assertIsNotNone(session)
+        assert session is not None
+        session.output.extend(["alpha one", "beta two", "alpha three"])
+
+        self.editor.execute_command("term search alpha")
+        self.assertEqual(session.search_query, "alpha")
+        self.assertEqual(len(session.search_hits), 2)
+        self.assertGreaterEqual(self.editor._terminal_scroll, 0)
+
+        old_index = session.search_index
+        self.editor.execute_command("term search next")
+        self.assertNotEqual(session.search_index, old_index)
+
+        self.editor.mode = MODE_TERMINAL
+        self.editor._terminal_input = "beta"
+        self.editor.handle_key("CTRL_R")
+        self.assertEqual(session.search_query, "beta")
+        self.assertEqual(self.editor._terminal_input, "")
+
+    def test_dap_console_and_variable_commands(self) -> None:
+        self.editor._process_manager = _FakeProcessManager()
+        target = self._root / "debug_live.py"
+        target.write_text("print('debug')\n", encoding="utf-8")
+        self.assertTrue(self.editor.open_file(target, force=True))
+
+        self.editor.execute_command("dap start")
+        self.assertIsNotNone(self.editor._dap_session_process_id)
+
+        self.editor.execute_command("dap print 1 + 1")
+        self.editor.execute_command("dap vars")
+        self.editor.execute_command("dap console where")
+        self.assertGreaterEqual(len(self.editor._process_manager.writes), 3)
+        self.assertEqual(self.editor._process_manager.writes[-3][1], "p 1 + 1")
+        self.assertEqual(self.editor._process_manager.writes[-2][1], "p locals()")
+        self.assertEqual(self.editor._process_manager.writes[-1][1], "where")
+
+        self.editor.execute_command("dap stop")
+        self.assertIsNone(self.editor._dap_session_process_id)
+
+    def test_macro_command_save_and_load(self) -> None:
+        self.editor._macro_registers = {"a": ["i", "x", "ESC"]}
+        self.editor.execute_command("macro save")
+        self.assertIn("Macros saved", self.editor.message)
+
+        self.editor._macro_registers = {}
+        self.editor.execute_command("macro load")
+        self.assertEqual(self.editor._macro_registers.get("a"), ["i", "x", "ESC"])
+
+    def test_undo_tree_restore_by_node(self) -> None:
+        self.editor.lines = ["abc"]
+        self.editor.cx = 3
+        self.editor.cy = 0
+
+        self.editor.mode = MODE_INSERT
+        self.editor.handle_key("x")
+        self.editor.mode = MODE_NORMAL
+        self.editor.handle_key("u")
+
+        self.editor.mode = MODE_INSERT
+        self.editor.handle_key("y")
+        self.editor.mode = MODE_NORMAL
+        self.assertEqual(self.editor.lines, ["abcy"])
+
+        self.editor.execute_command("undo restore 1")
+        self.assertEqual(self.editor.lines, ["abcx"])
+
+        self.editor.execute_command("undo restore 2")
+        self.assertEqual(self.editor.lines, ["abcy"])
+
+    def test_quickfix_jump_by_index(self) -> None:
+        first = self._root / "qc_a.py"
+        second = self._root / "qc_b.py"
+        first.write_text("TODO one\n", encoding="utf-8")
+        second.write_text("TODO two\n", encoding="utf-8")
+        self.assertTrue(self.editor.open_project(self._root, force=True))
+
+        self.editor.execute_command("quickfix fromgrep TODO")
+        self.editor.execute_command("quickfix jump 1")
+        self.assertIn("Quickfix 1/", self.editor.message)
+
+    def test_autocmd_filetype_events(self) -> None:
+        cfg = self.editor.config.data
+        autocmd = cfg.setdefault("features", {}).setdefault("autocmds", {})
+        if isinstance(autocmd, dict):
+            autocmd["events"] = {}
+            autocmd["filetypes"] = {
+                "python": {"bufreadpost": ["set nonumber"]},
+                ".txt": {"bufreadpost": ["set number"]},
+            }
+        self.editor._apply_runtime_config()
+
+        py_file = self._root / "typed.py"
+        txt_file = self._root / "typed.txt"
+        py_file.write_text("x = 1\n", encoding="utf-8")
+        txt_file.write_text("plain\n", encoding="utf-8")
+
+        self.assertTrue(self.editor.open_file(py_file, force=True))
+        self.assertFalse(self.editor.show_line_numbers)
+        self.assertTrue(self.editor.open_file(txt_file, force=True))
+        self.assertTrue(self.editor.show_line_numbers)
+
+    def test_window_scope_vars_are_isolated_per_split(self) -> None:
+        self.editor.execute_command("var set w:panel main")
+        self.editor.execute_command("split")
+        self.editor.execute_command("wincmd w")
+        self.editor.execute_command("var set w:panel secondary")
+        self.editor.execute_command("var get w:panel")
+        self.assertIn("secondary", self.editor.message)
+
+        self.editor.execute_command("wincmd w")
+        self.editor.execute_command("var get w:panel")
+        self.assertIn("main", self.editor.message)
+
+    def test_help_search_and_jump_topics(self) -> None:
+        self.editor.execute_command("help search quickfix")
+        self.assertTrue(any("quickfix" in line.lower() for line in self.editor.alert_lines))
+
+        self.editor.execute_command("help jump term")
+        self.assertTrue(any("terminal" in line.lower() for line in self.editor.alert_lines))
+
+    def test_stdlib_config_validate_merge_and_analyze(self) -> None:
+        base = self._root / "base.json"
+        override = self._root / "override.json"
+        merged = self._root / "merged.json"
+        base.write_text(
+            json.dumps({"python": {"required": "3.14.3"}, "editor": {"tab_size": 4}}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        override.write_text(json.dumps({"editor": {"tab_size": 2}}, ensure_ascii=False), encoding="utf-8")
+
+        self.editor.execute_command(f'stdlib config-validate "{base}"')
+        self.assertIn("Config valid", self.editor.message)
+
+        self.editor.execute_command(f'stdlib config-merge "{base}" "{override}" "{merged}"')
+        payload = json.loads(merged.read_text(encoding="utf-8"))
+        self.assertEqual(payload["editor"]["tab_size"], 2)
+
+        target = self._root / "analyze.py"
+        target.write_text("import os\n\nclass C:\n    pass\n\ndef f():\n    return 1\n", encoding="utf-8")
+        self.editor.execute_command(f'stdlib py-analyze "{target}"')
+        self.assertIn("Analyze done", self.editor.message)
 
 
 if __name__ == "__main__":

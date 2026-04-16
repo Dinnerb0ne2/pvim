@@ -18,6 +18,15 @@ class ActionRecord:
     after: ActionSnapshot
 
 
+@dataclass(slots=True, frozen=True)
+class HistoryNodeView:
+    node_id: int
+    parent: int | None
+    children: tuple[int, ...]
+    label: str
+    is_current: bool
+
+
 @dataclass(slots=True)
 class _HistoryNode:
     record: ActionRecord | None
@@ -27,13 +36,14 @@ class _HistoryNode:
 
 
 class HistoryStack:
-    __slots__ = ("_nodes", "_current", "_max_actions", "_next_id")
+    __slots__ = ("_nodes", "_current", "_max_actions", "_next_id", "_root_snapshot")
 
     def __init__(self, *, max_actions: int = 400) -> None:
         self._nodes: dict[int, _HistoryNode] = {}
         self._current = 0
         self._max_actions = max(20, int(max_actions))
         self._next_id = 1
+        self._root_snapshot: ActionSnapshot | None = None
         self.clear()
 
     def set_limit(self, value: int) -> None:
@@ -51,8 +61,14 @@ class HistoryStack:
         }
         self._current = 0
         self._next_id = 1
+        self._root_snapshot = None
+
+    def set_root_snapshot(self, snapshot: ActionSnapshot) -> None:
+        self._root_snapshot = snapshot
 
     def push(self, record: ActionRecord) -> None:
+        if self._root_snapshot is None:
+            self._root_snapshot = record.before
         parent = self._nodes[self._current]
         node_id = self._next_id
         self._next_id += 1
@@ -107,12 +123,57 @@ class HistoryStack:
     def stats(self) -> tuple[int, int]:
         return self._record_count(), self._depth(self._current)
 
+    def current_node_id(self) -> int:
+        return self._current
+
+    def view(self) -> list[HistoryNodeView]:
+        rows: list[HistoryNodeView] = []
+        for node_id in sorted(self._nodes.keys()):
+            node = self._nodes[node_id]
+            rows.append(
+                HistoryNodeView(
+                    node_id=node_id,
+                    parent=node.parent,
+                    children=tuple(node.children),
+                    label=node.record.label if node.record is not None else "root",
+                    is_current=node_id == self._current,
+                )
+            )
+        return rows
+
+    def restore(self, node_id: int) -> ActionSnapshot | None:
+        if node_id == 0:
+            if self._root_snapshot is None:
+                return None
+            self._current = 0
+            return self._root_snapshot
+        node = self._nodes.get(node_id)
+        if node is None or node.record is None:
+            return None
+        self._current = node_id
+        self._mark_active_path(node_id)
+        return node.record.after
+
     def _trim(self) -> None:
         while self._record_count() > self._max_actions:
             candidate = self._oldest_trim_candidate()
             if candidate is None:
                 break
             self._remove_leaf(candidate)
+
+    def _mark_active_path(self, node_id: int) -> None:
+        current = node_id
+        while current != 0:
+            node = self._nodes.get(current)
+            if node is None or node.parent is None:
+                break
+            parent = self._nodes.get(node.parent)
+            if parent is not None:
+                try:
+                    parent.active_child = parent.children.index(current)
+                except ValueError:
+                    pass
+            current = node.parent
 
     def _switch_sibling(self, step: int) -> ActionRecord | None:
         if self._current == 0:

@@ -48,8 +48,30 @@ class NormalModeMixin:
                 self._jump_back()
             elif key == "f":
                 self._jump_forward()
+            elif key == "v":
+                self._incremental_select_expand()
+            elif key == "V":
+                self._incremental_select_shrink()
             else:
                 self._set_message(f"Unknown g motion: g{key}", error=True)
+            return
+
+        if self._pending_motion == "z":
+            self._pending_motion = ""
+            if key == "a":
+                self._handle_fold_command(["toggle"])
+            elif key == "o":
+                self._handle_fold_command(["open"])
+            elif key == "c":
+                self._handle_fold_command(["close"])
+            elif key == "n":
+                self._handle_fold_command(["next"])
+            elif key == "p":
+                self._handle_fold_command(["prev"])
+            elif key == "r":
+                self._handle_fold_command(["refresh"])
+            else:
+                self._set_message(f"Unknown z motion: z{key}", error=True)
             return
 
         if self._pending_motion == "CTRL_W":
@@ -264,6 +286,13 @@ class NormalModeMixin:
             self.pending_operator = ""
             self.pending_scope = ""
             self._set_message("g")
+            return
+
+        if key == "z":
+            self._pending_motion = "z"
+            self.pending_operator = ""
+            self.pending_scope = ""
+            self._set_message("z")
             return
 
         if key == "CTRL_W":

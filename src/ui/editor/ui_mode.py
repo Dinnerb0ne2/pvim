@@ -122,11 +122,30 @@ class UIModeMixin:
         if key == "CTRL_D":
             self._send_terminal_input("\u0004")
             return
+        if key == "CTRL_W":
+            self._switch_terminal_relative(1)
+            return
+        if key == "CTRL_N":
+            self._terminal_search_shift(1)
+            return
+        if key == "CTRL_P":
+            self._terminal_search_shift(-1)
+            return
+        if key == "CTRL_R":
+            query = self._terminal_input.strip()
+            if query:
+                self._terminal_search(query)
+                self._terminal_input = ""
+            else:
+                self._terminal_search_shift(-1)
+            return
         if key == "PGUP":
             self._terminal_scroll = min(self._terminal_scroll + 1, max(0, len(self._terminal_output) - 1))
+            self._save_terminal_scroll()
             return
         if key == "PGDN":
             self._terminal_scroll = max(0, self._terminal_scroll - 1)
+            self._save_terminal_scroll()
             return
         if key == "BACKSPACE":
             self._terminal_input = self._terminal_input[:-1]

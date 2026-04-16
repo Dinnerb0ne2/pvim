@@ -1,4 +1,4 @@
-# PVIM - v0.7
+# PVIM - v0.8
 
 PVIM 是一个基于 **Python 3.14.3**、纯标准库实现的终端编辑器。
 
@@ -14,7 +14,7 @@ PVIM 是一个基于 **Python 3.14.3**、纯标准库实现的终端编辑器。
 - 全局与项目级搜索替换（findre/replacere/replaceallre/replaceproj/replaceprojre）
 - `/` 增量搜索预览 + 搜索历史（Up/Down）+ `n` 快速重复
 - 分屏窗口管理（split/vsplit/wincmd）
-- 内置终端面板与终端管理命令（:term open/close/status/history/send）
+- 内置终端会话管理（分屏、会话切换、历史滚动搜索、:term search/use/split）
 - 多编码读取与按编码保存（状态栏显示编码）
 - Swap 恢复 + 会话档案 + 自动保存（默认不开启启动自动恢复）
 - 子进程刷新版本号丢弃机制（只接收最新结果）
@@ -31,12 +31,14 @@ PVIM 是一个基于 **Python 3.14.3**、纯标准库实现的终端编辑器。
 - Git 命令增强（status/diff/blame/stage/unstage/branches/checkout）
 - 跳转历史（:jump back/forward/list，gb/gf，Ctrl+O）
 - 配置热重载与按文件类型快捷键覆盖（无需重启）
-- 撤销树分支切换（`g-` / `g+`）与主题快速切换（`:theme`）
+- 撤销树分支切换与节点恢复（`g-` / `g+`、`:undo tree|restore`）与主题快速切换（`:theme`）
 - 终端能力探测与降级（True Color / Unicode 自动回退）
-- Quickfix 列表导航（`:quickfix fromgrep|fromdiag|next|prev|list`）
-- Autocmd 事件触发（`bufreadpre/post`、`bufwritepre/post`）
-- 多作用域变量与剪贴板命令（`:var`、`:clip`）
-- 轻量 DAP（pdb）调试管理（`:dap start/stop/continue/next/step/break`）
+- Quickfix 列表导航与索引跳转（`:quickfix fromgrep|fromdiag|jump|next|prev|list`）
+- Autocmd 事件触发 + 文件类型专属规则（`features.autocmds.filetypes`）
+- 多作用域变量隔离（全局/窗口/缓冲区）与跨应用剪贴板（`:var`、`:clip`）
+- 轻量 DAP（pdb）调试管理（断点/单步/变量查看/调试控制台命令）
+- 命令式帮助系统（`:help topics|search|jump`）与宏管理（`:macro`）
+- 标准库工具集（配置校验/合并、HTTP 拉取、Python AST 分析、运行日志查看）
 
 ## 启动
 
